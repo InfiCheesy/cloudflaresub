@@ -593,15 +593,15 @@ export default {
       }
 
       if (request.method === 'POST' && url.pathname === '/api/generate') {
-        return handleGenerate(request, env, url);
+        return await handleGenerate(request, env, url);
       }
 
       if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-        return handleSub(url, env);
+        return await handleSub(url, env);
       }
 
       ensureBindings(env);
-      return env.ASSETS.fetch(request);
+      return await env.ASSETS.fetch(request);
     } catch (error) {
       const message = toErrorMessage(error);
       console.error('worker fetch error', {

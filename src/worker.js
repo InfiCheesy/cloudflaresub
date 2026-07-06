@@ -367,7 +367,7 @@ function renderClash(nodes) {
     ...allGroupMembers,
     ``,
     `rules:`,
-    `  - MATCH,节点选择`,
+    `  - "MATCH,节点选择"`,
   ].join('\n');
 }
 

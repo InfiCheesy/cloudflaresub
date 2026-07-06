@@ -46,7 +46,7 @@
           </div>
 
           <div>
-            <label for="preferredIps">2. 粘贴优选 IP / 优选域名</label>
+            <label for="preferredIps">2. 粘贴优选 IP / 优选域名（可选）</label>
             <textarea
               id="preferredIps"
               name="preferredIps"
@@ -55,10 +55,9 @@
 104.16.1.2#HK-01
 104.17.2.3:2053#HK-02
 cf.example.com:443#US-Edge"
-              required
             ></textarea>
             <p class="hint">
-              支持 <code>IP</code>、<code>IP:端口</code>、<code>域名</code>、<code>域名:端口</code>，<code>#</code> 后面可写备注。
+              支持 <code>IP</code>、<code>IP:端口</code>、<code>域名</code>、<code>域名:端口</code>，<code>#</code> 后面可写备注；留空时将直接使用原始节点。
             </p>
           </div>
 
@@ -112,7 +111,7 @@ cf.example.com:443#US-Edge"
         <div id="warningBox" class="warning hidden"></div>
 
         <div id="emptyState" class="empty-state">
-          还没有生成订阅。请先填写节点链接和优选 IP，然后点击“生成订阅”。
+          还没有生成订阅。请先填写节点链接，再按需填写优选 IP，然后点击“生成订阅”。
         </div>
 
         <div id="statsGrid" class="stats-grid">

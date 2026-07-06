@@ -445,14 +445,13 @@ async function handleGenerate(request, env, url) {
   const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
 
   if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
-  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
 
   const options = {
     namePrefix: body.namePrefix || '',
     keepOriginalHost: body.keepOriginalHost !== false,
   };
 
-  const nodes = buildNodes(baseNodes, preferredEndpoints, options);
+  const nodes = preferredEndpoints.length ? buildNodes(baseNodes, preferredEndpoints, options) : baseNodes;
 
   const payload = {
     version: 1,
@@ -512,7 +511,12 @@ async function handleGenerate(request, env, url) {
       host: node.host || '',
       sni: node.sni || '',
     })),
-    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+    warnings: [
+      ...(preferredEndpoints.length
+        ? []
+        : ['未填写优选 IP / 域名，已直接使用原始节点生成订阅。']),
+      ...(accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。']),
+    ],
   });
 }
 

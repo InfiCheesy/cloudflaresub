@@ -335,7 +335,7 @@ function renderClash(nodes) {
   );
 
   const allGroupMembers = [
-    `      - "自动选择"`,
+    `      - "Auto"`,
     ...proxyNames,
     `      - DIRECT`,
   ];
@@ -345,7 +345,7 @@ function renderClash(nodes) {
   return [
     `mixed-port: 7890`,
     `allow-lan: false`,
-    `mode: global`,
+    `mode: rule`,
     `log-level: info`,
     `ipv6: true`,
     ``,
@@ -353,7 +353,7 @@ function renderClash(nodes) {
     ...(proxies.length ? proxies : []),
     ``,
     `proxy-groups:`,
-    `  - name: "自动选择"`,
+    `  - name: "Auto"`,
     `    type: url-test`,
     `    url: "http://www.gstatic.com/generate_204"`,
     `    interval: 300`,
@@ -361,10 +361,14 @@ function renderClash(nodes) {
     `    proxies:`,
     ...autoGroupMembers,
     ``,
-    `  - name: "节点选择"`,
+    `  - name: "Proxy"`,
     `    type: select`,
     `    proxies:`,
     ...allGroupMembers,
+    ``,
+    `rules:`,
+    `  - "GEOIP,CN,DIRECT"`,
+    `  - "MATCH,Proxy"`,
   ].join('\n');
 }
 

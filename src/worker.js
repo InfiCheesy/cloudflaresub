@@ -345,7 +345,7 @@ function renderClash(nodes) {
   return [
     `mixed-port: 7890`,
     `allow-lan: false`,
-    `mode: rule`,
+    `mode: global`,
     `log-level: info`,
     `ipv6: true`,
     ``,
@@ -365,9 +365,6 @@ function renderClash(nodes) {
     `    type: select`,
     `    proxies:`,
     ...allGroupMembers,
-    ``,
-    `rules:`,
-    `  - "MATCH,节点选择"`,
   ].join('\n');
 }
 

@@ -27,6 +27,22 @@ function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
   });
 }
 
+function ensureBindings(env) {
+  if (!env?.SUB_STORE || typeof env.SUB_STORE.get !== 'function' || typeof env.SUB_STORE.put !== 'function') {
+    throw new Error('Cloudflare KV 绑定 SUB_STORE 未配置，请在 Worker Settings -> Bindings 中绑定 KV namespace。');
+  }
+  if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') {
+    throw new Error('静态资源绑定 ASSETS 未配置，请确认 wrangler.toml 的 assets.binding 为 ASSETS，且 Cloudflare 已启用静态资源。');
+  }
+}
+
+function toErrorMessage(error, fallback = '服务器内部错误') {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
+
 function b64EncodeUtf8(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
@@ -434,6 +450,8 @@ async function buildDedupHash(body) {
 }
 
 async function handleGenerate(request, env, url) {
+  ensureBindings(env);
+
   let body;
   try {
     body = await request.json();
@@ -531,6 +549,8 @@ function validateAccessToken(url, env) {
 }
 
 async function handleSub(url, env) {
+  ensureBindings(env);
+
   const tokenCheck = validateAccessToken(url, env);
   if (!tokenCheck.ok) return tokenCheck.response;
 
@@ -561,24 +581,44 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type',
-        },
+    try {
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          headers: {
+            'access-control-allow-origin': '*',
+            'access-control-allow-methods': 'GET,POST,OPTIONS',
+            'access-control-allow-headers': 'content-type',
+          },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/generate') {
+        return handleGenerate(request, env, url);
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
+        return handleSub(url, env);
+      }
+
+      ensureBindings(env);
+      return env.ASSETS.fetch(request);
+    } catch (error) {
+      const message = toErrorMessage(error);
+      console.error('worker fetch error', {
+        path: url.pathname,
+        method: request.method,
+        message,
       });
-    }
 
-    if (request.method === 'POST' && url.pathname === '/api/generate') {
-      return handleGenerate(request, env, url);
-    }
+      if (url.pathname.startsWith('/api/')) {
+        return json({ ok: false, error: message }, 500);
+      }
 
-    if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-      return handleSub(url, env);
-    }
+      if (url.pathname.startsWith('/sub/')) {
+        return text(`Internal Error: ${message}`, 500);
+      }
 
-    return env.ASSETS.fetch(request);
+      return text(`Internal Error: ${message}`, 500);
+    }
   },
 };

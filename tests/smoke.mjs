@@ -26,12 +26,16 @@ assert.equal(expanded.nodes[0].server, '104.16.1.2');
 assert.equal(expanded.nodes[0].hostHeader, 'edge.example.com');
 assert.equal(expanded.nodes[1].port, 2053);
 
+const rawWithoutPreferredEndpoints = renderRawSubscription(nodes);
+assert.ok(rawWithoutPreferredEndpoints.length > 10);
+
 const raw = renderRawSubscription(expanded.nodes);
 assert.ok(raw.length > 10);
 
 const clash = renderClashSubscription(expanded.nodes);
 assert.match(clash, /proxies:/);
 assert.match(clash, /edge\.example\.com/);
+assert.match(clash, /MATCH,Proxy/);
 
 const surge = renderSurgeSubscription(expanded.nodes, 'https://sub.example.com/sub/demo?target=surge');
 assert.match(surge, /\[Proxy]/);

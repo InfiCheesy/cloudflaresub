@@ -259,17 +259,18 @@ export function renderClashSubscription(nodes) {
   });
 
   lines.push('proxy-groups:');
-  lines.push('  - name: "🚀 节点选择"');
+  lines.push('  - name: "Proxy"');
   lines.push('    type: select');
-  lines.push(`    proxies: ["♻️ 自动选择", ${proxyNames.map(yamlQuote).join(', ')}]`);
-  lines.push('  - name: "♻️ 自动选择"');
+  lines.push(`    proxies: ["Auto", ${proxyNames.map(yamlQuote).join(', ')}, "DIRECT"]`);
+  lines.push('  - name: "Auto"');
   lines.push('    type: url-test');
   lines.push(`    url: ${yamlQuote(DEFAULT_TEST_URL)}`);
   lines.push('    interval: 300');
   lines.push('    tolerance: 50');
   lines.push(`    proxies: [${proxyNames.map(yamlQuote).join(', ')}]`);
   lines.push('rules:');
-  lines.push('  - MATCH,🚀 节点选择');
+  lines.push('  - GEOIP,CN,DIRECT');
+  lines.push('  - MATCH,Proxy');
 
   return lines.join('\n') + '\n';
 }

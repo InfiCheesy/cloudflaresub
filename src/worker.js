@@ -27,6 +27,22 @@ function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
   });
 }
 
+function ensureBindings(env) {
+  if (!env?.SUB_STORE || typeof env.SUB_STORE.get !== 'function' || typeof env.SUB_STORE.put !== 'function') {
+    throw new Error('Cloudflare KV 绑定 SUB_STORE 未配置，请在 Worker Settings -> Bindings 中绑定 KV namespace。');
+  }
+  if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') {
+    throw new Error('静态资源绑定 ASSETS 未配置，请确认 wrangler.toml 的 assets.binding 为 ASSETS，且 Cloudflare 已启用静态资源。');
+  }
+}
+
+function toErrorMessage(error, fallback = '服务器内部错误') {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
+
 function b64EncodeUtf8(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
@@ -319,7 +335,7 @@ function renderClash(nodes) {
   );
 
   const allGroupMembers = [
-    `      - "自动选择"`,
+    `      - "Auto"`,
     ...proxyNames,
     `      - DIRECT`,
   ];
@@ -337,7 +353,7 @@ function renderClash(nodes) {
     ...(proxies.length ? proxies : []),
     ``,
     `proxy-groups:`,
-    `  - name: "自动选择"`,
+    `  - name: "Auto"`,
     `    type: url-test`,
     `    url: "http://www.gstatic.com/generate_204"`,
     `    interval: 300`,
@@ -345,13 +361,14 @@ function renderClash(nodes) {
     `    proxies:`,
     ...autoGroupMembers,
     ``,
-    `  - name: "节点选择"`,
+    `  - name: "Proxy"`,
     `    type: select`,
     `    proxies:`,
     ...allGroupMembers,
     ``,
     `rules:`,
-    `  - MATCH,节点选择`,
+    `  - "GEOIP,CN,DIRECT"`,
+    `  - "MATCH,Proxy"`,
   ].join('\n');
 }
 
@@ -434,6 +451,8 @@ async function buildDedupHash(body) {
 }
 
 async function handleGenerate(request, env, url) {
+  ensureBindings(env);
+
   let body;
   try {
     body = await request.json();
@@ -445,14 +464,13 @@ async function handleGenerate(request, env, url) {
   const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
 
   if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
-  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
 
   const options = {
     namePrefix: body.namePrefix || '',
     keepOriginalHost: body.keepOriginalHost !== false,
   };
 
-  const nodes = buildNodes(baseNodes, preferredEndpoints, options);
+  const nodes = preferredEndpoints.length ? buildNodes(baseNodes, preferredEndpoints, options) : baseNodes;
 
   const payload = {
     version: 1,
@@ -512,7 +530,12 @@ async function handleGenerate(request, env, url) {
       host: node.host || '',
       sni: node.sni || '',
     })),
-    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+    warnings: [
+      ...(preferredEndpoints.length
+        ? []
+        : ['未填写优选 IP / 域名，已直接使用原始节点生成订阅。']),
+      ...(accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。']),
+    ],
   });
 }
 
@@ -527,6 +550,8 @@ function validateAccessToken(url, env) {
 }
 
 async function handleSub(url, env) {
+  ensureBindings(env);
+
   const tokenCheck = validateAccessToken(url, env);
   if (!tokenCheck.ok) return tokenCheck.response;
 
@@ -557,24 +582,44 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type',
-        },
+    try {
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          headers: {
+            'access-control-allow-origin': '*',
+            'access-control-allow-methods': 'GET,POST,OPTIONS',
+            'access-control-allow-headers': 'content-type',
+          },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/generate') {
+        return await handleGenerate(request, env, url);
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
+        return await handleSub(url, env);
+      }
+
+      ensureBindings(env);
+      return await env.ASSETS.fetch(request);
+    } catch (error) {
+      const message = toErrorMessage(error);
+      console.error('worker fetch error', {
+        path: url.pathname,
+        method: request.method,
+        message,
       });
-    }
 
-    if (request.method === 'POST' && url.pathname === '/api/generate') {
-      return handleGenerate(request, env, url);
-    }
+      if (url.pathname.startsWith('/api/')) {
+        return json({ ok: false, error: message }, 500);
+      }
 
-    if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-      return handleSub(url, env);
-    }
+      if (url.pathname.startsWith('/sub/')) {
+        return text(`Internal Error: ${message}`, 500);
+      }
 
-    return env.ASSETS.fetch(request);
+      return text(`Internal Error: ${message}`, 500);
+    }
   },
 };

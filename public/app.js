@@ -57,7 +57,16 @@ form.addEventListener('submit', async (event) => {
       body: JSON.stringify(payload),
     });
 
-    const data = await response.json();
+    const contentType = response.headers.get('content-type') || '';
+    let data;
+
+    if (contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      const rawText = await response.text();
+      throw new Error(rawText || '服务端返回了非 JSON 响应');
+    }
+
     if (!response.ok || !data.ok) {
       throw new Error(data.error || '生成失败');
     }

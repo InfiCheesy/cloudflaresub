@@ -173,6 +173,7 @@ curl "https://<worker>/sub/<id>?target=clash&token=<SUB_ACCESS_TOKEN>"
 - `src/worker.js` 当前是 KV 短链方案，不依赖 `SUB_LINK_SECRET`
 - 每条订阅记录默认保存 7 天（TTL）
 - Surge 导出当前仅包含 `vmess` / `trojan`
+- 首次部署前需在 Cloudflare 控制台完成 KV 命名空间的绑定
 
 ## License
 

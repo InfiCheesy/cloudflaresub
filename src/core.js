@@ -302,8 +302,17 @@ export function renderClashSubscription(nodes) {
   return lines.join('\n') + '\n';
 }
 
+// Surge expresses only plain TCP and WebSocket transports for
+// VMess/Trojan; h2 / gRPC / HTTP nodes would render as silently dead
+// plain-TCP lines, so they are filtered out (see the worker's copy).
+function isSurgeExpressibleNode(node) {
+  if (node.type !== 'vmess' && node.type !== 'trojan') return false;
+  const net = String(node.network || 'tcp').toLowerCase();
+  return net === 'tcp' || net === 'ws';
+}
+
 export function renderSurgeSubscription(nodes, requestUrl) {
-  const filtered = nodes.filter((node) => node.type === 'vmess' || node.type === 'trojan');
+  const filtered = nodes.filter(isSurgeExpressibleNode);
   if (!filtered.length) {
     throw new Error('当前 Surge 导出仅支持 VMess / Trojan 节点。');
   }
@@ -365,7 +374,7 @@ export function renderVmessUri(node) {
     id: node.uuid,
     aid: String(node.alterId ?? 0),
     scy: node.cipher || 'auto',
-    net: node.network || 'ws',
+    net: node.network || 'tcp',
     type: node.headerType || '',
     host: node.hostHeader || '',
     path: node.path || '/',
@@ -472,7 +481,9 @@ function parseVmessUri(uri) {
     uuid,
     alterId: normalizeInteger(data.aid, 0),
     cipher: String(data.scy || data.cipher || 'auto').trim() || 'auto',
-    network: String(data.net || 'ws').trim() || 'ws',
+    // Missing `net` means plain TCP in the VMess share format (see
+    // the worker's copy): 'ws' here silently rewrote TCP nodes.
+    network: String(data.net || 'tcp').trim().toLowerCase() || 'tcp',
     path: normalizePath(data.path || '/'),
     hostHeader: String(data.host || '').trim(),
     sni: String(data.sni || '').trim(),
@@ -668,7 +679,17 @@ function renderClashProxy(node) {
     lines.push(`      grpc-service-name: ${yamlQuote(svc)}`);
   }
 
-  if (node.network === 'http' || node.network === 'h2') {
+  if (node.network === 'h2') {
+    // mihomo reads H2 options from h2-opts (path string + host list),
+    // not http-opts — see the worker's copy.
+    lines.push('    h2-opts:');
+    lines.push(`      path: ${yamlQuote(node.path || '/')}`);
+    if (node.hostHeader) {
+      lines.push(`      host: [${yamlQuote(node.hostHeader)}]`);
+    }
+  }
+
+  if (node.network === 'http') {
     lines.push('    http-opts:');
     lines.push(`      path: [${yamlQuote(node.path || '/')}]`);
     if (node.hostHeader) {

@@ -570,7 +570,11 @@ function parseVmess(link) {
     port: Number(obj.port || 443),
     uuid: obj.id,
     cipher: obj.scy || 'auto',
-    network: obj.net || 'ws',
+    // A missing `net` means plain TCP in the VMess share format (the
+    // URL-style parser below defaults to 'tcp' too): defaulting to
+    // 'ws' here used to silently turn plain-TCP nodes into WebSocket
+    // nodes in every output format, plain/raw links included.
+    network: String(obj.net || 'tcp').toLowerCase(),
     tls: obj.tls === 'tls',
     host: obj.host || '',
     path: obj.path || '/',
@@ -719,7 +723,7 @@ function encodeVmess(node) {
     id: node.uuid,
     aid: '0',
     scy: node.cipher || 'auto',
-    net: node.network || 'ws',
+    net: node.network || 'tcp',
     type: 'none',
     host: node.host || '',
     path: node.path || '/',
@@ -821,6 +825,18 @@ function pushClashHttpOpts(lines, node) {
   }
 }
 
+function pushClashH2Opts(lines, node) {
+  // mihomo reads H2 transport options from h2-opts, NOT http-opts
+  // (that key belongs to network: http, and its shape differs: h2
+  // takes a path string and a host list). Emitting http-opts for an
+  // h2 node made the client fall back to the default path and no
+  // hosts, silently breaking or degrading every h2 node.
+  lines.push('    h2-opts:');
+  lines.push(`      path: "${escapeYaml(node.path || '/')}"`);
+  const host = node.host || node.sni || '';
+  if (host) lines.push(`      host: ["${escapeYaml(host)}"]`);
+}
+
 function renderClash(nodes) {
   // Stored records predate build-time dedupe: rename again here so an
   // old entry with duplicate names still imports cleanly.
@@ -854,18 +870,19 @@ function renderClash(nodes) {
           `    cipher: "${escapeYaml(node.cipher || 'auto')}"`,
           `    udp: true`,
           `    tls: ${node.tls ? 'true' : 'false'}`,
-          `    network: "${escapeYaml(node.network || 'ws')}"`,
+          `    network: "${escapeYaml(node.network || 'tcp')}"`,
         ];
 
         if (node.sni) {
           lines.push(`    servername: "${escapeYaml(node.sni)}"`);
         }
 
-        if ((node.network || 'ws') === 'ws') {
+        if ((node.network || 'tcp') === 'ws') {
           pushClashWsOpts(lines, node);
         }
         pushClashGrpcOpts(lines, node);
-        if (node.network === 'h2' || node.network === 'http') pushClashHttpOpts(lines, node);
+        if (node.network === 'h2') pushClashH2Opts(lines, node);
+        else if (node.network === 'http') pushClashHttpOpts(lines, node);
         if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -904,7 +921,8 @@ function renderClash(nodes) {
           pushClashWsOpts(lines, node);
         }
         pushClashGrpcOpts(lines, node);
-        if (node.network === 'h2' || node.network === 'http') pushClashHttpOpts(lines, node);
+        if (node.network === 'h2') pushClashH2Opts(lines, node);
+        else if (node.network === 'http') pushClashHttpOpts(lines, node);
         if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -936,7 +954,8 @@ function renderClash(nodes) {
           pushClashWsOpts(lines, node);
         }
         pushClashGrpcOpts(lines, node);
-        if (node.network === 'h2' || node.network === 'http') pushClashHttpOpts(lines, node);
+        if (node.network === 'h2') pushClashH2Opts(lines, node);
+        else if (node.network === 'http') pushClashHttpOpts(lines, node);
         pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -1004,6 +1023,19 @@ function surgeField(value) {
   return String(value ?? '').replace(/[\r\n,]+/g, ' ').trim();
 }
 
+// Surge can only express plain TCP and WebSocket transports for
+// VMess/Trojan. An h2 / gRPC / HTTP node used to render with NO
+// transport marker at all, which Surge dials as plain TCP+TLS — a
+// silently dead node sitting among working ones. Such nodes are
+// filtered out instead (the same treatment VLESS gets: a type Surge
+// cannot express at all), and handleSub reports the case where that
+// leaves an entry with nothing Surge can use.
+function surgeExpressible(node) {
+  if (node.type !== 'vmess' && node.type !== 'trojan') return false;
+  const net = String(node.network || 'tcp').toLowerCase();
+  return net === 'tcp' || net === 'ws';
+}
+
 function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
   // Dedupe twice: once on the raw names (shared with Clash), then on
   // the Surge-sanitized names — two different raw names can sanitize
@@ -1012,7 +1044,7 @@ function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
   // unaffected.
   const supported = dedupeNodeNames(
     dedupeNodeNames(nodes)
-      .filter((node) => node.type === 'vmess' || node.type === 'trojan')
+      .filter(surgeExpressible)
       .map((node) => ({
         ...node,
         name: surgeName(node.name),
@@ -1029,7 +1061,7 @@ function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
         // used to be emitted unconditionally, rendering tcp and grpc
         // nodes as ws nodes (with the grpc service name, which lives
         // in path, stuffed into ws-path).
-        const wsPart = (node.network || 'ws') === 'ws'
+        const wsPart = (node.network || 'tcp') === 'ws'
           ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}`
           : '';
         return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}${wsPart}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
@@ -1177,6 +1209,18 @@ function notePointerKey(note, id) {
   return `note:${note}:${id}`;
 }
 
+// Tags ride along in the record's KV metadata so /api/tags can
+// aggregate the vocabulary from the key list alone instead of
+// reading every full record value. Omitted when the JSON would
+// bloat the 1024-byte metadata budget (long note + many wide tags):
+// the endpoint then falls back to reading that one record, exactly
+// as it did before this field existed.
+function metaTagsOf(record) {
+  const tags = sanitizeTags(record && record.tags);
+  if (!tags.length) return [];
+  return JSON.stringify(tags).length <= 384 ? tags : undefined;
+}
+
 function buildRecordMetadata(record) {
   const servers = (record.sources || []).map((x) => x.server).filter(Boolean);
   const st = record.storage || { mode: 'permanent' };
@@ -1187,6 +1231,7 @@ function buildRecordMetadata(record) {
     out: Array.isArray(record.nodes) ? record.nodes.length : 0,
     retention: st.mode === 'days' ? `days:${st.days}` : 'permanent',
     exp: st.mode === 'days' ? (st.expiresAt || '') : '',
+    tags: metaTagsOf(record),
   };
 }
 
@@ -1641,6 +1686,50 @@ async function checkAdmin(request, env, url, body) {
   return null;
 }
 
+// One admin-list row, resolved from its record. Returns null for a
+// ghost key (the list index still enumerates a just-deleted entry
+// whose record is already gone).
+async function buildListItem(env, key) {
+  const id = key.name.slice('sub:'.length);
+  const meta = key.metadata || {};
+  const item = {
+    id,
+    note: (typeof meta.note === 'string' ? meta.note : ''),
+    tags: [],
+    createdAt: meta.createdAt || null,
+    sources: meta.sources ? meta.sources.split(',').filter(Boolean) : [],
+    outputNodes: typeof meta.out === 'number' ? meta.out : null,
+    storage: meta.retention && meta.retention.startsWith('days:')
+      ? { mode: 'days', days: Number(meta.retention.slice(5)) || null, expiresAt: meta.exp || null }
+      : { mode: 'permanent' },
+    dynamic: false,
+  };
+  const raw = await env.SUB_STORE.get(key.name);
+  if (raw === null || raw === undefined) return null;
+  try {
+    const rec = JSON.parse(raw);
+    item.note = (typeof rec.note === 'string' ? rec.note : '');
+    // Sanitize on read: a record hand-edited in KV can carry
+    // non-string tag members, and raw passthrough lets one
+    // corrupt record break the whole admin UI downstream.
+    item.tags = sanitizeTags(rec.tags);
+    item.createdAt = rec.createdAt || item.createdAt;
+    const servers = [...new Set((rec.sources || []).map((x) => x.server).filter(Boolean))];
+    if (servers.length) item.sources = servers;
+    if (Array.isArray(rec.nodes)) item.outputNodes = rec.nodes.length;
+    item.storage = rec.storage || { mode: 'permanent' };
+    item.dynamic = !!rec.dynamic;
+    if (rec.dynamic && rec.dynamic.sourceUrl) item.sourceUrl = rec.dynamic.sourceUrl;
+    if (rec.dynamic) {
+      item.sourceCount = Array.isArray(rec.dynamic.sources)
+        ? rec.dynamic.sources.length
+        : (rec.dynamic.sourceUrl ? 1 : 0);
+    }
+  } catch {}
+  item.linkToken = await linkTokenFor(id, env);
+  return item;
+}
+
 async function handleList(request, env, url) {
   if (!env.SUB_STORE) return json({ ok: false, error: 'SUB_STORE KV 未绑定' }, 500);
   const denied = await checkAdmin(request, env, url, null);
@@ -1654,51 +1743,13 @@ async function handleList(request, env, url) {
   let cursor;
   do {
     const page = await env.SUB_STORE.list({ prefix: 'sub:', cursor, limit: 256 });
-    for (const key of page.keys) {
-      const id = key.name.slice('sub:'.length);
-      const meta = key.metadata || {};
-      const item = {
-        id,
-        note: (typeof meta.note === 'string' ? meta.note : ''),
-        tags: [],
-        createdAt: meta.createdAt || null,
-        sources: meta.sources ? meta.sources.split(',').filter(Boolean) : [],
-        outputNodes: typeof meta.out === 'number' ? meta.out : null,
-        storage: meta.retention && meta.retention.startsWith('days:')
-          ? { mode: 'days', days: Number(meta.retention.slice(5)) || null, expiresAt: meta.exp || null }
-          : { mode: 'permanent' },
-        dynamic: false,
-      };
-      const raw = await env.SUB_STORE.get(key.name);
-      if (raw === null || raw === undefined) {
-        // Ghost key: the list index still enumerates a just-deleted entry.
-        // The record is gone, so the entry must not reappear in the list.
-        continue;
-      }
-      {
-        try {
-          const rec = JSON.parse(raw);
-          item.note = (typeof rec.note === 'string' ? rec.note : '');
-          // Sanitize on read: a record hand-edited in KV can carry
-          // non-string tag members, and raw passthrough lets one
-          // corrupt record break the whole admin UI downstream.
-          item.tags = sanitizeTags(rec.tags);
-          item.createdAt = rec.createdAt || item.createdAt;
-          const servers = [...new Set((rec.sources || []).map((x) => x.server).filter(Boolean))];
-          if (servers.length) item.sources = servers;
-          if (Array.isArray(rec.nodes)) item.outputNodes = rec.nodes.length;
-          item.storage = rec.storage || { mode: 'permanent' };
-          item.dynamic = !!rec.dynamic;
-          if (rec.dynamic && rec.dynamic.sourceUrl) item.sourceUrl = rec.dynamic.sourceUrl;
-          if (rec.dynamic) {
-            item.sourceCount = Array.isArray(rec.dynamic.sources)
-              ? rec.dynamic.sources.length
-              : (rec.dynamic.sourceUrl ? 1 : 0);
-          }
-        } catch {}
-      }
-      item.linkToken = await linkTokenFor(id, env);
-      items.push(item);
+    // Records resolve in parallel chunks (the diagnostics census
+    // pattern): awaiting one KV get at a time made the list's
+    // latency grow strictly linearly with the entry count.
+    for (let i = 0; i < page.keys.length; i += 25) {
+      const chunk = page.keys.slice(i, i + 25);
+      const built = await Promise.all(chunk.map((key) => buildListItem(env, key)));
+      for (const item of built) if (item) items.push(item);
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
@@ -1975,23 +2026,36 @@ async function handleTagsList(request, env, url) {
   let cursor;
   do {
     const page = await env.SUB_STORE.list({ prefix: 'sub:', cursor, limit: 256 });
-    for (const key of page.keys) {
-      const raw = await env.SUB_STORE.get(key.name);
-      if (raw === null || raw === undefined) continue;
-      let rec;
-      try { rec = JSON.parse(raw); } catch { continue; }
-      if (!Array.isArray(rec.tags)) continue;
-      const seen = new Set();
-      for (const tag of rec.tags) {
-        // Skip non-string members outright (hand-edited records): a
-        // String() coercion would invent junk tags like 'null'.
-        if (typeof tag !== 'string') continue;
-        const lower = tag.toLowerCase();
-        if (seen.has(lower)) continue;
-        seen.add(lower);
-        const cur = byLower.get(lower);
-        if (cur) cur.count += 1;
-        else byLower.set(lower, { tag, count: 1 });
+    // Tags normally ride in the key metadata (buildRecordMetadata),
+    // so the vocabulary costs zero record reads. Keys written before
+    // that field existed — or whose tags overflowed the metadata
+    // budget and were omitted — fall back to reading the record
+    // itself. Keys resolve in parallel chunks, like the census.
+    for (let i = 0; i < page.keys.length; i += 25) {
+      const chunk = page.keys.slice(i, i + 25);
+      const perKey = await Promise.all(chunk.map(async (key) => {
+        const meta = key.metadata || {};
+        if (Array.isArray(meta.tags)) return meta.tags;
+        const raw = await env.SUB_STORE.get(key.name);
+        if (raw === null || raw === undefined) return null;
+        let rec;
+        try { rec = JSON.parse(raw); } catch { return null; }
+        return Array.isArray(rec.tags) ? rec.tags : null;
+      }));
+      for (const tags of perKey) {
+        if (!tags) continue;
+        const seen = new Set();
+        for (const tag of tags) {
+          // Skip non-string members outright (hand-edited records): a
+          // String() coercion would invent junk tags like 'null'.
+          if (typeof tag !== 'string') continue;
+          const lower = tag.toLowerCase();
+          if (seen.has(lower)) continue;
+          seen.add(lower);
+          const cur = byLower.get(lower);
+          if (cur) cur.count += 1;
+          else byLower.set(lower, { tag, count: 1 });
+        }
       }
     }
     cursor = page.list_complete ? undefined : page.cursor;
@@ -2162,6 +2226,14 @@ async function handleSub(request, env, url) {
 
   const record = parseStoredRecord(raw);
   if (!record) return text('条目数据损坏，无法生成订阅内容。', 500, 'text/plain; charset=utf-8');
+  // Retention expiry is recorded in the record itself, and KV reaps
+  // expired keys lazily — without this check an expired entry keeps
+  // serving until the platform gets around to deleting it.
+  const recStorage = record.storage;
+  if (recStorage && recStorage.mode === 'days' && recStorage.expiresAt) {
+    const expMs = Date.parse(recStorage.expiresAt);
+    if (Number.isFinite(expMs) && expMs <= Date.now()) return text('not found', 404);
+  }
   let nodes = record.nodes || [];
   if (record.dynamic && Array.isArray(record.baseNodes) && record.baseNodes.length) {
     // Dynamic subscription: rebuild the node list from the source's
@@ -2208,6 +2280,16 @@ async function handleSub(request, env, url) {
     if (!nodes.some((node) => node.type === 'vmess' || node.type === 'trojan')) {
       return text(
         '该条目没有 Surge 支持的节点：Surge 仅支持 VMess / Trojan 节点，当前条目不含这两种类型。',
+        400,
+        'text/plain; charset=utf-8',
+      );
+    }
+    if (!nodes.some(surgeExpressible)) {
+      // The types are right but every one rides a transport Surge
+      // cannot express (h2 / gRPC / HTTP): rendering them anyway
+      // would produce silently dead plain-TCP lines.
+      return text(
+        '该条目没有 Surge 可用的节点：Surge 不支持 h2 / gRPC / HTTP 传输，当前条目的 VMess / Trojan 节点均为这类传输。',
         400,
         'text/plain; charset=utf-8',
       );

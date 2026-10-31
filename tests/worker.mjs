@@ -1320,8 +1320,10 @@ console.log('worker tests passed');
   assert.ok(firstLine.includes(linkTokens.get('FixR1201')), 'surge: managed URL carries the link token');
   const tcpLine = surgeStatic.body.split('\n').find((l) => l.startsWith('tcp节点'));
   assert.ok(tcpLine && !tcpLine.includes('ws=true'), 'surge: tcp vmess is not dressed as ws');
-  const grpcLine = surgeStatic.body.split('\n').find((l) => l.startsWith('grpc节点'));
-  assert.ok(grpcLine && !grpcLine.includes('ws=true') && !grpcLine.includes('ws-path'), 'surge: grpc vmess gets no ws parameters');
+  // Round 14 supersedes the round-12 expectation below: a grpc node
+  // is no longer rendered bare (which Surge dialed as plain TCP) —
+  // it is filtered out of the Surge output entirely.
+  assert.ok(!surgeStatic.body.includes('grpc节点'), 'surge: grpc vmess is filtered out, not silently degraded');
   const tjLine = surgeStatic.body.split('\n').find((l) => l.startsWith('ws-trojan'));
   assert.ok(tjLine && tjLine.includes('ws=true') && tjLine.includes('ws-path=/tj'), 'surge: ws trojan carries its ws parameters');
 
@@ -1331,7 +1333,10 @@ console.log('worker tests passed');
   const clashResp = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1201?target=clash&token=' + linkTokens.get('FixR1201')), env);
   assert.equal(clashResp.headers.get('profile-update-interval'), '24', 'sub: static clash advertises a 24h update interval');
   const clash12 = await clashResp.text();
-  assert.ok(clash12.includes('http-opts:'), 'clash: h2 node carries http-opts');
+  // Round 14: h2 nodes carry h2-opts (the key mihomo actually reads);
+  // http-opts is only for network: http.
+  assert.ok(clash12.includes('h2-opts:'), 'clash: h2 node carries h2-opts');
+  assert.ok(!clash12.includes('http-opts:'), 'clash: no http-opts is emitted for an h2 node');
   assert.ok(clash12.includes('grpc-service-name: "mysvc"'), 'clash: vmess grpc service name comes from path');
   const clashDynResp = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1202?target=clash&token=' + linkTokens.get('FixR1202')), env);
   assert.equal(clashDynResp.headers.get('profile-update-interval'), '1', 'sub: dynamic clash advertises a 1h update interval');
@@ -1445,4 +1450,88 @@ console.log('worker tests passed');
     globalThis.fetch = realFetch;
   }
   console.log('audit-13 suite: parse guards, policy-name reservation, census ages, source coalescing: passed');
+}
+
+// ===== Audit round 14: vmess default transport, clash h2-opts, surge transport gate, app-level expiry, tags-via-metadata + parallel list =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const vmessJson = (extra) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', scy: 'auto', type: 'none', tls: '', ...extra })).toString('base64');
+
+  // 1) A vmess link without `net` is a plain-TCP node in every format.
+  const gTcp = await generate({ nodeLinks: vmessJson({ ps: 'tcpvm' }), preferredIps: '198.51.100.7' });
+  const decoded = JSON.parse(Buffer.from(gTcp.plainText.split('vmess://')[1], 'base64').toString('utf8'));
+  assert.equal(decoded.net, 'tcp', 'vmess: missing net round-trips as tcp, not ws');
+  const tcpClash = await getSub(gTcp.shortId, 'clash');
+  assert.ok(tcpClash.body.includes('network: "tcp"'), 'clash: net-less vmess renders network tcp');
+  assert.ok(!tcpClash.body.includes('ws-opts:'), 'clash: net-less vmess gets no ws-opts');
+  const tcpSurge = await getSub(gTcp.shortId, 'surge');
+  assert.ok(!tcpSurge.body.includes('ws=true'), 'surge: net-less vmess gets no ws=true');
+
+  // 2) h2 vmess in clash: h2-opts with path + host list, no http-opts.
+  const gH2 = await generate({ nodeLinks: vmessJson({ ps: 'h2vm', net: 'h2', tls: 'tls', host: 'h2.example.com', path: '/h2path' }), preferredIps: '198.51.100.8' });
+  const h2Clash = await getSub(gH2.shortId, 'clash');
+  assert.ok(h2Clash.body.includes('h2-opts:'), 'clash: h2 node carries h2-opts');
+  assert.ok(h2Clash.body.includes('path: "/h2path"'), 'clash: h2-opts carries the path');
+  assert.ok(h2Clash.body.includes('host: ["h2.example.com"]'), 'clash: h2-opts carries the host list');
+  assert.ok(!h2Clash.body.includes('http-opts:'), 'clash: h2 node gets no http-opts');
+
+  // 3) Surge transport gate: a grpc-only entry 400s; a mixed entry
+  // keeps only the expressible node.
+  const gGrpc = await generate({ nodeLinks: vmessJson({ ps: 'grpcvm', net: 'grpc', tls: 'tls', path: 'mysvc' }), preferredIps: '198.51.100.9' });
+  const grpcSurge = await getSub(gGrpc.shortId, 'surge');
+  assert.equal(grpcSurge.status, 400, 'surge: grpc-only entry is refused');
+  assert.ok(grpcSurge.body.includes('Surge 不支持'), 'surge: refusal names the transport problem');
+  const gMix = await generate({ nodeLinks: [vmessJson({ ps: 'grpcvm', net: 'grpc', tls: 'tls', path: 'mysvc' }), vmessJson({ ps: 'wsvm', net: 'ws', tls: 'tls', host: 'w.example.com', path: '/w' })].join('\n'), preferredIps: '198.51.100.10' });
+  const mixSurge = await getSub(gMix.shortId, 'surge');
+  assert.equal(mixSurge.status, 200, 'surge: mixed entry still serves');
+  assert.ok(mixSurge.body.includes('wsvm'), 'surge: ws node survives the filter');
+  assert.ok(!mixSurge.body.includes('grpcvm'), 'surge: grpc node is filtered out');
+
+  // 4) An expired-but-unreaped record 404s at the app level; an
+  // unexpired retention record still serves.
+  const gExp = await generate({ nodeLinks: vmessJson({ ps: 'expvm', net: 'tcp' }), preferredIps: '198.51.100.11', storageMode: 'days', retentionDays: 30 });
+  const expKey = 'sub:' + gExp.shortId;
+  const expRec = JSON.parse(store.get(expKey).value);
+  expRec.storage.expiresAt = new Date(Date.now() - 60000).toISOString();
+  store.set(expKey, { value: JSON.stringify(expRec), metadata: store.get(expKey).metadata });
+  const expSub = await getSub(gExp.shortId, 'plain');
+  assert.equal(expSub.status, 404, 'sub: expired record is not served even while KV still holds it');
+  const gLive = await generate({ nodeLinks: vmessJson({ ps: 'livevm', net: 'tcp' }), preferredIps: '198.51.100.12', storageMode: 'days', retentionDays: 30 });
+  const liveSub = await getSub(gLive.shortId, 'plain');
+  assert.equal(liveSub.status, 200, 'sub: unexpired retention record still serves');
+
+  // 5) /api/tags reads tags from key metadata (zero record reads),
+  // with a record fallback for legacy keys; /api/list resolves its
+  // records in parallel chunks.
+  const gTags = await generate({ nodeLinks: vmessJson({ ps: 'tagvm', net: 'tcp' }), preferredIps: '198.51.100.13', tags: ['MetaTag'] });
+  const tagKey = 'sub:' + gTags.shortId;
+  const tagBefore = store.get(tagKey);
+  assert.ok(Array.isArray(tagBefore.metadata.tags) && tagBefore.metadata.tags.includes('MetaTag'), 'tags: generate writes tags into KV metadata');
+  store.set(tagKey, { value: '{"corrupt"', metadata: tagBefore.metadata });
+  const tagsResp = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.ok(tagsResp.tags.some((t) => t.tag === 'MetaTag' && t.count >= 1), 'tags: vocabulary comes from metadata when the record is unreadable');
+  store.set(tagKey, { value: tagBefore.value, metadata: { ...tagBefore.metadata, tags: undefined } });
+  const tagsResp2 = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.ok(tagsResp2.tags.some((t) => t.tag === 'MetaTag'), 'tags: legacy keys fall back to reading the record');
+  store.set(tagKey, tagBefore);
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const envPar = {
+    ...env,
+    SUB_STORE: {
+      ...env.SUB_STORE,
+      async get(k) {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight -= 1;
+        return env.SUB_STORE.get(k);
+      },
+    },
+  };
+  const listPar = await (await worker.fetch(adminReq('/api/list'), envPar)).json();
+  assert.ok(listPar.count >= 5, 'list: parallel build returns every entry');
+  assert.ok(maxInFlight > 1, 'list: record reads overlap (chunked parallel), max in flight = ' + maxInFlight);
+  console.log('audit-14 suite: vmess tcp default, h2-opts, surge transport gate, app-level expiry, tags metadata + parallel list: passed');
 }

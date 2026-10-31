@@ -129,3 +129,25 @@ assert.equal(payload.nodes.length, 2);
 }
 
 console.log('smoke test passed');
+
+// ===== Audit round 14 (core): vmess default transport, h2-opts, surge transport filter =====
+{
+  const noNet = 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'core-tcp', add: '203.0.113.20', port: '10086', id: '00000000-0000-4000-8000-000000000001', scy: 'auto', tls: '' })).toString('base64');
+  const parsed = parseNodeLinks(noNet);
+  assert.equal(parsed.nodes[0].network, 'tcp', 'core: vmess without net defaults to tcp');
+  const rawCore = Buffer.from(renderRawSubscription(parsed.nodes), 'base64').toString('utf8');
+  assert.equal(JSON.parse(Buffer.from(rawCore.split('vmess://')[1], 'base64').toString('utf8')).net, 'tcp', 'core: re-encoded vmess keeps net=tcp');
+
+  const h2Nodes = [{ type: 'vmess', name: 'core-h2', server: '203.0.113.21', port: 443, uuid: '00000000-0000-4000-8000-000000000001', cipher: 'auto', network: 'h2', tls: true, hostHeader: 'h2.example.com', path: '/h2p', sni: 'h2.example.com', alpn: '', fp: '' }];
+  const clashCore = renderClashSubscription(h2Nodes);
+  assert.ok(clashCore.includes('h2-opts:'), 'core clash: h2 node carries h2-opts');
+  assert.ok(!clashCore.includes('http-opts:'), 'core clash: no http-opts for h2');
+
+  const grpcOnly = [{ type: 'vmess', name: 'core-grpc', server: '203.0.113.22', port: 443, uuid: '00000000-0000-4000-8000-000000000001', cipher: 'auto', network: 'grpc', tls: true, path: 'svc', sni: '', hostHeader: '', alpn: '', fp: '' }];
+  assert.throws(() => renderSurgeSubscription(grpcOnly, 'https://x/sub'), /Surge/, 'core surge: grpc-only set is refused');
+  const mixed = [...grpcOnly, { ...grpcOnly[0], name: 'core-ws', network: 'ws', path: '/ws' }];
+  const surgeCore = renderSurgeSubscription(mixed, 'https://x/sub');
+  assert.ok(surgeCore.includes('core-ws'), 'core surge: ws node survives');
+  assert.ok(!surgeCore.includes('core-grpc'), 'core surge: grpc node filtered out');
+  console.log('audit-14 core suite: vmess tcp default, h2-opts, surge transport filter: passed');
+}

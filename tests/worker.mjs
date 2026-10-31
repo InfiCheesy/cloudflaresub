@@ -404,11 +404,17 @@ console.log('worker tests passed');
   const er = await (await worker.fetch(adminReq(`/api/entry?id=${j1.shortId}`), env)).json();
   assert.equal(er.linkToken, linkTokA, 'entry read carries the same link token');
 
-  // Surge output embeds the per-entry link token, never the admin token.
-  const surge = await getSub(j1.shortId, 'surge');
+  // Surge output embeds the per-entry link token, never the admin
+  // token. (j1 is vless-only, and since audit round 9 its Surge
+  // target answers a clear 400 instead of an empty profile — so the
+  // token-embedding check runs on a trojan entry.)
+  const jTrojan = await generate({ nodeLinks: 'trojan://pw@tj.example.com:443#tj', preferredIps: '203.0.113.9' });
+  const surge = await getSub(jTrojan.shortId, 'surge');
   assert.equal(surge.status, 200);
-  assert.ok(surge.body.includes(`?token=${linkTokA}`), 'surge profile carries the link token');
+  assert.ok(surge.body.includes(`?token=${linkTokens.get(jTrojan.shortId)}`), 'surge profile carries the link token');
   assert.ok(!surge.body.includes('token=tok'), 'surge profile must not contain the admin token');
+  const surgeVless = await getSub(j1.shortId, 'surge');
+  assert.equal(surgeVless.status, 400, 'vless-only surge target is a clear error (audit round 9)');
   console.log('link token suite: per-entry tokens, admin token rejected at /sub, link token rejected at admin: passed');
 }
 
@@ -478,7 +484,11 @@ console.log('worker tests passed');
   }), env);
   const clashAuto = await (await fetchAuto('ClashforWindows/0.20.39')).text();
   assert.ok(clashAuto.startsWith('mixed-port:'), 'clash UA gets clash yaml');
-  const surgeAuto = await (await fetchAuto('Surge/5.10.0')).text();
+  // The Surge-UA check needs a Surge-supported entry (j1 is vless-only
+  // and now answers the audit-9 400 on the surge target).
+  const jTj2 = await generate({ nodeLinks: 'trojan://pw@tj2.example.com:443#tj2', preferredIps: '203.0.113.10' });
+  const surgeAutoResp = await worker.fetch(new Request('https://x.pages.dev/sub/' + jTj2.shortId + '?token=' + linkTokens.get(jTj2.shortId), { headers: { 'user-agent': 'Surge/5.10.0' } }), env);
+  const surgeAuto = await surgeAutoResp.text();
   assert.ok(surgeAuto.includes('[Proxy]'), 'surge UA gets surge profile');
   const plainAuto = await (await fetchAuto('Mozilla/5.0')).text();
   assert.equal(Buffer.from(plainAuto, 'base64').toString('utf8'), j1.plainText, 'unknown UA keeps base64 raw');
@@ -1154,4 +1164,33 @@ console.log('worker tests passed');
   assert.equal(versionResp.headers.get('cache-control'), 'no-store', 'API JSON is no-store');
   assert.equal(versionResp.headers.get('access-control-allow-origin'), null, 'no wildcard CORS on API JSON');
   console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');
+}
+
+// Audit round 9: duplicate node names are disambiguated end-to-end,
+// and a vless-only entry's Surge target answers a clear error instead
+// of an empty 200 profile.
+{
+  const gen9 = async (body) => {
+    const r = await worker.fetch(new Request('http://x/api/generate', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+    }), env);
+    return r.json();
+  };
+  const listTok9 = async (id) => {
+    const l = await (await worker.fetch(new Request('http://x/api/list', { headers: { 'x-admin-token': 'tok' } }), env)).json();
+    return l.items.find((i) => i.id === id).linkToken;
+  };
+  // The endpoint carries a remark, so buildNodes composes the SAME
+  // name for both source nodes (without a remark the build counter
+  // already disambiguates) — dedupe must suffix the second one.
+  const dup = await gen9({ nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@a.example.com:443?security=tls#同名\nvless://f541611e-0aeb-4900-aa47-6e95d4916a49@b.example.com:443?security=tls#同名', preferredIps: '203.0.113.7#备注' });
+  const tok9 = await listTok9(dup.shortId);
+  const clash9 = await (await worker.fetch(new Request(`http://x/sub/${dup.shortId}?token=${tok9}&target=clash`), env)).text();
+  const names9 = [...clash9.split('proxy-groups:')[0].matchAll(/- name: "([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(names9).size, names9.length, 'clash proxy names are unique end-to-end');
+  assert.ok(names9.some((n) => n.endsWith('(2)')), 'the duplicate got a (2) suffix');
+  const surge9 = await worker.fetch(new Request(`http://x/sub/${dup.shortId}?token=${tok9}&target=surge`), env);
+  assert.equal(surge9.status, 400, 'vless-only surge target is a clear error, not an empty 200');
+  assert.ok((await surge9.text()).includes('Surge 仅支持 VMess / Trojan'), 'surge error explains the supported types');
+  console.log('audit round 9 suite: duplicate names + surge empty-profile error: passed');
 }

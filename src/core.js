@@ -182,7 +182,32 @@ export function expandNodes(baseNodes, endpoints, options = {}) {
     });
   });
 
-  return { nodes: expanded, warnings };
+  return { nodes: dedupeNodeNames(expanded), warnings };
+}
+
+// Mirror of the worker's helper: Clash/Surge key proxies by name and
+// reject duplicates, so later occurrences of a name get a " (n)"
+// suffix, bumped past any name that already ends that way.
+export function dedupeNodeNames(nodes) {
+  const used = new Set();
+  const counts = new Map();
+  return nodes.map((node) => {
+    const base = node.name || '';
+    if (!used.has(base)) {
+      used.add(base);
+      counts.set(base, 1);
+      return node;
+    }
+    let n = (counts.get(base) || 1) + 1;
+    let candidate = `${base} (${n})`;
+    while (used.has(candidate)) {
+      n += 1;
+      candidate = `${base} (${n})`;
+    }
+    counts.set(base, n);
+    used.add(candidate);
+    return { ...node, name: candidate };
+  });
 }
 
 export function summarizeNodes(nodes, limit = 20) {
@@ -238,7 +263,7 @@ export function renderRawSubscription(nodes) {
 }
 
 export function renderClashSubscription(nodes) {
-  const supportedNodes = nodes.filter(isClashSupportedNode);
+  const supportedNodes = dedupeNodeNames(nodes).filter(isClashSupportedNode);
   if (!supportedNodes.length) {
     throw new Error('没有可导出为 Clash 的节点。当前版本主要支持 VMess/VLESS/Trojan 的 WS/TCP/GRPC/HTTP 常见格式。');
   }
@@ -275,12 +300,17 @@ export function renderClashSubscription(nodes) {
 }
 
 export function renderSurgeSubscription(nodes, requestUrl) {
-  const supportedNodes = nodes.filter((node) => node.type === 'vmess' || node.type === 'trojan');
-  if (!supportedNodes.length) {
-    throw new Error('当前 Surge 导出仅支持 VMess / Trojan 节点。你的示例 VMess 节点可以正常使用该导出。');
+  const filtered = nodes.filter((node) => node.type === 'vmess' || node.type === 'trojan');
+  if (!filtered.length) {
+    throw new Error('当前 Surge 导出仅支持 VMess / Trojan 节点。');
   }
+  // Sanitize first, then dedupe: two different raw names can sanitize
+  // to the same Surge name, and Surge keys proxies by that form.
+  const supportedNodes = dedupeNodeNames(
+    filtered.map((node) => ({ ...node, name: sanitizeSurgeName(node.name) })),
+  );
 
-  const proxyNames = supportedNodes.map((node) => sanitizeSurgeName(node.name));
+  const proxyNames = supportedNodes.map((node) => node.name);
   const lines = [
     `#!MANAGED-CONFIG ${requestUrl} interval=86400 strict=false`,
     '',
@@ -756,27 +786,28 @@ function setQueryParam(params, key, value) {
 }
 
 function yamlQuote(value) {
-  const text = String(value ?? '');
-  // Escape the whitespace controls as YAML escapes (a raw newline in
-  // a double-quoted scalar only survives via line folding, which
-  // silently renames the node in Clash) and drop the remaining C0
-  // controls outright — they are never legitimate in a name/host.
-  const cleaned = text
+  // Semantics intentionally identical to the worker's escapeYaml —
+  // the two implementations are kept in lockstep (an equivalence
+  // battery in tests/smoke.mjs compares their rendered names): escape
+  // backslash/quote, spell out tabs, FLATTEN line breaks to a space
+  // (a raw CR/LF would break the line-based format; folding would
+  // silently rename the node), drop the remaining C0 controls.
+  const cleaned = String(value ?? '')
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
     .replace(/\t/g, '\\t')
+    .replace(/[\r\n]+/g, ' ')
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
   return `"${cleaned}"`;
 }
 
 function sanitizeSurgeName(name) {
-  return String(name || 'proxy')
-    .replace(/[\r\n]/g, ' ')
-    .replace(/,/g, '，')
-    .replace(/=/g, '＝')
-    .trim();
+  // Identical semantics to the worker's surgeName (lockstep — see the
+  // equivalence battery in tests/smoke.mjs): line breaks and commas
+  // collapse to a space, since Surge's field/group syntax is comma-
+  // separated. (This copy previously rewrote them to fullwidth
+  // punctuation instead — one of the drifts the battery now guards.)
+  return String(name || '').replace(/[\r\n,]+/g, ' ').trim();
 }
 
 function escapeSurgeHeader(value) {

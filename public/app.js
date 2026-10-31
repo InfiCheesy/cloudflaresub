@@ -34,6 +34,12 @@ document.addEventListener('visibilitychange', () => {
   diagPush({ kind: 'event', name: document.visibilityState === 'visible' ? 'page-visible' : 'page-hidden' });
 });
 const rawFetch = window.fetch.bind(window);
+// No request may hang forever: a stalled platform request used to
+// leave the UI stuck on 生成中/加载中 with no trace in this journal
+// (only completed calls were recorded). Every string-URL fetch gets
+// a 20s AbortController budget; a timeout is journaled as
+// err 'timeout' and surfaces as a clear Chinese error.
+const FETCH_TIMEOUT_MS = 20000;
 window.fetch = async (input, init) => {
   const urlStr = typeof input === 'string' ? input : (input && input.url) || '';
   let path = '';
@@ -42,17 +48,29 @@ window.fetch = async (input, init) => {
   const template = path.startsWith('/sub/') ? '/sub/:id' : path;
   const method = (init && init.method) || (input && input.method) || 'GET';
   const started = performance.now();
+  let controller = null;
+  let timer = null;
+  let timedOut = false;
+  let effectiveInit = init;
+  if (typeof input === 'string' && !(init && init.signal) && typeof AbortController === 'function') {
+    controller = new AbortController();
+    timer = setTimeout(() => { timedOut = true; controller.abort(); }, FETCH_TIMEOUT_MS);
+    effectiveInit = { ...(init || {}), signal: controller.signal };
+  }
   try {
-    const resp = await rawFetch(input, init);
+    const resp = await rawFetch(input, effectiveInit);
     if (track) {
       diagPush({ kind: 'api', route: `${method} ${template}`, status: resp.status, ms: Math.round(performance.now() - started) });
     }
     return resp;
   } catch (e) {
     if (track) {
-      diagPush({ kind: 'api', route: `${method} ${template}`, status: 0, ms: Math.round(performance.now() - started), err: (e && e.name) || 'Error' });
+      diagPush({ kind: 'api', route: `${method} ${template}`, status: 0, ms: Math.round(performance.now() - started), err: timedOut ? 'timeout' : ((e && e.name) || 'Error') });
     }
+    if (timedOut) throw new Error('请求超时，请检查网络后重试');
     throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 };
 
@@ -800,6 +818,7 @@ function sortedAdminItems() {
 
 function itemMatchesQuery(item, needle) {
   if (!needle) return true;
+  if ((item.id || '').toLowerCase().includes(needle)) return true;
   if ((item.note || '').toLowerCase().includes(needle)) return true;
   if ((item.tags || []).some((t) => String(t).toLowerCase().includes(needle))) return true;
   return (item.sources || []).some((s) => String(s).toLowerCase().includes(needle));

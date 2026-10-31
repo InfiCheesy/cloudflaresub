@@ -618,6 +618,33 @@ function parseRawLinks(input) {
   return { nodes, skipped };
 }
 
+// Clash/Mihomo and Surge key proxies by name and reject (or silently
+// misroute) duplicates. Two source nodes sharing one remark — or the
+// same link pasted twice — used to produce duplicate names and a
+// subscription the client refused to import. Later occurrences get a
+// " (n)" suffix, bumped past any name that already ends that way.
+function dedupeNodeNames(nodes) {
+  const used = new Set();
+  const counts = new Map();
+  return nodes.map((node) => {
+    const base = node.name || '';
+    if (!used.has(base)) {
+      used.add(base);
+      counts.set(base, 1);
+      return node;
+    }
+    let n = (counts.get(base) || 1) + 1;
+    let candidate = `${base} (${n})`;
+    while (used.has(candidate)) {
+      n += 1;
+      candidate = `${base} (${n})`;
+    }
+    counts.set(base, n);
+    used.add(candidate);
+    return { ...node, name: candidate };
+  });
+}
+
 function buildNodes(baseNodes, preferredEndpoints, options = {}) {
   const output = [];
   const prefix = (options.namePrefix || '').trim();
@@ -643,7 +670,7 @@ function buildNodes(baseNodes, preferredEndpoints, options = {}) {
       });
     }
   }
-  return output;
+  return dedupeNodeNames(output);
 }
 
 function encodeVmess(node) {
@@ -723,6 +750,9 @@ function pushClashWsOpts(lines, node) {
 }
 
 function renderClash(nodes) {
+  // Stored records predate build-time dedupe: rename again here so an
+  // old entry with duplicate names still imports cleanly.
+  nodes = dedupeNodeNames(nodes);
   const proxies = nodes
     .map((node) => {
       if (node.type === 'vmess') {
@@ -865,8 +895,17 @@ function surgeField(value) {
 }
 
 function renderSurge(nodes, baseUrl, linkToken) {
-  const proxies = nodes
-    .filter((node) => node.type === 'vmess' || node.type === 'trojan')
+  // Dedupe twice: once on the raw names (shared with Clash), then on
+  // the Surge-sanitized names — two different raw names can sanitize
+  // to the same Surge name ('a,b' vs 'a b'), and Surge keys by the
+  // sanitized form. surgeName is idempotent, so the renders below are
+  // unaffected.
+  const supported = dedupeNodeNames(
+    dedupeNodeNames(nodes)
+      .filter((node) => node.type === 'vmess' || node.type === 'trojan')
+      .map((node) => ({ ...node, name: surgeName(node.name) })),
+  );
+  const proxies = supported
     .map((node) => {
       if (node.type === 'vmess') {
         return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
@@ -883,8 +922,7 @@ function renderSurge(nodes, baseUrl, linkToken) {
     '',
     '[Proxy Group]',
     'Proxy = select, ' +
-      nodes
-        .filter((n) => n.type === 'vmess' || n.type === 'trojan')
+      supported
         .map((n) => surgeName(n.name))
         .join(', '),
     '',
@@ -1987,6 +2025,16 @@ async function handleSub(request, env, url) {
     return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
   }
   if (target === 'surge') {
+    // Surge supports only VMess/Trojan: an entry without either used
+    // to return a 200 with an empty [Proxy] section, which imports
+    // into a client as a silently node-less profile. Say so instead.
+    if (!nodes.some((node) => node.type === 'vmess' || node.type === 'trojan')) {
+      return text(
+        '该条目没有 Surge 支持的节点：Surge 仅支持 VMess / Trojan 节点，当前条目不含这两种类型。',
+        400,
+        'text/plain; charset=utf-8',
+      );
+    }
     return text(
       renderSurge(nodes, url.origin + url.pathname, await linkTokenFor(id, env)),
       200,

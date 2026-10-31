@@ -511,6 +511,8 @@ function parseVlessUri(uri) {
     sni: String(params.sni || params.peer || '').trim(),
     tls: security === 'tls' || security === 'reality',
     security,
+    pbk: String(params.pbk || '').trim(),
+    sid: String(params.sid || '').trim(),
     alpn: splitListValue(params.alpn),
     fp: String(params.fp || '').trim(),
     allowInsecure: toBoolean(params.allowInsecure || params.insecure),
@@ -638,6 +640,13 @@ function renderClashProxy(node) {
       lines.push(`    client-fingerprint: ${yamlQuote(node.fp)}`);
     }
     lines.push(`    skip-cert-verify: ${node.allowInsecure ? 'true' : 'false'}`);
+    if (node.type === 'vless' && node.security === 'reality' && node.pbk) {
+      lines.push('    reality-opts:');
+      lines.push(`      public-key: ${yamlQuote(node.pbk)}`);
+      if (node.sid) {
+        lines.push(`      short-id: ${yamlQuote(node.sid)}`);
+      }
+    }
   }
 
   lines.push(`    network: ${node.network || 'tcp'}`);

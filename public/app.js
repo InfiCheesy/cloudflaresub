@@ -1268,12 +1268,17 @@ function renderAdminList() {
   updateSelectionUI();
 }
 
+let adminListLoadSeq = 0;
 async function loadAdminList() {
   const token = adminToken();
   if (!token) {
     adminMsg.textContent = '请先填入 SUB_ACCESS_TOKEN。';
     return;
   }
+  // Overlapping loads (double-click, reload races) resolve in network
+  // order, not request order: without a sequence guard a slow older
+  // response lands last and silently reverts the list to stale data.
+  const seq = ++adminListLoadSeq;
   storageSet('sessionStorage', 'cfsub_admin_token', token);
   adminMsg.textContent = '加载中...';
   // The shared tag order loads in parallel; when it lands it
@@ -1283,6 +1288,7 @@ async function loadAdminList() {
     // The admin token travels in a header, never in the URL.
     const resp = await fetch('/api/list', { headers: { 'x-admin-token': token } });
     const data = await resp.json().catch(() => null);
+    if (seq !== adminListLoadSeq) return; // a newer load superseded this one
     if (!resp.ok || !data || !data.ok) throw new Error((data && data.error) || '加载失败');
     adminState.items = data.items || [];
     // Ingestion boundary: whatever the server (or a future regression
@@ -1297,6 +1303,7 @@ async function loadAdminList() {
     pruneTagOrderToVocab();
     updateAdminCount();
   } catch (e) {
+    if (seq !== adminListLoadSeq) return; // superseded; the newer load owns the message
     adminMsg.textContent = e.message || '加载失败';
   }
 }
@@ -1688,6 +1695,35 @@ async function settleNoteAutosaves(ids) {
   ids.forEach(cancelNoteAutosave);
   await Promise.all(ids.map((id) => noteSaveStates.get(id)?.promise).filter(Boolean).map((p) => p.catch(() => {})));
 }
+
+// A queued autosave lives in a ~0.9s timer: closing the tab (or the
+// OS killing a backgrounded mobile tab) inside that window used to
+// drop the last edit silently, despite the 自动保存 promise. On
+// pagehide, fire every unsaved note change immediately with
+// keepalive so the request outlives the page. Read-back verification
+// is skipped — landing the write is what counts here.
+window.addEventListener('pagehide', () => {
+  if (!adminBody) return;
+  const token = adminToken();
+  if (!token) return;
+  for (const entry of adminBody.querySelectorAll('.entry')) {
+    const id = entry.dataset.id;
+    const box = entry.querySelector('.note-input');
+    if (!id || !box) continue;
+    const item = adminItems.get(id);
+    if (!item) continue;
+    const value = normalizeNoteText(box.value);
+    if (value === (item.note || '')) continue;
+    try {
+      fetch('/api/note', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id, note: value, token }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch { /* the page is going away; nothing more can be done */ }
+  }
+});
 
 // Tags/retention saves rewrite the SAME record the note autosave
 // writes, and every handler puts the whole record from its own read:

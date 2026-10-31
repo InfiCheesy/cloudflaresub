@@ -1236,3 +1236,59 @@ console.log('worker tests passed');
   assert.equal(rawR.status, 400, 'empty record: default raw target is a clear 400 too');
   console.log('audit-10 suite: reserved names renamed, empty records refuse clearly');
 }
+
+// ===== Audit round 11: Clash transport completeness + truncation warnings =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  // REALITY vless: Clash must carry tls + reality-opts + flow, and the
+  // raw link must still round-trip security=reality.
+  const rl = await generate({
+    nodeLinks: 'vless://' + U + '@rl.example.com:443?security=reality&encryption=none&pbk=AAAABBBBCCCC&sid=0123&flow=xtls-rprx-vision&sni=www.example.com&fp=chrome&type=tcp#RL',
+    preferredIps: '1.2.3.4',
+  });
+  const rlClash = await getSub(rl.shortId, 'clash');
+  assert.ok(rlClash.body.includes('tls: true'), 'reality: clash tls is true');
+  assert.ok(rlClash.body.includes('reality-opts:'), 'reality: clash carries reality-opts');
+  assert.ok(rlClash.body.includes('public-key: "AAAABBBBCCCC"'), 'reality: clash carries the public key');
+  assert.ok(rlClash.body.includes('short-id: "0123"'), 'reality: clash carries the short id');
+  assert.ok(rlClash.body.includes('flow: "xtls-rprx-vision"'), 'reality: clash carries the flow');
+  assert.ok(rlClash.body.includes('client-fingerprint: "chrome"'), 'reality: clash carries the fingerprint');
+  const rlRaw = await getSub(rl.shortId);
+  assert.ok(Buffer.from(rlRaw.body, 'base64').toString('utf8').includes('security=reality'), 'reality: raw link still round-trips security=reality');
+
+  // A record stored BEFORE the parser modeled reality (fields only in
+  // params, tls:false) renders the same through the read-through.
+  await env.SUB_STORE.put('sub:OldRL001', JSON.stringify({
+    id: 'OldRL001',
+    nodes: [{ type: 'vless', name: 'oldrl', server: 'rl.example.com', port: 443, uuid: U, network: 'tcp', tls: false, sni: 'www.example.com', host: '', path: '/', fp: '', alpn: '', flow: 'xtls-rprx-vision', params: { security: 'reality', pbk: 'AAAABBBBCCCC', sid: '0123', flow: 'xtls-rprx-vision', sni: 'www.example.com', type: 'tcp' } }],
+    storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr11 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('OldRL001', lr11.items.find((i) => i.id === 'OldRL001').linkToken);
+  const oldClash = await getSub('OldRL001', 'clash');
+  assert.ok(oldClash.body.includes('reality-opts:') && oldClash.body.includes('tls: true'), 'reality: pre-fix records render via params read-through');
+
+  // grpc service name + trojan allowInsecure + alpn.
+  const tj = await generate({
+    nodeLinks: 'vless://' + U + '@g.example.com:443?security=tls&type=grpc&serviceName=mysvc&alpn=h2#GRPC\n'
+      + 'trojan://' + 'pw' + '@t.example.com:443?allowInsecure=1&sni=t.example.com#TJ',
+    preferredIps: '1.2.3.4',
+  });
+  const tjClash = await getSub(tj.shortId, 'clash');
+  assert.ok(tjClash.body.includes('grpc-opts:') && tjClash.body.includes('grpc-service-name: "mysvc"'), 'grpc: clash carries the service name');
+  assert.ok(tjClash.body.includes('alpn: ["h2"]'), 'grpc: clash carries alpn');
+  assert.ok(tjClash.body.includes('skip-cert-verify: true'), 'trojan: clash honors allowInsecure');
+  const tjSurge = await getSub(tj.shortId, 'surge');
+  assert.ok(tjSurge.body.includes('skip-cert-verify=true'), 'trojan: surge honors allowInsecure');
+
+  // Truncation of the STORED inputs is warned about (generation itself
+  // parses the full text — the valid link still produces nodes).
+  const padLine = '#' + 'x'.repeat(89);
+  const bigLinks = (padLine + '\n').repeat(1200) + 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: '尾巴节点', add: 'a.example.com', port: '443', id: U, aid: '0', net: 'tcp', type: 'none', tls: '' })).toString('base64');
+  const big = await generate({ nodeLinks: bigLinks, preferredIps: '1.2.3.4' });
+  assert.ok(big.counts.outputNodes >= 1, 'truncation: the tail link still generated (parse uses full text)');
+  assert.ok((big.warnings || []).some((w) => w.includes('存档仅保留前 100000 字符')), 'truncation: nodeLinks cap is warned');
+  const bigIps = await generate({ nodeLinks: 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', net: 'tcp', type: 'none', tls: '' })).toString('base64'), preferredIps: '1.2.3.4\n'.repeat(7000) });
+  assert.ok((bigIps.warnings || []).some((w) => w.includes('存档仅保留前 50000 字符')), 'truncation: preferredIps cap is warned');
+  console.log('audit-11 suite: reality/grpc/insecure/alpn in clash, truncation warnings: passed');
+}

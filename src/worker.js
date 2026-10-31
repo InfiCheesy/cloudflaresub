@@ -561,6 +561,7 @@ function parseVmess(link) {
 
 function parseUrlLike(link, type) {
   const u = new URL(link);
+  const security = (u.searchParams.get('security') || '').toLowerCase();
   return {
     type,
     name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
@@ -570,7 +571,18 @@ function parseUrlLike(link, type) {
     password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
     uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
     network: u.searchParams.get('type') || 'tcp',
-    tls: (u.searchParams.get('security') || '').toLowerCase() === 'tls',
+    // REALITY and XTLS are TLS-family transports: treating only the
+    // literal 'tls' as encrypted used to render REALITY nodes as
+    // plaintext in Clash (they still round-tripped in raw links via
+    // params, so nothing looked wrong until the node never connected).
+    security,
+    tls: security === 'tls' || security === 'reality' || security === 'xtls',
+    pbk: u.searchParams.get('pbk') || '',
+    sid: u.searchParams.get('sid') || '',
+    serviceName: u.searchParams.get('serviceName') || '',
+    allowInsecure: ['1', 'true'].includes(
+      (u.searchParams.get('allowInsecure') || u.searchParams.get('insecure') || '').toLowerCase(),
+    ),
     host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
     path: u.searchParams.get('path') || '/',
     sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
@@ -703,7 +715,12 @@ function encodeVless(node) {
   // model (e.g. encryption=none) and the original ordering survive a round trip.
   const params = new URLSearchParams(node.params || {});
   params.set('type', node.network || 'ws');
-  if (node.tls) params.set('security', 'tls');
+  // Preserve REALITY/XTLS verbatim: the parser now reports them as
+  // tls:true, and the old unconditional rewrite to 'tls' would have
+  // broken the raw round trip that used to work.
+  const secIn = String(node.security || (params.get('security') || '')).toLowerCase();
+  if (secIn === 'reality' || secIn === 'xtls') params.set('security', secIn);
+  else if (node.tls) params.set('security', 'tls');
   else if ((params.get('security') || '').toLowerCase() === 'tls') params.delete('security');
   if (node.host) params.set('host', node.host); else params.delete('host');
   if (node.sni) params.set('sni', node.sni); else params.delete('sni');
@@ -753,12 +770,46 @@ function pushClashWsOpts(lines, node) {
   );
 }
 
+// TLS-family options the links can carry and Clash understands. The
+// renderer used to drop all of them (core's copy emits them), which
+// silently degraded or broke nodes in Clash only.
+function pushClashTlsExtras(lines, node) {
+  if (node.allowInsecure) lines.push('    skip-cert-verify: true');
+  if (node.fp) lines.push(`    client-fingerprint: "${escapeYaml(node.fp)}"`);
+  if (node.alpn) {
+    const list = String(node.alpn).split(',').map((s) => s.trim()).filter(Boolean);
+    if (list.length) lines.push(`    alpn: [${list.map((a) => `"${escapeYaml(a)}"`).join(', ')}]`);
+  }
+}
+
+function pushClashGrpcOpts(lines, node) {
+  if ((node.network || '') === 'grpc' && node.serviceName) {
+    lines.push('    grpc-opts:', `      grpc-service-name: "${escapeYaml(node.serviceName)}"`);
+  }
+}
+
 function renderClash(nodes) {
   // Stored records predate build-time dedupe: rename again here so an
   // old entry with duplicate names still imports cleanly.
   nodes = dedupeNodeNames(nodes, ['自动选择', '节点选择']);
   const proxies = nodes
     .map((node) => {
+      // Records stored before the parser modeled REALITY carry these
+      // only in the raw params: read through so old entries render
+      // correctly without being regenerated.
+      if (node.type === 'vless' || node.type === 'trojan') {
+        const p = node.params || {};
+        node = {
+          ...node,
+          security: node.security || String(p.security || '').toLowerCase(),
+          tls: node.tls || ['reality', 'xtls'].includes(String(p.security || '').toLowerCase()),
+          pbk: node.pbk || p.pbk || '',
+          sid: node.sid || p.sid || '',
+          serviceName: node.serviceName || p.serviceName || '',
+          allowInsecure: node.allowInsecure
+            || ['1', 'true'].includes(String(p.allowInsecure || p.insecure || '').toLowerCase()),
+        };
+      }
       if (node.type === 'vmess') {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
@@ -780,6 +831,8 @@ function renderClash(nodes) {
         if ((node.network || 'ws') === 'ws') {
           pushClashWsOpts(lines, node);
         }
+        pushClashGrpcOpts(lines, node);
+        if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
       }
@@ -800,9 +853,21 @@ function renderClash(nodes) {
           lines.push(`    servername: "${escapeYaml(node.sni)}"`);
         }
 
+        if (node.flow) {
+          lines.push(`    flow: "${escapeYaml(node.flow)}"`);
+        }
+
+        if (node.security === 'reality' && node.pbk) {
+          lines.push('    reality-opts:');
+          lines.push(`      public-key: "${escapeYaml(node.pbk)}"`);
+          if (node.sid) lines.push(`      short-id: "${escapeYaml(node.sid)}"`);
+        }
+
         if ((node.network || 'ws') === 'ws') {
           pushClashWsOpts(lines, node);
         }
+        pushClashGrpcOpts(lines, node);
+        if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
       }
@@ -832,6 +897,8 @@ function renderClash(nodes) {
         if (node.network === 'ws') {
           pushClashWsOpts(lines, node);
         }
+        pushClashGrpcOpts(lines, node);
+        pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
       }
@@ -907,7 +974,13 @@ function renderSurge(nodes, baseUrl, linkToken) {
   const supported = dedupeNodeNames(
     dedupeNodeNames(nodes)
       .filter((node) => node.type === 'vmess' || node.type === 'trojan')
-      .map((node) => ({ ...node, name: surgeName(node.name) })),
+      .map((node) => ({
+        ...node,
+        name: surgeName(node.name),
+        // Same params read-through as renderClash for older records.
+        allowInsecure: node.allowInsecure
+          || ['1', 'true'].includes(String((node.params || {}).allowInsecure || (node.params || {}).insecure || '').toLowerCase()),
+      })),
     ['Proxy'],
   );
   const proxies = supported
@@ -915,7 +988,7 @@ function renderSurge(nodes, baseUrl, linkToken) {
       if (node.type === 'vmess') {
         return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
       }
-      return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}`;
+      return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`;
     });
 
   return [
@@ -1453,6 +1526,15 @@ async function handleGenerate(request, env, url) {
     warnings: [
       ...(accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。']),
       ...(skippedLines > 0 ? [`有 ${skippedLines} 行节点链接无法解析或端口不可用，已跳过。`] : []),
+      // Generation parses the full text, but the stored copy (what
+      // backfill restores) is capped: say so, or the tail silently
+      // vanishes from every future backfill-and-regenerate.
+      ...(String(body.nodeLinks || '').length > 100000
+        ? ['节点链接过长：本次已完整生成，但存档仅保留前 100000 字符，日后用「回填到生成区」再生成时尾部链接会缺失（且会生成新条目）。']
+        : []),
+      ...(mixedText.length > 50000
+        ? ['优选地址框过长：本次已完整生成，但存档仅保留前 50000 字符，日后用「回填到生成区」再生成时尾部内容会缺失（且会生成新条目）。']
+        : []),
       ...(dynamic && sourceUrls.length === 1 && !sourceInfo.failed.length
         ? [`动态订阅：将自动跟随来源的最新优选 IP（约每小时刷新；来源不可用时用上次快照兜底）。来源现有 ${sourceInfo.total} 个优选地址，本次使用前 ${dynamic.limit} 个。`]
         : []),

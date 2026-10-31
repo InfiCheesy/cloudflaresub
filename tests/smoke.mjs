@@ -121,6 +121,10 @@ assert.equal(payload.nodes.length, 2);
     { type: 'vmess', name: '🚀 节点选择', server: 'h.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', hostHeader: '', path: '/' },
   ]);
   assert.ok(coreReserved.includes('- name: "🚀 节点选择 (2)"'), 'core clash renames a node named like its select group');
+  // Audit-11: core renders REALITY vless with reality-opts.
+  const rlParsed = parseNodeLinks('vless://f541611e-0aeb-4900-aa47-6e95d4916a49@rl.example.com:443?security=reality&pbk=AAAABBBBCCCC&sid=0123&flow=xtls-rprx-vision&sni=www.example.com&type=tcp#RL');
+  const rlCore = renderClashSubscription(rlParsed.nodes);
+  assert.ok(rlCore.includes('reality-opts:') && rlCore.includes('AAAABBBBCCCC'), 'core clash carries reality-opts');
   console.log('equivalence battery: worker/core rendered names agree');
 }
 

@@ -266,7 +266,7 @@ export function renderRawSubscription(nodes) {
 }
 
 export function renderClashSubscription(nodes) {
-  const supportedNodes = dedupeNodeNames(nodes, ['🚀 节点选择', '♻️ 自动选择']).filter(isClashSupportedNode);
+  const supportedNodes = dedupeNodeNames(nodes, ['🚀 节点选择', '♻️ 自动选择', 'DIRECT', 'REJECT', 'GLOBAL']).filter(isClashSupportedNode);
   if (!supportedNodes.length) {
     throw new Error('没有可导出为 Clash 的节点。当前版本主要支持 VMess/VLESS/Trojan 的 WS/TCP/GRPC/HTTP 常见格式。');
   }
@@ -311,7 +311,7 @@ export function renderSurgeSubscription(nodes, requestUrl) {
   // to the same Surge name, and Surge keys proxies by that form.
   const supportedNodes = dedupeNodeNames(
     filtered.map((node) => ({ ...node, name: sanitizeSurgeName(node.name) })),
-    ['🚀 节点选择', '♻️ 自动选择'],
+    ['🚀 节点选择', '♻️ 自动选择', 'DIRECT', 'REJECT'],
   );
 
   const proxyNames = supportedNodes.map((node) => node.name);

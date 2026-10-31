@@ -1354,3 +1354,95 @@ console.log('worker tests passed');
   assert.equal(listResp.headers.get('x-content-type-options'), 'nosniff', 'api: nosniff set');
   console.log('audit-12 suite: surge managed-config + transports, update intervals, framing headers: passed');
 }
+
+// ===== Audit round 13: parse guards, built-in policy names, census ages, source coalescing =====
+{
+  // A hand-corrupted record must fail cleanly everywhere, not as a
+  // bare 500 from an unguarded parse.
+  await env.SUB_STORE.put('sub:FixR1301', 'this is not json{');
+  const lrBad = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  const badTok = lrBad.items.find((i) => i.id === 'FixR1301').linkToken;
+  const badSub = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1301?token=' + badTok), env);
+  assert.equal(badSub.status, 500, 'corrupt record: /sub is a clean 500');
+  assert.ok((await badSub.text()).includes('条目数据损坏'), 'corrupt record: /sub says the record is damaged');
+  for (const path of ['/api/note', '/api/tags', '/api/retention']) {
+    const body = path === '/api/note'
+      ? { token: 'tok', id: 'FixR1301', note: 'x' }
+      : path === '/api/tags'
+        ? { token: 'tok', id: 'FixR1301', tags: ['a'] }
+        : { token: 'tok', id: 'FixR1301', mode: 'permanent' };
+    const resp = await worker.fetch(new Request('https://x.pages.dev' + path, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    }), env);
+    const data = await resp.json();
+    assert.equal(resp.status, 500, `corrupt record: ${path} is a clean 500`);
+    assert.equal(data.error, '条目数据损坏', `corrupt record: ${path} names the damage`);
+  }
+
+  // Regenerating the same content as a corrupted entry heals it: the
+  // dedup path mints a fresh record instead of throwing.
+  const healBody = { nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@heal.example.com:443?security=tls&type=ws#HEAL', preferredIps: '1.2.3.4' };
+  const first = await generate(healBody);
+  await env.SUB_STORE.put('sub:' + first.shortId, 'corrupted!!');
+  const healed = await generate(healBody);
+  assert.equal(healed.shortId, first.shortId, 'corrupt entry: regenerate heals the record in place under the same id');
+  const healedSub = await getSub(healed.shortId, 'clash');
+  assert.equal(healedSub.status, 200, 'corrupt entry: the healed entry serves normally');
+
+  // Built-in policy names are reserved in both exporters. Seeded as
+  // a stored record: the generate path's counter suffixes mean exact
+  // built-in names only arrive via stored/legacy records, which is
+  // what the render-time dedupe guards.
+  const U13 = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  await env.SUB_STORE.put('sub:FixR1302', JSON.stringify({
+    id: 'FixR1302',
+    nodes: [
+      { type: 'vless', name: 'DIRECT', server: 'd1.example.com', port: 443, uuid: U13, network: 'ws', tls: true, sni: '', host: '', path: '/', params: { type: 'ws' } },
+      { type: 'trojan', name: 'REJECT', server: 'd2.example.com', port: 443, password: 'pw', tls: true, sni: '', host: '', path: '/', network: 'tcp', params: {} },
+      { type: 'vmess', name: 'DIRECT', server: 'd3.example.com', port: 443, uuid: U13, cipher: 'auto', network: 'ws', tls: true, sni: '', host: 'h.example.com', path: '/' },
+    ],
+    storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr13 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('FixR1302', lr13.items.find((i) => i.id === 'FixR1302').linkToken);
+  const namedClash = await getSub('FixR1302', 'clash');
+  assert.ok(namedClash.body.includes('name: "DIRECT (2)"'), 'clash: a DIRECT node is renamed out of the built-in namespace');
+  assert.ok(namedClash.body.includes('name: "REJECT (2)"'), 'clash: a REJECT node is renamed too');
+  assert.ok(!namedClash.body.includes('name: "DIRECT"'), 'clash: no proxy keeps the exact built-in name');
+  const namedSurge = await getSub('FixR1302', 'surge');
+  assert.ok(namedSurge.body.includes('DIRECT (2) = vmess'), 'surge: a DIRECT node is renamed too');
+
+  // The census age summary reads ISO createdAt values (what every
+  // record actually stores), not only epoch numbers.
+  const diagResp = await worker.fetch(new Request('https://x.pages.dev/api/diag', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok' }),
+  }), env);
+  const diagJson = await diagResp.json();
+  assert.equal(typeof diagJson.diag.census.oldestAgeDays, 'number', 'census: oldestAgeDays populates from ISO createdAt');
+  assert.equal(typeof diagJson.diag.census.newestAgeDays, 'number', 'census: newestAgeDays populates from ISO createdAt');
+
+  // Concurrent refreshes of one source coalesce into a single fetch.
+  const realFetch = globalThis.fetch;
+  let sourceFetches = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u === 'https://coal.example.com/ips.txt') {
+      sourceFetches++;
+      await new Promise((r) => setTimeout(r, 60));
+      return new Response('104.16.9.9\n104.16.9.10', { status: 200 });
+    }
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const mk = (host) => ({
+      nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@' + host + ':443?security=tls&type=ws#CO',
+      preferredIps: 'https://coal.example.com/ips.txt',
+    });
+    const [g1, g2] = await Promise.all([generate(mk('c1.example.com')), generate(mk('c2.example.com'))]);
+    assert.ok(g1.shortId && g2.shortId && g1.shortId !== g2.shortId, 'coalescing: both generates succeed');
+    assert.equal(sourceFetches, 1, 'coalescing: two concurrent generates fetch the source once');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  console.log('audit-13 suite: parse guards, policy-name reservation, census ages, source coalescing: passed');
+}

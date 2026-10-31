@@ -326,6 +326,24 @@ async function getSourceEndpoints(env, rawUrl, now = Date.now()) {
   if (cached && now - (cached.lastAttempt || 0) < IP_SOURCE_RETRY_MS) {
     return { url, endpoints: cached.endpoints, fromCache: true, fetchedAt: cached.fetchedAt };
   }
+  // Coalesce concurrent refreshes of the same source: without this,
+  // every request landing inside the stale window fetched the source
+  // and rewrote the cache itself (a small stampede at each hourly
+  // boundary, paid in external fetches and KV writes).
+  const pending = sourceInflight.get(url);
+  if (pending) return pending;
+  const flight = fetchSourceAndCache(env, url, cached, now);
+  sourceInflight.set(url, flight);
+  try {
+    return await flight;
+  } finally {
+    if (sourceInflight.get(url) === flight) sourceInflight.delete(url);
+  }
+}
+
+const sourceInflight = new Map();
+
+async function fetchSourceAndCache(env, url, cached, now) {
   const fetchStartedAt = Date.now();
   try {
     const fresh = await fetchIpSource(url);
@@ -350,7 +368,7 @@ async function getSourceEndpoints(env, rawUrl, now = Date.now()) {
       return { url, endpoints: cached.endpoints, fromCache: true, fetchedAt: cached.fetchedAt, refreshError: e.message };
     }
     throw e;
-  }
+}
 }
 
 // A refresh that could not reach a source must not erase the snapshot
@@ -806,7 +824,7 @@ function pushClashHttpOpts(lines, node) {
 function renderClash(nodes) {
   // Stored records predate build-time dedupe: rename again here so an
   // old entry with duplicate names still imports cleanly.
-  nodes = dedupeNodeNames(nodes, ['自动选择', '节点选择']);
+  nodes = dedupeNodeNames(nodes, ['自动选择', '节点选择', 'DIRECT', 'REJECT', 'GLOBAL']);
   const proxies = nodes
     .map((node) => {
       // Records stored before the parser modeled REALITY carry these
@@ -1002,7 +1020,7 @@ function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
         allowInsecure: node.allowInsecure
           || ['1', 'true'].includes(String((node.params || {}).allowInsecure || (node.params || {}).insecure || '').toLowerCase()),
       })),
-    ['Proxy'],
+    ['Proxy', 'DIRECT', 'REJECT'],
   );
   const proxies = supported
     .map((node) => {
@@ -1459,8 +1477,15 @@ async function handleGenerate(request, env, url) {
     // a TTL also migrates older (7-day expiry) entries to permanent
     // storage, backfills sources, and applies a newly provided note.
     const raw = await env.SUB_STORE.get(`sub:${id}`);
+    let existing = null;
     if (raw) {
-      record = JSON.parse(raw);
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') existing = parsed;
+      } catch {}
+    }
+    if (existing) {
+      record = existing;
       const prevNote = (typeof record.note === 'string' ? record.note : '');
       if (providedNote !== null) record.note = providedNote;
       if (providedTags !== null) record.tags = providedTags;
@@ -1787,6 +1812,20 @@ function buildBackfill(record) {
 // Direct single-record read for write verification. Deliberately NOT
 // built on KV list(): the list index lags fresh writes and made the
 // UI's read-back check report false failures; a point get() is prompt.
+// Parse a stored entry record tolerantly: a hand-corrupted KV value
+// must surface as a clean 'record damaged' answer, not as a bare 500
+// from an unguarded JSON.parse. (The list, entry and census paths
+// already guard individually; the write/sub paths now share this.)
+function parseStoredRecord(raw) {
+  if (!raw) return null;
+  try {
+    const rec = JSON.parse(raw);
+    return rec && typeof rec === 'object' ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
 async function handleEntry(request, env, url) {
   if (!env.SUB_STORE) return json({ ok: false, error: 'SUB_STORE KV 未绑定' }, 500);
   const denied = await checkAdmin(request, env, url, null);
@@ -1883,7 +1922,8 @@ async function handleNote(request, env) {
   const raw = await env.SUB_STORE.get(`sub:${id}`);
   if (!raw) return json({ ok: false, error: '条目不存在' }, 404);
 
-  const record = JSON.parse(raw);
+  const record = parseStoredRecord(raw);
+  if (!record) return json({ ok: false, error: '条目数据损坏' }, 500);
   const prevNote = (typeof record.note === 'string' ? record.note : '');
   record.note = sanitizeNote(body.note);
   record.updatedAt = new Date().toISOString();
@@ -1910,7 +1950,8 @@ async function handleTagsSave(request, env) {
   const raw = await env.SUB_STORE.get(`sub:${id}`);
   if (!raw) return json({ ok: false, error: '条目不存在' }, 404);
 
-  const record = JSON.parse(raw);
+  const record = parseStoredRecord(raw);
+  if (!record) return json({ ok: false, error: '条目数据损坏' }, 500);
   record.tags = sanitizeTags(body.tags);
   record.updatedAt = new Date().toISOString();
   await putRecord(env, id, record, (typeof record.note === 'string' ? record.note : ''), remainingTtl(record));
@@ -2037,7 +2078,8 @@ async function handleRetention(request, env) {
   const retention = parseRetention({ storageMode: body.mode, retentionDays: body.days });
   if (retention.error) return json({ ok: false, error: retention.error }, 400);
 
-  const record = JSON.parse(raw);
+  const record = parseStoredRecord(raw);
+  if (!record) return json({ ok: false, error: '条目数据损坏' }, 500);
   record.storage = retention.storage;
   record.updatedAt = new Date().toISOString();
   // Re-apply from NOW: switching to permanent clears the TTL, switching to
@@ -2118,7 +2160,8 @@ async function handleSub(request, env, url) {
   const raw = await env.SUB_STORE.get(`sub:${id}`);
   if (!raw) return text('not found', 404);
 
-  const record = JSON.parse(raw);
+  const record = parseStoredRecord(raw);
+  if (!record) return text('条目数据损坏，无法生成订阅内容。', 500, 'text/plain; charset=utf-8');
   let nodes = record.nodes || [];
   if (record.dynamic && Array.isArray(record.baseNodes) && record.baseNodes.length) {
     // Dynamic subscription: rebuild the node list from the source's
@@ -2359,9 +2402,17 @@ async function diagCensus(env) {
       for (const t of clean) vocab.add(t.toLowerCase());
     }
     if (typeof rec.note === 'string' && rec.note) withNote++;
-    if (typeof rec.createdAt === 'number') {
-      oldest = oldest === null ? rec.createdAt : Math.min(oldest, rec.createdAt);
-      newest = newest === null ? rec.createdAt : Math.max(newest, rec.createdAt);
+    // Records store createdAt as an ISO string (only hand-made ones
+    // use epoch numbers): accept both, or the age summary below is a
+    // dead field that never populates for real data.
+    const createdMs = typeof rec.createdAt === 'number'
+      ? rec.createdAt
+      : typeof rec.createdAt === 'string'
+        ? Date.parse(rec.createdAt)
+        : NaN;
+    if (Number.isFinite(createdMs) && createdMs > 0) {
+      oldest = oldest === null ? createdMs : Math.min(oldest, createdMs);
+      newest = newest === null ? createdMs : Math.max(newest, createdMs);
     }
     const srcUrls = rec.dynamic && Array.isArray(rec.dynamic.sources)
       ? rec.dynamic.sources.map((s) => s && s.url)

@@ -396,6 +396,9 @@ async function loadGenTagVocab() {
   }
   const token = adminToken();
   if (!token) return;
+  // A token pasted just now (no list load yet) should also pick up
+  // the shared order before the suggestions render.
+  if (!tagOrderLoaded) loadTagOrderFromServer();
   try {
     const resp = await fetch('/api/tags', { headers: { 'x-admin-token': token } });
     const data = await resp.json();
@@ -2521,3 +2524,11 @@ if (diagExportBtn) {
     }
   });
 }
+
+// With a restored token, preload the shared tag order: it used to
+// load only together with the admin list, so a straight-to-generate
+// session rendered the picker's suggestions in vocabulary order
+// instead of the owner's arrangement. This deliberately runs at the
+// very end of the script — the tag-order state is declared further
+// up and must be initialized before the loader can touch it.
+if (savedAdminToken) loadTagOrderFromServer();

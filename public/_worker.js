@@ -1781,6 +1781,70 @@ async function handleTagsList(request, env, url) {
   return json({ ok: true, tags });
 }
 
+// The site-wide display order for the tag vocabulary (the filter bar
+// is canonical; suggestion areas follow it). Stored as ONE global
+// record on the server so every device sees the same arrangement —
+// it used to be a per-browser localStorage preference, which made
+// different devices disagree. Written without a TTL: it is settings,
+// not an entry.
+const TAG_ORDER_KV_KEY = 'meta:tag-order';
+const MAX_TAG_ORDER = 500;
+
+function sanitizeTagOrder(value) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of value) {
+    if (typeof raw !== 'string') continue;
+    const tag = dropDanglingSurrogate(
+      raw.replace(/[\r\n\t]+/g, ' ').trim().slice(0, MAX_TAG_LENGTH),
+    ).trim();
+    if (!tag) continue;
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+    if (out.length >= MAX_TAG_ORDER) break;
+  }
+  return out;
+}
+
+async function readTagOrder(env) {
+  // Point get on the record itself — never a list() scan (KV list is
+  // eventually consistent and would serve stale orders).
+  const raw = await env.SUB_STORE.get(TAG_ORDER_KV_KEY);
+  if (!raw) return [];
+  try {
+    return sanitizeTagOrder(JSON.parse(raw)?.order);
+  } catch {
+    return [];
+  }
+}
+
+async function handleTagOrderGet(request, env, url) {
+  if (!env.SUB_STORE) return json({ ok: false, error: 'SUB_STORE KV 未绑定' }, 500);
+  const denied = await checkAdmin(request, env, url, null);
+  if (denied) return denied;
+  return json({ ok: true, order: await readTagOrder(env) });
+}
+
+async function handleTagOrderSave(request, env) {
+  const { body, error } = await parseAdminBody(request, env);
+  if (error) return error;
+  if (!Array.isArray(body.order)) return json({ ok: false, error: 'order 必须是数组' }, 400);
+  const order = sanitizeTagOrder(body.order);
+  // One-time import semantics: a client carrying its old per-browser
+  // order may claim an EMPTY server order, but must never overwrite
+  // one that already exists — whichever device imports first wins,
+  // and after that the server copy is the only one anyone reads.
+  if (body.ifEmpty === true) {
+    const existing = await readTagOrder(env);
+    if (existing.length) return json({ ok: true, order: existing, imported: false });
+  }
+  await env.SUB_STORE.put(TAG_ORDER_KV_KEY, JSON.stringify({ order, updatedAt: new Date().toISOString() }));
+  return json({ ok: true, order, imported: body.ifEmpty === true });
+}
+
 async function handleRetention(request, env) {
   const { body, error } = await parseAdminBody(request, env);
   if (error) return error;
@@ -1958,6 +2022,14 @@ export default {
 
       if (request.method === 'POST' && url.pathname === '/api/tags') {
         return await handleTagsSave(request, env);
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/tag-order') {
+        return await handleTagOrderGet(request, env, url);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/tag-order') {
+        return await handleTagOrderSave(request, env);
       }
 
       if (request.method === 'POST' && url.pathname === '/api/retention') {

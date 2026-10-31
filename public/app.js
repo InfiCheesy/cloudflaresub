@@ -708,18 +708,73 @@ function entryTagsHtml(item) {
   return `<div class="entry-tags">${tags.map((t) => `<button type="button" class="tag-chip tag-chip-mini${sel.has(String(t).toLowerCase()) ? ' is-on' : ''}" data-tag-filter="${escapeHtml(t)}" title="按此标签筛选">${escapeHtml(t)}</button>`).join('')}</div>`;
 }
 
-// The filter bar's chip order is a view preference of this browser:
-// a long-press drag stores it, and it then wins over the default
-// count/name order for the tags it names (new tags follow behind).
-const TAG_ORDER_KEY = 'cfsub_tag_filter_order';
+// The tag display order lives on the SERVER (GET/POST
+// /api/tag-order): one shared arrangement for every device. This
+// variable is only the current page's working copy. The order used
+// to be a per-browser localStorage preference, which made devices
+// disagree; the one remaining localStorage interaction is the
+// one-time import in loadTagOrderFromServer, after which the legacy
+// key is removed and never read or written again.
+const LEGACY_TAG_ORDER_KEY = 'cfsub_tag_filter_order';
+let tagOrder = [];
+
 function loadTagOrder() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(TAG_ORDER_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed.map(String) : [];
-  } catch { return []; }
+  return tagOrder;
 }
+
+async function persistTagOrder(tags, ifEmpty) {
+  const token = adminToken();
+  if (!token) return null;
+  try {
+    const resp = await fetch('/api/tag-order', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-admin-token': token },
+      body: JSON.stringify(ifEmpty ? { order: tags, ifEmpty: true } : { order: tags }),
+    });
+    const data = await resp.json().catch(() => null);
+    return resp.ok && data?.ok ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 function saveTagOrder(tags) {
-  try { localStorage.setItem(TAG_ORDER_KEY, JSON.stringify(tags)); } catch {}
+  tagOrder = [...tags];
+  void persistTagOrder(tags, false);
+}
+
+// Runs alongside the admin list load: fetch the shared order, run
+// the one-time legacy import if the server has none yet, then
+// broadcast so every vocabulary view re-renders canonically.
+async function loadTagOrderFromServer() {
+  const token = adminToken();
+  if (!token) return;
+  let serverOrder = null;
+  try {
+    const resp = await fetch('/api/tag-order', { headers: { 'x-admin-token': token } });
+    const data = await resp.json().catch(() => null);
+    if (resp.ok && data?.ok && Array.isArray(data.order)) serverOrder = data.order;
+  } catch {}
+  if (serverOrder === null) return; // unreachable: keep the last known order and retry on the next list load
+
+  if (!serverOrder.length) {
+    let legacy = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem(LEGACY_TAG_ORDER_KEY) || '[]');
+      if (Array.isArray(parsed)) legacy = parsed.filter((t) => typeof t === 'string');
+    } catch {}
+    if (legacy.length) {
+      const imported = await persistTagOrder(legacy, true);
+      // The server's answer is authoritative either way: our import,
+      // or another device's that landed first.
+      if (imported && Array.isArray(imported.order)) serverOrder = imported.order;
+    }
+  }
+  // Imported, superseded, or empty — the legacy key has served its
+  // purpose and is never read or written again.
+  try { localStorage.removeItem(LEGACY_TAG_ORDER_KEY); } catch {}
+  tagOrder = serverOrder;
+  refreshTagVocabViews();
 }
 // The single broadcast every tag-order change goes through: ALL
 // vocabulary views re-render from the one canonical order — the
@@ -935,6 +990,9 @@ async function loadAdminList() {
   }
   sessionStorage.setItem('cfsub_admin_token', token);
   adminMsg.textContent = '加载中...';
+  // The shared tag order loads in parallel; when it lands it
+  // broadcasts, re-rendering every vocabulary view canonically.
+  void loadTagOrderFromServer();
   try {
     // The admin token travels in a header, never in the URL.
     const resp = await fetch('/api/list', { headers: { 'x-admin-token': token } });

@@ -817,6 +817,29 @@ console.log('worker tests passed');
   }), env);
   assert.equal(saveNoAuth.status, 403, 'save requires the admin token');
 
+  // Tag ORDER endpoints: one shared server-side arrangement (the
+  // filter bar's order), replacing the old per-browser localStorage
+  // preference that made devices disagree.
+  const getOrder = () => worker.fetch(adminReq('/api/tag-order'), env).then((r) => r.json());
+  const postOrder = (body) => worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+  }), env);
+  assert.deepEqual((await getOrder()).order, [], 'tag order starts empty');
+  assert.equal((await worker.fetch(new Request('https://x.pages.dev/api/tag-order'), env)).status, 403, 'tag order read requires the admin token');
+  const savedOrder = await postOrder({ order: ['直播', 'HK', '直播', 7, ''] }).then((r) => r.json());
+  assert.deepEqual(savedOrder.order, ['直播', 'HK'], 'tag order save sanitizes and dedupes');
+  assert.deepEqual((await getOrder()).order, ['直播', 'HK'], 'tag order round-trips');
+  assert.equal((await postOrder({ order: 'HK' })).status, 400, 'non-array order 400s');
+  const imp1 = await postOrder({ order: ['甲'], ifEmpty: true }).then((r) => r.json());
+  assert.equal(imp1.imported, false, 'ifEmpty import never overwrites an existing order');
+  assert.deepEqual(imp1.order, ['直播', 'HK'], 'ifEmpty import returns the existing order');
+  await env.SUB_STORE.delete('meta:tag-order');
+  const imp2 = await postOrder({ order: ['甲', '乙'], ifEmpty: true }).then((r) => r.json());
+  assert.equal(imp2.imported, true, 'ifEmpty import claims an empty server order');
+  assert.deepEqual((await getOrder()).order, ['甲', '乙'], 'imported order reads back');
+  const listAfter = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  assert.ok(!listAfter.items.some((i) => i.id === 'meta:tag-order'), 'the order record never appears as an entry');
+
   // Audit fixes (2026-10-31): F1 a missing/non-array tags field must be
   // a 400, never a silent wipe; F3 non-string members are dropped, not
   // String()-coerced into junk tags; F7 the per-tag length cap never

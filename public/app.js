@@ -1139,6 +1139,13 @@ async function loadAdminList() {
     const data = await resp.json();
     if (!resp.ok || !data.ok) throw new Error(data.error || '加载失败');
     adminState.items = data.items || [];
+    // Ingestion boundary: whatever the server (or a future regression
+    // in it) sends, an item's tags are a string array by the time any
+    // renderer or counter touches them — a non-array tags field used
+    // to take down the whole list render and the diagnostics export.
+    for (const item of adminState.items) {
+      item.tags = Array.isArray(item.tags) ? item.tags.filter((t) => typeof t === 'string') : [];
+    }
     adminState.selected.clear();
     renderAdminList();
     pruneTagOrderToVocab();

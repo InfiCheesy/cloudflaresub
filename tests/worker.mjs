@@ -1110,5 +1110,17 @@ console.log('worker tests passed');
   assert.ok(stars.length <= 8, 'flood occupies at most one collapsed entry per shard');
   assert.ok(flooded.diag.events.some((e) => e.route === 'POST /api/tag-order'), 'legit history survives the flood');
   assert.ok(flooded.diag.events.length <= 60, 'ring still capped after the flood');
+
+  // F1: junk members inside a shard (null, primitives, a string
+  // timestamp) must not zero the merged view or block new events.
+  store.set('sys:diag-events:3', {
+    value: JSON.stringify([null, 1, 'x', { t: 'bad' }, { t: Date.now(), kind: 'api', route: 'POST /api/note', status: 200, ms: 1 }]),
+  });
+  const withJunk = await (await diagPost()).json();
+  assert.ok(withJunk.diag.events.some((e) => e.route === 'POST /api/note'), 'valid events survive junk shard members');
+  assert.ok(
+    withJunk.diag.events.every((e) => e && typeof e === 'object' && typeof e.t === 'number'),
+    'merged events are all well-formed',
+  );
   console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');
 }

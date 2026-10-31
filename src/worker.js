@@ -2038,7 +2038,12 @@ async function readDiagShard(env, key) {
     const raw = await env.SUB_STORE.get(key);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    // Keep only well-formed events (plain object, numeric timestamp —
+    // the only shape diagRecord writes). One junk member must not
+    // poison the merge: the sort dereferences .t, and a null member
+    // used to throw there and silently zero the whole ring view.
+    return parsed.filter((e) => e && typeof e === 'object' && typeof e.t === 'number');
   } catch {
     return [];
   }

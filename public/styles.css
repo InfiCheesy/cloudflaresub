@@ -954,7 +954,12 @@ button.small {
   }
   .admin-head,
   .entry {
-    min-width: 936px;
+    /* Must cover the row grid's own minimum, or the last (actions)
+       column spills past every row box and iOS Safari clips it
+       instead of extending the scroll area: tracks 848 + gaps 84 +
+       row padding 28 = 960. (Was 936 — buttons overflowed the row
+       edge by ~24px on phones.) */
+    min-width: 960px;
   }
   .entry.expanded .entry-row,
   .entry.retention-open .entry-row,

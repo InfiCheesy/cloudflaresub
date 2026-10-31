@@ -469,7 +469,11 @@ https://example.com/ips.txt"
         </div>
       </div>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script> 
+    <!-- qrcodejs 1.0.0, self-hosted (was loaded from cdnjs): the page
+         holds the admin token, so it must not execute third-party-hosted
+         scripts. Bytes verified identical across two CDNs at vendoring
+         time; sha256 c541ef06327885a8415bca8df6071e14189b4855336def4f36db54bde8484f36. -->
+    <script src="vendor/qrcode.min.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

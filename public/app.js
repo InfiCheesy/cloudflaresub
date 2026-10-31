@@ -2216,7 +2216,7 @@ async function buildDiagReport() {
   const items = adminState.items || [];
   const dynCount = items.filter((i) => i.dynamic).length;
   const tagCount = items.filter((i) => Array.isArray(i.tags) && i.tags.length).length;
-  const noteCount = items.filter((i) => i.note && i.note.trim()).length;
+  const noteCount = items.filter((i) => typeof i.note === 'string' && i.note.trim()).length;
   lines.push(`管理列表：${items.length ? `已加载 ${items.length} 条（动态 ${dynCount}，含标签 ${tagCount}，含备注 ${noteCount}）` : '未加载'}`);
   lines.push(`标签词汇：${allTagCounts().length} 个；已选筛选：${adminState.tagSelected.size} 个；顺序已加载：${tagOrderLoaded ? '是' : '否'}`);
   const lastList = [...diagJournal].reverse().find((e) => e.kind === 'api' && e.route === 'GET /api/list');

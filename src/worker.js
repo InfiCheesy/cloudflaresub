@@ -335,16 +335,17 @@ async function getSourceEndpoints(env, rawUrl, now = Date.now()) {
     // diagnostics ring. The URL itself never enters the ring.
     let host = 'h:none';
     try { host = await diagHash(env, `host:${new URL(url).hostname}`); } catch {}
+    const errKind = sourceErrKind(e);
+    const result = cached ? 'stale-cache' : 'failed';
+    if (sourceEventDue(`${host}|${result}|${errKind}`)) {
+      await diagRecord(env, {
+        kind: 'ip-source', host, result, err: errKind, ms: Date.now() - fetchStartedAt,
+      });
+    }
     if (cached) {
       await writeIpCache(env, url, { ...cached, lastAttempt: now });
-      await diagRecord(env, {
-        kind: 'ip-source', host, result: 'stale-cache', err: sourceErrKind(e), ms: Date.now() - fetchStartedAt,
-      });
       return { url, endpoints: cached.endpoints, fromCache: true, fetchedAt: cached.fetchedAt, refreshError: e.message };
     }
-    await diagRecord(env, {
-      kind: 'ip-source', host, result: 'failed', err: sourceErrKind(e), ms: Date.now() - fetchStartedAt,
-    });
     throw e;
   }
 }
@@ -1010,7 +1011,7 @@ function buildRecordMetadata(record) {
   const servers = (record.sources || []).map((x) => x.server).filter(Boolean);
   const st = record.storage || { mode: 'permanent' };
   return {
-    note: record.note || '',
+    note: (typeof record.note === 'string' ? record.note : ''),
     createdAt: record.createdAt || '',
     sources: [...new Set(servers)].slice(0, 3).join(',').slice(0, 200),
     out: Array.isArray(record.nodes) ? record.nodes.length : 0,
@@ -1308,7 +1309,7 @@ async function handleGenerate(request, env, url) {
     const raw = await env.SUB_STORE.get(`sub:${id}`);
     if (raw) {
       record = JSON.parse(raw);
-      const prevNote = record.note || '';
+      const prevNote = (typeof record.note === 'string' ? record.note : '');
       if (providedNote !== null) record.note = providedNote;
       if (providedTags !== null) record.tags = providedTags;
       if (!record.sources) record.sources = sources;
@@ -1373,7 +1374,7 @@ async function handleGenerate(request, env, url) {
       clash: withToken('clash'),
       surge: withToken('surge'),
     },
-    note: record.note || '',
+    note: (typeof record.note === 'string' ? record.note : ''),
     tags: sanitizeTags(record.tags),
     storage: record.storage || { mode: 'permanent' },
     links: nodes.map(encodeNodeLink).filter(Boolean),
@@ -1472,7 +1473,7 @@ async function handleList(request, env, url) {
       const meta = key.metadata || {};
       const item = {
         id,
-        note: meta.note || '',
+        note: (typeof meta.note === 'string' ? meta.note : ''),
         tags: [],
         createdAt: meta.createdAt || null,
         sources: meta.sources ? meta.sources.split(',').filter(Boolean) : [],
@@ -1491,7 +1492,7 @@ async function handleList(request, env, url) {
       {
         try {
           const rec = JSON.parse(raw);
-          item.note = rec.note || '';
+          item.note = (typeof rec.note === 'string' ? rec.note : '');
           // Sanitize on read: a record hand-edited in KV can carry
           // non-string tag members, and raw passthrough lets one
           // corrupt record break the whole admin UI downstream.
@@ -1588,7 +1589,7 @@ function buildBackfill(record) {
   const base = {
     namePrefix: record.options?.namePrefix || '',
     keepOriginalHost: record.options?.keepOriginalHost !== false,
-    note: record.note || '',
+    note: (typeof record.note === 'string' ? record.note : ''),
     tags: sanitizeTags(record.tags),
     storage: record.storage || { mode: 'permanent' },
   };
@@ -1638,7 +1639,7 @@ async function handleEntry(request, env, url) {
   return json({
     ok: true,
     id,
-    note: record.note || '',
+    note: (typeof record.note === 'string' ? record.note : ''),
     tags: sanitizeTags(record.tags),
     createdAt: record.createdAt || null,
     storage: record.storage || { mode: 'permanent' },
@@ -1722,7 +1723,7 @@ async function handleNote(request, env) {
   if (!raw) return json({ ok: false, error: '条目不存在' }, 404);
 
   const record = JSON.parse(raw);
-  const prevNote = record.note || '';
+  const prevNote = (typeof record.note === 'string' ? record.note : '');
   record.note = sanitizeNote(body.note);
   record.updatedAt = new Date().toISOString();
   // Rewrite with whatever time the entry has left, so saving a note never
@@ -1751,7 +1752,7 @@ async function handleTagsSave(request, env) {
   const record = JSON.parse(raw);
   record.tags = sanitizeTags(body.tags);
   record.updatedAt = new Date().toISOString();
-  await putRecord(env, id, record, record.note || '', remainingTtl(record));
+  await putRecord(env, id, record, (typeof record.note === 'string' ? record.note : ''), remainingTtl(record));
   return json({ ok: true, id, tags: record.tags });
 }
 
@@ -1881,7 +1882,7 @@ async function handleRetention(request, env) {
   // Re-apply from NOW: switching to permanent clears the TTL, switching to
   // days restarts the countdown (same rule as regenerating the entry).
   const ttl = applyRetention(record, Date.now());
-  await putRecord(env, id, record, record.note || '', ttl);
+  await putRecord(env, id, record, (typeof record.note === 'string' ? record.note : ''), ttl);
   if (record.dedupHash) {
     await env.SUB_STORE.put(`dedup:${record.dedupHash}`, id, ttl ? { expirationTtl: ttl } : {});
   }
@@ -2025,17 +2026,42 @@ function diagHash(env, value) {
 
 const DIAG_EVENTS_KEY = 'sys:diag-events';
 const DIAG_RING_MAX = 60;
+const DIAG_SHARDS = 8;
+const DIAG_SHARD_MAX = 20;
 const DIAG_KNOWN_ROUTES = new Set([
   '/api/generate', '/api/list', '/api/entry', '/api/ip-source-test',
   '/api/note', '/api/tags', '/api/tag-order', '/api/retention', '/api/delete',
 ]);
 
-async function readDiagEvents(env) {
+async function readDiagShard(env, key) {
   try {
-    const raw = await env.SUB_STORE.get(DIAG_EVENTS_KEY);
+    const raw = await env.SUB_STORE.get(key);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// The merged view across all shards (plus the pre-sharding single key,
+// whose events age out of the window on their own): sorted by time,
+// newest DIAG_RING_MAX kept.
+async function readDiagEvents(env) {
+  try {
+    const keys = [];
+    let cursor;
+    do {
+      const page = await env.SUB_STORE.list({ prefix: DIAG_EVENTS_KEY, cursor, limit: 64 });
+      keys.push(...page.keys);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    const all = [];
+    for (const k of keys.slice(0, 16)) {
+      all.push(...(await readDiagShard(env, k.name)));
+    }
+    all.sort((a, b) => (a.t || 0) - (b.t || 0));
+    return all.slice(-DIAG_RING_MAX);
   } catch {
     return [];
   }
@@ -2053,7 +2079,13 @@ function diagSig(e) {
 async function diagRecord(env, evt) {
   try {
     if (!env || !env.SUB_STORE) return;
-    const arr = await readDiagEvents(env);
+    // Writes land on a random shard: KV has no atomic read-modify-write,
+    // so a single hot key loses most events whenever two requests are
+    // in flight at once. Eight shards cut same-key collisions by about
+    // 8x; the read side merges. (Loss is reduced, not eliminated —
+    // the ring stays best-effort by design.)
+    const key = `${DIAG_EVENTS_KEY}:${Math.floor(Math.random() * DIAG_SHARDS)}`;
+    const arr = await readDiagShard(env, key);
     const last = arr[arr.length - 1];
     if (last && diagSig(last) === diagSig(evt)) {
       last.n = (last.n || 1) + 1;
@@ -2061,10 +2093,25 @@ async function diagRecord(env, evt) {
       if (typeof evt.ms === 'number') last.ms = evt.ms;
     } else {
       arr.push({ t: Date.now(), ...evt });
-      if (arr.length > DIAG_RING_MAX) arr.splice(0, arr.length - DIAG_RING_MAX);
+      if (arr.length > DIAG_SHARD_MAX) arr.splice(0, arr.length - DIAG_SHARD_MAX);
     }
-    await env.SUB_STORE.put(DIAG_EVENTS_KEY, JSON.stringify(arr));
+    await env.SUB_STORE.put(key, JSON.stringify(arr));
   } catch {}
+}
+
+// Per-isolate throttle for ip-source failure events: while a source
+// stays down, subscription fetches retry it every few minutes for
+// days. One ring entry per host+result+error per 10 minutes is plenty
+// of signal and keeps the /sub hot path from paying ring writes for
+// the whole outage. (Isolates are ephemeral; a cold isolate may let
+// one extra entry through — acceptable for a best-effort ring.)
+const sourceEventSeen = new Map();
+function sourceEventDue(key) {
+  const now = Date.now();
+  if (now - (sourceEventSeen.get(key) || 0) < 10 * 60 * 1000) return false;
+  sourceEventSeen.set(key, now);
+  if (sourceEventSeen.size > 200) sourceEventSeen.clear();
+  return true;
 }
 
 function sourceErrKind(e) {

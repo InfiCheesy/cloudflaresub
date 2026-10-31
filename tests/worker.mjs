@@ -848,11 +848,14 @@ console.log('worker tests passed');
   const vKey = `sub:${victim.shortId}`;
   const vRec = JSON.parse(store.get(vKey).value);
   vRec.tags = [123, null, { x: 1 }, '  带空格  ', '干净', '干净'];
+  vRec.note = 123; // E1: a non-string note must read back as '' everywhere
   store.set(vKey, { value: JSON.stringify(vRec) });
   const poisonListRes = await (await worker.fetch(adminReq('/api/list'), env)).json();
   assert.deepEqual(poisonListRes.items.find((i) => i.id === victim.shortId).tags, ['带空格', '干净'], 'list sanitizes stored tags on read');
+  assert.equal(poisonListRes.items.find((i) => i.id === victim.shortId).note, '', 'list coerces a non-string note to empty on read');
   const poisonEntryRes = await (await worker.fetch(adminReq(`/api/entry?id=${victim.shortId}`), env)).json();
   assert.deepEqual(poisonEntryRes.tags, ['带空格', '干净'], 'entry sanitizes stored tags on read');
+  assert.equal(poisonEntryRes.note, '', 'entry coerces a non-string note to empty on read');
   assert.deepEqual(poisonEntryRes.backfill.tags, ['带空格', '干净'], 'backfill sanitizes stored tags on read');
   const poisonVocabRes = await (await worker.fetch(adminReq('/api/tags'), env)).json();
   assert.ok(poisonVocabRes.tags.every((v) => typeof v.tag === 'string'), 'vocabulary never carries non-string tags');
@@ -1101,8 +1104,10 @@ console.log('worker tests passed');
     await worker.fetch(new Request(`https://x.pages.dev/api/junk${i}`), env);
   }
   const flooded = await (await diagPost()).json();
-  const star = flooded.diag.events.find((e) => e.route === 'GET /api/*');
-  assert.ok(star && (star.n || 1) >= 60, 'junk flood collapses into one counted entry');
+  const stars = flooded.diag.events.filter((e) => e.route === 'GET /api/*');
+  const starTotal = stars.reduce((a, e) => a + (e.n || 1), 0);
+  assert.ok(starTotal >= 60, 'junk flood is fully counted across the shards');
+  assert.ok(stars.length <= 8, 'flood occupies at most one collapsed entry per shard');
   assert.ok(flooded.diag.events.some((e) => e.route === 'POST /api/tag-order'), 'legit history survives the flood');
   assert.ok(flooded.diag.events.length <= 60, 'ring still capped after the flood');
   console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');

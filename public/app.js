@@ -144,7 +144,23 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
     // keeps the list whole when a trash drop is cancelled at its
     // confirm dialog.
     if (d.placeholder) {
-      container.insertBefore(d.chip, d.placeholder);
+      try {
+        if (d.placeholder.parentElement === container) {
+          container.insertBefore(d.chip, d.placeholder);
+        } else {
+          throw new Error('placeholder replaced mid-drag');
+        }
+      } catch {
+        // A mid-drag re-render destroyed the placeholder and rebuilt
+        // the chips from data — the dragged tag is already back in
+        // the list as a fresh chip, so drop this stale element
+        // rather than duplicate it (append only if it is somehow
+        // missing). The cleanup below must run either way: a throw
+        // here used to strand the chip in <body> with drag styles.
+        const rebuilt = [...container.querySelectorAll(chipSelector)];
+        if (rebuilt.some((c) => c.dataset.sortValue === d.chip.dataset.sortValue)) d.chip.remove();
+        else container.appendChild(d.chip);
+      }
       d.placeholder.remove();
     }
     d.chip.classList.remove('dragging');
@@ -270,6 +286,7 @@ let genTagVocab = null; // [{tag, count}] from GET /api/tags, lazy
 
 function renderGenTagSuggestions() {
   if (!genTagSuggestions) return;
+  if (genTagChips?.classList.contains('chip-sorting')) return; // mid-drag: the drop re-renders
   // The picker suggestions follow the filter bar's (stored) order,
   // not the server vocabulary's raw count order.
   const vocab = applyTagOrder(genTagVocab || []).filter(
@@ -717,6 +734,9 @@ function entryTagsHtml(item) {
 // key is removed and never read or written again.
 const LEGACY_TAG_ORDER_KEY = 'cfsub_tag_filter_order';
 let tagOrder = [];
+let tagOrderLoaded = false; // a server order has been adopted at least once
+let tagOrderLoading = null; // in-flight load (single-flight)
+let tagOrderSaveSeq = 0; // bumped on every local save
 
 function loadTagOrder() {
   return tagOrder;
@@ -740,41 +760,75 @@ async function persistTagOrder(tags, ifEmpty) {
 
 function saveTagOrder(tags) {
   tagOrder = [...tags];
-  void persistTagOrder(tags, false);
+  tagOrderSaveSeq++;
+  // Before the first successful load there is nothing safe to write
+  // against: persisting a pre-load arrangement (rendered in the
+  // default order) would clobber the shared order this client has
+  // never seen. Pre-load changes stay local and are superseded by
+  // the first load's broadcast.
+  if (!tagOrderLoaded) return;
+  void persistTagOrder(tags, false).then((r) => {
+    // A silent failure here is exactly the cross-device divergence
+    // the server-side order exists to prevent — say so.
+    if (!r && adminMsg) adminMsg.textContent = '标签顺序保存失败，请检查网络后重新加载列表';
+  });
 }
 
 // Runs alongside the admin list load: fetch the shared order, run
 // the one-time legacy import if the server has none yet, then
 // broadcast so every vocabulary view re-renders canonically.
-async function loadTagOrderFromServer() {
-  const token = adminToken();
-  if (!token) return;
-  let serverOrder = null;
-  try {
-    const resp = await fetch('/api/tag-order', { headers: { 'x-admin-token': token } });
-    const data = await resp.json().catch(() => null);
-    if (resp.ok && data?.ok && Array.isArray(data.order)) serverOrder = data.order;
-  } catch {}
-  if (serverOrder === null) return; // unreachable: keep the last known order and retry on the next list load
-
-  if (!serverOrder.length) {
-    let legacy = [];
+// Single-flight: overlapping list loads share one fetch.
+function loadTagOrderFromServer() {
+  if (tagOrderLoading) return tagOrderLoading;
+  tagOrderLoading = (async () => {
     try {
-      const parsed = JSON.parse(localStorage.getItem(LEGACY_TAG_ORDER_KEY) || '[]');
-      if (Array.isArray(parsed)) legacy = parsed.filter((t) => typeof t === 'string');
-    } catch {}
-    if (legacy.length) {
-      const imported = await persistTagOrder(legacy, true);
-      // The server's answer is authoritative either way: our import,
-      // or another device's that landed first.
-      if (imported && Array.isArray(imported.order)) serverOrder = imported.order;
+      const token = adminToken();
+      if (!token) return;
+      const seqAtStart = tagOrderSaveSeq;
+      let serverOrder = null;
+      try {
+        const resp = await fetch('/api/tag-order', { headers: { 'x-admin-token': token } });
+        const data = await resp.json().catch(() => null);
+        if (resp.ok && data?.ok && Array.isArray(data.order)) serverOrder = data.order;
+      } catch {}
+      if (serverOrder === null) return; // unreachable: keep the last known order and retry on the next list load
+
+      let keepLegacy = false;
+      if (!serverOrder.length) {
+        let legacy = [];
+        try {
+          const parsed = JSON.parse(localStorage.getItem(LEGACY_TAG_ORDER_KEY) || '[]');
+          if (Array.isArray(parsed)) legacy = parsed.filter((t) => typeof t === 'string');
+        } catch {}
+        if (legacy.length) {
+          const imported = await persistTagOrder(legacy, true);
+          // The server's answer is authoritative either way: our
+          // import, or another device's that landed first.
+          if (imported && Array.isArray(imported.order)) serverOrder = imported.order;
+          else if (!imported) keepLegacy = true; // import failed: keep the key so the next load retries
+        }
+      }
+      // Imported, superseded, or empty — the legacy key has served
+      // its purpose and is never read or written again. (On a failed
+      // import it stays, exactly so it can be retried.)
+      if (!keepLegacy) {
+        try { localStorage.removeItem(LEGACY_TAG_ORDER_KEY); } catch {}
+      }
+      const hadLoaded = tagOrderLoaded;
+      tagOrderLoaded = true;
+      if (hadLoaded && tagOrderSaveSeq !== seqAtStart) {
+        // A save landed while this load was in flight: the local
+        // working order is newer than whatever this (possibly
+        // stale) read returned — keep it; the next load confirms.
+      } else {
+        tagOrder = serverOrder;
+      }
+      refreshTagVocabViews();
+    } finally {
+      tagOrderLoading = null;
     }
-  }
-  // Imported, superseded, or empty — the legacy key has served its
-  // purpose and is never read or written again.
-  try { localStorage.removeItem(LEGACY_TAG_ORDER_KEY); } catch {}
-  tagOrder = serverOrder;
-  refreshTagVocabViews();
+  })();
+  return tagOrderLoading;
 }
 // The single broadcast every tag-order change goes through: ALL
 // vocabulary views re-render from the one canonical order — the
@@ -811,6 +865,7 @@ function orderedTagVocab() {
 
 function renderTagFilterBar() {
   if (!tagFilterBar || !tagFilterChips) return;
+  if (tagFilterChips.classList.contains('chip-sorting')) return; // mid-drag: the drop re-renders
   const vocab = orderedTagVocab();
   const names = new Set(vocab.map((v) => v.tag.toLowerCase()));
   for (const t of [...adminState.tagSelected]) {
@@ -866,7 +921,11 @@ async function deleteTagEverywhere(tag) {
   for (const t of [...adminState.tagSelected]) {
     if (t.toLowerCase() === lower) adminState.tagSelected.delete(t);
   }
-  saveTagOrder(loadTagOrder().filter((t) => t.toLowerCase() !== lower));
+  // Prune the shared order by what ACTUALLY remains after the saves:
+  // a tag whose save failed still exists on its entry and keeps its
+  // slot; only tags gone from every entry lose theirs.
+  const remaining = new Set(allTagCounts().map((v) => v.tag.toLowerCase()));
+  saveTagOrder(loadTagOrder().filter((t) => remaining.has(t.toLowerCase())));
   const hadVocab = genTagVocab !== null;
   genTagVocab = null;
   renderAdminList();
@@ -1656,7 +1715,10 @@ document.addEventListener('click', async (event) => {
 // ---------------- Entry tags edit panel (inline, mirrors retention) ----------------
 function renderTagsPanel(panel) {
   const chips = panel.querySelector('.tags-edit-chips');
-  if (chips) {
+  // Never rebuild a chip list mid-drag: the drag's placeholder and
+  // hit-testing live in that DOM. The drop itself broadcasts, which
+  // re-renders everything right after.
+  if (chips && !chips.classList.contains('chip-sorting')) {
     chips.innerHTML = panel._tags.length
       ? panel._tags.map((t, i) => `<span class="tag-chip" data-sort-value="${escapeHtml(t)}">${escapeHtml(t)}<button type="button" class="tag-chip-x" data-tags-remove="${i}" aria-label="移除标签 ${escapeHtml(t)}">×</button></span>`).join('')
       : '<span class="hint">暂无标签</span>';

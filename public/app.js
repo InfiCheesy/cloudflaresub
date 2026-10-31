@@ -89,29 +89,76 @@ if (storageModeSelect && retentionDaysInput) {
 }
 
 // ---------------- Drag-to-reorder chips (long-press) ----------------
-// Editable chip lists (the generate-form picker, an entry's tag-edit
-// panel) store tags as an ordered array, so their order is user data.
-// A chip is picked up by pressing it for ~220ms — a shorter press, or
-// moving first, stays an ordinary tap/scroll and never starts a drag.
-// While dragging, the chip is live-moved among its siblings by pointer
-// position (row-aware midpoint test); on release the container's DOM
-// order is reported through onReorder(tagValues).
-function makeChipsSortable(container, chipSelector, onReorder) {
+// Chip lists whose order is meaningful (the generate-form picker, an
+// entry's tag-edit panel, the filter bar) reorder by long-press drag:
+// press ~220ms to pick a chip up — a shorter press, or moving first,
+// stays an ordinary tap/scroll. The picked-up chip LEAVES the flow
+// (position:fixed, follows the pointer) and a dashed placeholder holds
+// its slot; only the placeholder moves among the siblings, and they
+// glide to their new spots with a FLIP transform animation. Because
+// the dragged chip never feeds back into the layout, the midpoint
+// hit-test is stable — no jitter. On release the placeholder's slot
+// gives the new order through onReorder(tagValues). An optional trash
+// element (the filter bar's label) turns into a bin during the drag;
+// dropping the chip on it calls onTrash(tagValue) instead.
+function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null, onTrash = null } = {}) {
   if (!container) return;
   let drag = null;
+  const siblings = () => [...container.querySelectorAll(chipSelector)].filter((c) => c !== drag.chip);
+  const readOrder = (d) => {
+    const values = [];
+    for (const node of container.childNodes) {
+      if (node === d.placeholder) values.push(d.chip.dataset.sortValue);
+      else if (node.nodeType === 1 && node !== d.chip && node.matches(chipSelector)) values.push(node.dataset.sortValue);
+    }
+    return values;
+  };
+  // Move the placeholder, animating the siblings from their old spots.
+  const flipMove = (mutate) => {
+    const chips = siblings();
+    const before = new Map(chips.map((c) => [c, c.getBoundingClientRect()]));
+    mutate();
+    for (const c of chips) {
+      const b = before.get(c);
+      if (!b) continue;
+      const a = c.getBoundingClientRect();
+      const dx = b.left - a.left;
+      const dy = b.top - a.top;
+      if (!dx && !dy) continue;
+      c.style.transition = 'none';
+      c.style.transform = `translate(${dx}px, ${dy}px)`;
+      requestAnimationFrame(() => {
+        c.style.transition = 'transform 180ms ease';
+        c.style.transform = '';
+      });
+    }
+  };
   const endDrag = (commit) => {
     if (!drag) return;
-    clearTimeout(drag.timer);
+    const d = drag;
+    drag = null;
+    clearTimeout(d.timer);
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
-    window.removeEventListener('pointercancel', onUp);
-    drag.chip.classList.remove('dragging');
-    container.classList.remove('chip-sorting');
-    drag = null;
-    if (commit) {
-      const values = [...container.querySelectorAll(chipSelector)].map((c) => c.dataset.sortValue);
-      onReorder(values);
+    window.removeEventListener('pointercancel', onCancel);
+    if (!d.active) return;
+    if (trashEl) {
+      trashEl.textContent = d.trashText ?? trashEl.textContent;
+      trashEl.classList.remove('trash-armed', 'is-hot');
     }
+    const trashed = commit && d.overTrash && typeof onTrash === 'function';
+    const values = commit && !trashed ? readOrder(d) : null;
+    d.placeholder?.remove();
+    d.chip.classList.remove('dragging');
+    d.chip.style.cssText = '';
+    container.classList.remove('chip-sorting');
+    // The click this gesture is about to produce must not also toggle
+    // the chip (filter chips are buttons): swallow exactly one.
+    const swallow = (e) => { e.stopPropagation(); e.preventDefault(); };
+    container.addEventListener('click', swallow, { capture: true, once: true });
+    setTimeout(() => container.removeEventListener('click', swallow, { capture: true }), 400);
+    if (trashed) onTrash(d.chip.dataset.sortValue);
+    else if (values) onReorder(values);
   };
   const onMove = (event) => {
     if (!drag) return;
@@ -121,36 +168,74 @@ function makeChipsSortable(container, chipSelector, onReorder) {
       return;
     }
     event.preventDefault();
-    for (const sib of container.querySelectorAll(chipSelector)) {
-      if (sib === drag.chip) continue;
+    drag.chip.style.left = `${event.clientX - drag.grabDX}px`;
+    drag.chip.style.top = `${event.clientY - drag.grabDY}px`;
+    if (trashEl) {
+      const r = trashEl.getBoundingClientRect();
+      drag.overTrash = event.clientX >= r.left && event.clientX <= r.right
+        && event.clientY >= r.top && event.clientY <= r.bottom;
+      trashEl.classList.toggle('is-hot', drag.overTrash);
+      if (drag.overTrash) return; // the slot stays put while over the bin
+    }
+    let target = null;
+    for (const sib of siblings()) {
       const r = sib.getBoundingClientRect();
       const before = event.clientY < r.top
         || (event.clientY <= r.bottom && event.clientX < r.left + r.width / 2);
-      if (before) {
-        container.insertBefore(drag.chip, sib);
-        return;
-      }
+      if (before) { target = sib; break; }
     }
-    container.appendChild(drag.chip);
+    const ph = drag.placeholder;
+    if (target) {
+      if (ph.nextSibling !== target) flipMove(() => container.insertBefore(ph, target));
+    } else if (container.lastChild !== ph) {
+      flipMove(() => container.appendChild(ph));
+    }
   };
   const onUp = () => endDrag(true);
+  const onCancel = () => endDrag(false);
   container.addEventListener('pointerdown', (event) => {
     if (event.button !== undefined && event.button !== 0) return;
-    if (event.target.closest('button')) return; // the × stays a plain tap
     const chip = event.target.closest(chipSelector);
     if (!chip || !container.contains(chip)) return;
-    const state = { chip, x: event.clientX, y: event.clientY, active: false, timer: null };
+    // A nested button inside a chip (the ×) stays a plain tap; a chip
+    // that IS a button (filter chips) drags from its whole body.
+    const innerBtn = event.target.closest('button');
+    if (innerBtn && innerBtn !== chip) return;
+    const state = {
+      chip, x: event.clientX, y: event.clientY,
+      active: false, timer: null, placeholder: null, overTrash: false, grabDX: 0, grabDY: 0, trashText: null,
+    };
     state.timer = setTimeout(() => {
       state.active = true;
+      const rect = chip.getBoundingClientRect();
+      const ph = document.createElement('span');
+      ph.className = 'chip-placeholder';
+      ph.style.width = `${rect.width}px`;
+      ph.style.height = `${rect.height}px`;
+      container.insertBefore(ph, chip);
+      state.placeholder = ph;
+      state.grabDX = state.x - rect.left;
+      state.grabDY = state.y - rect.top;
       chip.classList.add('dragging');
+      chip.style.position = 'fixed';
+      chip.style.left = `${rect.left}px`;
+      chip.style.top = `${rect.top}px`;
+      chip.style.width = `${rect.width}px`;
+      chip.style.zIndex = '1000';
+      chip.style.pointerEvents = 'none';
       container.classList.add('chip-sorting');
+      if (trashEl) {
+        state.trashText = trashEl.textContent;
+        trashEl.textContent = '🗑';
+        trashEl.classList.add('trash-armed');
+      }
     }, 220);
     drag = state;
     // Track the gesture at window level: no pointer capture needed,
     // and fast drags that leave the container keep working.
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onUp);
+    window.addEventListener('pointercancel', onCancel);
   });
 }
 
@@ -239,10 +324,12 @@ if (genTagChips) {
   });
   // Long-press drag reorders the picker; a reorder is a deliberate
   // edit, so it marks the picker touched like an add/remove does.
-  makeChipsSortable(genTagChips, '.tag-chip', (values) => {
-    genTags = values;
-    genTagsTouched = true;
-    renderGenTags();
+  makeChipsSortable(genTagChips, '.tag-chip', {
+    onReorder: (values) => {
+      genTags = values;
+      genTagsTouched = true;
+      renderGenTags();
+    },
   });
 }
 if (genTagSuggestions) {
@@ -596,9 +683,32 @@ function entryTagsHtml(item) {
   return `<div class="entry-tags">${tags.map((t) => `<button type="button" class="tag-chip tag-chip-mini${sel.has(String(t).toLowerCase()) ? ' is-on' : ''}" data-tag-filter="${escapeHtml(t)}" title="按此标签筛选">${escapeHtml(t)}</button>`).join('')}</div>`;
 }
 
+// The filter bar's chip order is a view preference of this browser:
+// a long-press drag stores it, and it then wins over the default
+// count/name order for the tags it names (new tags follow behind).
+const TAG_ORDER_KEY = 'cfsub_tag_filter_order';
+function loadTagOrder() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TAG_ORDER_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch { return []; }
+}
+function saveTagOrder(tags) {
+  try { localStorage.setItem(TAG_ORDER_KEY, JSON.stringify(tags)); } catch {}
+}
+function orderedTagVocab() {
+  const vocab = allTagCounts();
+  const pos = new Map(loadTagOrder().map((t, i) => [t.toLowerCase(), i]));
+  return vocab.sort((a, b) => {
+    const pa = pos.get(String(a.tag).toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
+    const pb = pos.get(String(b.tag).toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
+    return pa - pb || b.count - a.count || a.tag.localeCompare(b.tag, 'zh-Hans-CN');
+  });
+}
+
 function renderTagFilterBar() {
   if (!tagFilterBar || !tagFilterChips) return;
-  const vocab = allTagCounts();
+  const vocab = orderedTagVocab();
   const names = new Set(vocab.map((v) => v.tag.toLowerCase()));
   for (const t of [...adminState.tagSelected]) {
     if (!names.has(t.toLowerCase())) adminState.tagSelected.delete(t);
@@ -607,7 +717,7 @@ function renderTagFilterBar() {
   if (!vocab.length) return;
   const sel = selectedTagLowers();
   tagFilterChips.innerHTML = vocab
-    .map((v) => `<button type="button" class="tag-chip tag-chip-filter${sel.has(String(v.tag).toLowerCase()) ? ' is-on' : ''}" data-tag-filter="${escapeHtml(v.tag)}">${escapeHtml(v.tag)} · ${v.count}</button>`)
+    .map((v) => `<button type="button" class="tag-chip tag-chip-filter${sel.has(String(v.tag).toLowerCase()) ? ' is-on' : ''}" data-tag-filter="${escapeHtml(v.tag)}" data-sort-value="${escapeHtml(v.tag)}" title="点按筛选；长按拖动排序，拖到左侧放开可删除">${escapeHtml(v.tag)} · ${v.count}</button>`)
     .join('');
   if (tagFilterClear) tagFilterClear.classList.toggle('hidden', adminState.tagSelected.size === 0);
   if (tagModeAndBtn) tagModeAndBtn.classList.toggle('is-active', adminState.tagMode === 'and');
@@ -626,10 +736,54 @@ function toggleTagFilter(tag) {
   updateAdminCount();
 }
 
+// Dragging a filter chip onto the bar's label (a bin while dragging)
+// deletes that tag from EVERY entry carrying it — the vocabulary is
+// derived from the entries, so there is no lesser "remove". Confirmed
+// first, applied entry by entry through the regular tags endpoint,
+// and any failures are named.
+async function deleteTagEverywhere(tag) {
+  const lower = String(tag).toLowerCase();
+  const affected = adminState.items.filter((item) => (item.tags || []).some((t) => String(t).toLowerCase() === lower));
+  if (!affected.length) return;
+  if (!window.confirm(`确定要把标签「${tag}」从全部 ${affected.length} 条订阅上删除吗？此操作不可恢复。`)) return;
+  const token = adminToken();
+  adminMsg.textContent = `正在从 ${affected.length} 条订阅上删除标签「${tag}」…`;
+  const failed = [];
+  for (const item of affected) {
+    const tags = (item.tags || []).filter((t) => String(t).toLowerCase() !== lower);
+    try {
+      const resp = await postJson('/api/tags', { id: item.id, tags, token });
+      const data = await resp.json().catch(() => null);
+      if (resp.ok && data?.ok) item.tags = tags;
+      else failed.push(item.id);
+    } catch {
+      failed.push(item.id);
+    }
+  }
+  for (const t of [...adminState.tagSelected]) {
+    if (t.toLowerCase() === lower) adminState.tagSelected.delete(t);
+  }
+  saveTagOrder(loadTagOrder().filter((t) => t.toLowerCase() !== lower));
+  genTagVocab = null;
+  renderAdminList();
+  updateAdminCount();
+  adminMsg.textContent = failed.length
+    ? `标签「${tag}」已从 ${affected.length - failed.length} 条订阅上删除；${failed.length} 条失败：${failed.join('、')}`
+    : `标签「${tag}」已从全部 ${affected.length} 条订阅上删除。`;
+}
+
 if (tagFilterChips) {
   tagFilterChips.addEventListener('click', (event) => {
     const btn = event.target.closest('[data-tag-filter]');
     if (btn) toggleTagFilter(btn.dataset.tagFilter);
+  });
+  makeChipsSortable(tagFilterChips, '.tag-chip', {
+    onReorder: (values) => {
+      saveTagOrder(values);
+      renderTagFilterBar();
+    },
+    trashEl: tagFilterBar?.querySelector('.tag-filter-label'),
+    onTrash: (tag) => { void deleteTagEverywhere(tag); },
   });
 }
 if (adminBody) {
@@ -1421,9 +1575,11 @@ function buildTagsPanel(item) {
     <p class="hint">每条最多 10 个标签，单个最长 24 字；点下方已有标签可直接选用，长按标签可拖动排序。保存后会回读 KV 确认。</p>`;
   panel._tags = [...(item.tags || [])];
   renderTagsPanel(panel);
-  makeChipsSortable(panel.querySelector('.tags-edit-chips'), '.tag-chip', (values) => {
-    panel._tags = values;
-    renderTagsPanel(panel);
+  makeChipsSortable(panel.querySelector('.tags-edit-chips'), '.tag-chip', {
+    onReorder: (values) => {
+      panel._tags = values;
+      renderTagsPanel(panel);
+    },
   });
   return panel;
 }

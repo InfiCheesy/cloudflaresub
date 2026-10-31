@@ -1097,8 +1097,16 @@ label {
   gap: 6px;
 }
 #adminSection .note-cell .note-input {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   height: auto;
+  min-height: 3.2em; /* floor for short rows / stacked mobile layout */
+  resize: none; /* the 50/50 split sizes the box; manual resize would break it */
+}
+/* The tag area under the editor takes the other half of the cell. */
+.entry-row .note-cell .entry-tags {
+  flex: 1 1 0;
+  margin-top: 0;
+  align-content: flex-start;
 }
 .note-save-status {
   min-height: 1.35em;
@@ -1165,23 +1173,50 @@ button.tag-chip:hover {
   color: #0b1220;
   font-weight: 600;
 }
-/* Editable chips (generate picker, tag-edit panel) reorder by
-   long-press drag; display/filter chips stay plain taps. */
+/* Editable chips (generate picker, tag-edit panel, filter bar)
+   reorder by long-press drag; row display chips stay plain taps. */
 #genTagChips .tag-chip,
-.tags-edit-chips .tag-chip {
+.tags-edit-chips .tag-chip,
+#tagFilterChips .tag-chip {
   touch-action: none;
   cursor: grab;
   -webkit-user-select: none;
   user-select: none;
 }
+/* While dragging, the chip leaves the flow and follows the pointer
+   (left/top set inline); a dashed placeholder holds its slot, and
+   siblings glide via FLIP transforms — no layout feedback, no jitter. */
 .tag-chip.dragging {
-  opacity: 0.92;
-  transform: scale(1.07);
+  opacity: 0.95;
+  scale: 1.06;
   border-color: var(--accent);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
   cursor: grabbing;
-  position: relative;
-  z-index: 2;
+  margin: 0;
+}
+.chip-placeholder {
+  display: inline-block;
+  box-sizing: border-box;
+  border: 1.5px dashed rgba(96, 165, 250, 0.55);
+  border-radius: 999px;
+  background: rgba(96, 165, 250, 0.07);
+}
+/* Filter-bar trash zone: the label turns into a bin during a drag. */
+.tag-filter-label.trash-armed {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 36px;
+  padding: 2px 10px;
+  border: 1.5px dashed rgba(248, 113, 113, 0.6);
+  border-radius: 10px;
+  font-size: 1.05rem;
+}
+.tag-filter-label.trash-armed.is-hot {
+  background: rgba(248, 113, 113, 0.22);
+  border-color: #f87171;
+  scale: 1.12;
 }
 .tag-chip-x {
   border: none;

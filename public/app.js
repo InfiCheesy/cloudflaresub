@@ -560,6 +560,7 @@ document.addEventListener('click', async (event) => {
 
     qrCanvas.innerHTML = '';
     qrText.textContent = input.value;
+    qrOriginBtn = qrButton;
     qrModal.classList.remove('hidden');
     qrModal.setAttribute('aria-hidden', 'false');
 
@@ -569,6 +570,7 @@ document.addEventListener('click', async (event) => {
       height: 220,
       correctLevel: window.QRCode.CorrectLevel.M,
     });
+    playQrMotion(true);
     return;
   }
 
@@ -579,10 +581,92 @@ document.addEventListener('click', async (event) => {
 
 closeQrModal.addEventListener('click', closeQrDialog);
 
-function closeQrDialog() {
+// The QR dialog grows out of the button that opened it and shrinks
+// back into the same button on close ("从哪来，回哪去"): the flight is
+// a translate+scale from the button's rect to the dialog's natural
+// rect, computed fresh on every open and close (the button may have
+// scrolled meanwhile). Reduced-motion users and missing pieces fall
+// back to the previous instant toggle.
+let qrOriginBtn = null;
+let qrMotionSeq = 0;
+
+function qrDialogParts() {
+  return {
+    dialog: qrModal.querySelector('.modal-dialog'),
+    backdrop: qrModal.querySelector('.modal-backdrop'),
+  };
+}
+
+function qrMotionKeyframes() {
+  const { dialog } = qrDialogParts();
+  if (!dialog || !qrOriginBtn || !qrOriginBtn.isConnected) return null;
+  if (typeof dialog.animate !== 'function') return null;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null;
+  const d = dialog.getBoundingClientRect();
+  const b = qrOriginBtn.getBoundingClientRect();
+  if (!d.width || !d.height || !b.width || !b.height) return null;
+  const dx = b.left + b.width / 2 - (d.left + d.width / 2);
+  const dy = b.top + b.height / 2 - (d.top + d.height / 2);
+  const sx = Math.max(b.width / d.width, 0.02);
+  const sy = Math.max(b.height / d.height, 0.02);
+  return {
+    atOrigin: { transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`, opacity: '0.35' },
+    atRest: { transform: 'translate(0px, 0px) scale(1, 1)', opacity: '1' },
+  };
+}
+
+function playQrMotion(opening) {
+  const { dialog, backdrop } = qrDialogParts();
+  if (!dialog) return;
+  const seq = ++qrMotionSeq;
+  if (dialog.getAnimations) dialog.getAnimations().forEach((a) => a.cancel());
+  if (backdrop && backdrop.getAnimations) backdrop.getAnimations().forEach((a) => a.cancel());
+  const frames = qrMotionKeyframes();
+  if (backdrop && typeof backdrop.animate === 'function'
+      && !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+    backdrop.animate(
+      opening ? [{ opacity: '0' }, { opacity: '1' }] : [{ opacity: '1' }, { opacity: '0' }],
+      { duration: 200, easing: 'ease-out', fill: opening ? 'none' : 'forwards' },
+    );
+  }
+  if (!frames) {
+    if (!opening) hideQrDialogNow();
+    return;
+  }
+  const anim = dialog.animate(
+    opening ? [frames.atOrigin, frames.atRest] : [frames.atRest, frames.atOrigin],
+    {
+      duration: opening ? 260 : 230,
+      easing: opening ? 'cubic-bezier(0.32, 0.72, 0.24, 1)' : 'cubic-bezier(0.5, 0, 0.75, 0)',
+      fill: opening ? 'none' : 'forwards',
+    },
+  );
+  if (!opening) {
+    let done = false;
+    const finish = () => {
+      if (done || seq !== qrMotionSeq) return;
+      done = true;
+      hideQrDialogNow();
+    };
+    if (anim && typeof anim === 'object') anim.onfinish = finish;
+    setTimeout(finish, 300);
+  }
+}
+
+function hideQrDialogNow() {
+  const { dialog, backdrop } = qrDialogParts();
+  if (dialog && dialog.getAnimations) dialog.getAnimations().forEach((a) => a.cancel());
+  if (backdrop && backdrop.getAnimations) backdrop.getAnimations().forEach((a) => a.cancel());
   qrModal.classList.add('hidden');
   qrModal.setAttribute('aria-hidden', 'true');
   qrCanvas.innerHTML = '';
+}
+
+function closeQrDialog() {
+  if (qrModal.classList.contains('hidden')) return;
+  // playQrMotion hides the dialog when the return flight lands; with
+  // no animation available it hides synchronously instead.
+  playQrMotion(false);
 }
 
 function escapeHtml(value) {

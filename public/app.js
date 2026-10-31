@@ -88,6 +88,72 @@ if (storageModeSelect && retentionDaysInput) {
   });
 }
 
+// ---------------- Drag-to-reorder chips (long-press) ----------------
+// Editable chip lists (the generate-form picker, an entry's tag-edit
+// panel) store tags as an ordered array, so their order is user data.
+// A chip is picked up by pressing it for ~220ms — a shorter press, or
+// moving first, stays an ordinary tap/scroll and never starts a drag.
+// While dragging, the chip is live-moved among its siblings by pointer
+// position (row-aware midpoint test); on release the container's DOM
+// order is reported through onReorder(tagValues).
+function makeChipsSortable(container, chipSelector, onReorder) {
+  if (!container) return;
+  let drag = null;
+  const endDrag = (commit) => {
+    if (!drag) return;
+    clearTimeout(drag.timer);
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointercancel', onUp);
+    drag.chip.classList.remove('dragging');
+    container.classList.remove('chip-sorting');
+    drag = null;
+    if (commit) {
+      const values = [...container.querySelectorAll(chipSelector)].map((c) => c.dataset.sortValue);
+      onReorder(values);
+    }
+  };
+  const onMove = (event) => {
+    if (!drag) return;
+    if (!drag.active) {
+      // Moved before the press matured: this gesture is a scroll.
+      if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 10) endDrag(false);
+      return;
+    }
+    event.preventDefault();
+    for (const sib of container.querySelectorAll(chipSelector)) {
+      if (sib === drag.chip) continue;
+      const r = sib.getBoundingClientRect();
+      const before = event.clientY < r.top
+        || (event.clientY <= r.bottom && event.clientX < r.left + r.width / 2);
+      if (before) {
+        container.insertBefore(drag.chip, sib);
+        return;
+      }
+    }
+    container.appendChild(drag.chip);
+  };
+  const onUp = () => endDrag(true);
+  container.addEventListener('pointerdown', (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    if (event.target.closest('button')) return; // the × stays a plain tap
+    const chip = event.target.closest(chipSelector);
+    if (!chip || !container.contains(chip)) return;
+    const state = { chip, x: event.clientX, y: event.clientY, active: false, timer: null };
+    state.timer = setTimeout(() => {
+      state.active = true;
+      chip.classList.add('dragging');
+      container.classList.add('chip-sorting');
+    }, 220);
+    drag = state;
+    // Track the gesture at window level: no pointer capture needed,
+    // and fast drags that leave the container keep working.
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  });
+}
+
 // ---------------- Generate-form tag picker ----------------
 // Selected tags ride along with the generate request ONLY when the
 // owner actually touched the picker (added/removed a chip, or a
@@ -113,7 +179,7 @@ function renderGenTagSuggestions() {
 function renderGenTags() {
   if (genTagChips) {
     genTagChips.innerHTML = genTags
-      .map((t, i) => `<span class="tag-chip">${escapeHtml(t)}<button type="button" class="tag-chip-x" data-gen-tag-remove="${i}" aria-label="移除标签 ${escapeHtml(t)}">×</button></span>`)
+      .map((t, i) => `<span class="tag-chip" data-sort-value="${escapeHtml(t)}">${escapeHtml(t)}<button type="button" class="tag-chip-x" data-gen-tag-remove="${i}" aria-label="移除标签 ${escapeHtml(t)}">×</button></span>`)
       .join('');
   }
   renderGenTagSuggestions();
@@ -168,6 +234,13 @@ if (genTagChips) {
     const btn = event.target.closest('[data-gen-tag-remove]');
     if (!btn) return;
     genTags.splice(Number(btn.dataset.genTagRemove), 1);
+    genTagsTouched = true;
+    renderGenTags();
+  });
+  // Long-press drag reorders the picker; a reorder is a deliberate
+  // edit, so it marks the picker touched like an add/remove does.
+  makeChipsSortable(genTagChips, '.tag-chip', (values) => {
+    genTags = values;
     genTagsTouched = true;
     renderGenTags();
   });
@@ -1321,7 +1394,7 @@ function renderTagsPanel(panel) {
   const chips = panel.querySelector('.tags-edit-chips');
   if (chips) {
     chips.innerHTML = panel._tags.length
-      ? panel._tags.map((t, i) => `<span class="tag-chip">${escapeHtml(t)}<button type="button" class="tag-chip-x" data-tags-remove="${i}" aria-label="移除标签 ${escapeHtml(t)}">×</button></span>`).join('')
+      ? panel._tags.map((t, i) => `<span class="tag-chip" data-sort-value="${escapeHtml(t)}">${escapeHtml(t)}<button type="button" class="tag-chip-x" data-tags-remove="${i}" aria-label="移除标签 ${escapeHtml(t)}">×</button></span>`).join('')
       : '<span class="hint">暂无标签</span>';
   }
   const sugg = panel.querySelector('.tags-edit-suggest');
@@ -1345,9 +1418,13 @@ function buildTagsPanel(item) {
       <button type="button" class="secondary small" data-tags-cancel>取消</button>
     </div>
     <div class="tags-edit-suggest tag-suggestions"></div>
-    <p class="hint">每条最多 10 个标签，单个最长 24 字；点下方已有标签可直接选用。保存后会回读 KV 确认。</p>`;
+    <p class="hint">每条最多 10 个标签，单个最长 24 字；点下方已有标签可直接选用，长按标签可拖动排序。保存后会回读 KV 确认。</p>`;
   panel._tags = [...(item.tags || [])];
   renderTagsPanel(panel);
+  makeChipsSortable(panel.querySelector('.tags-edit-chips'), '.tag-chip', (values) => {
+    panel._tags = values;
+    renderTagsPanel(panel);
+  });
   return panel;
 }
 

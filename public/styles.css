@@ -1165,6 +1165,24 @@ button.tag-chip:hover {
   color: #0b1220;
   font-weight: 600;
 }
+/* Editable chips (generate picker, tag-edit panel) reorder by
+   long-press drag; display/filter chips stay plain taps. */
+#genTagChips .tag-chip,
+.tags-edit-chips .tag-chip {
+  touch-action: none;
+  cursor: grab;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.tag-chip.dragging {
+  opacity: 0.92;
+  transform: scale(1.07);
+  border-color: var(--accent);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  cursor: grabbing;
+  position: relative;
+  z-index: 2;
+}
 .tag-chip-x {
   border: none;
   background: none;

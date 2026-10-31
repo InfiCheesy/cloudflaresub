@@ -2025,6 +2025,10 @@ function diagHash(env, value) {
 
 const DIAG_EVENTS_KEY = 'sys:diag-events';
 const DIAG_RING_MAX = 60;
+const DIAG_KNOWN_ROUTES = new Set([
+  '/api/generate', '/api/list', '/api/entry', '/api/ip-source-test',
+  '/api/note', '/api/tags', '/api/tag-order', '/api/retention', '/api/delete',
+]);
 
 async function readDiagEvents(env) {
   try {
@@ -2037,13 +2041,28 @@ async function readDiagEvents(env) {
   }
 }
 
+function diagSig(e) {
+  return [e.kind || '', e.route || '', e.status ?? '', e.err || '', e.host || '', e.result || ''].join('|');
+}
+
 // Best-effort append; never throws, never blocks a response on failure.
+// Consecutive events with the same signature collapse into one entry
+// with a repeat count, so a flood (a flaky source retried by every
+// subscription fetch, or junk requests) can never evict the rest of
+// the history — it occupies exactly one slot, however large it gets.
 async function diagRecord(env, evt) {
   try {
     if (!env || !env.SUB_STORE) return;
     const arr = await readDiagEvents(env);
-    arr.push({ t: Date.now(), ...evt });
-    if (arr.length > DIAG_RING_MAX) arr.splice(0, arr.length - DIAG_RING_MAX);
+    const last = arr[arr.length - 1];
+    if (last && diagSig(last) === diagSig(evt)) {
+      last.n = (last.n || 1) + 1;
+      last.t = Date.now();
+      if (typeof evt.ms === 'number') last.ms = evt.ms;
+    } else {
+      arr.push({ t: Date.now(), ...evt });
+      if (arr.length > DIAG_RING_MAX) arr.splice(0, arr.length - DIAG_RING_MAX);
+    }
     await env.SUB_STORE.put(DIAG_EVENTS_KEY, JSON.stringify(arr));
   } catch {}
 }
@@ -2079,11 +2098,21 @@ async function diagCensus(env) {
   const sizes = [];
   let oldest = null;
   let newest = null;
-  for (const k of subKeys.slice(0, 300)) {
-    if (k.expiration || (k.metadata && k.metadata.expiresAt)) expiring++;
-    const raw = await store.get(k.name);
+  const sampleKeys = subKeys.slice(0, 300);
+  const sampleRaws = [];
+  for (let i = 0; i < sampleKeys.length; i += 25) {
+    const chunk = sampleKeys.slice(i, i + 25);
+    sampleRaws.push(...(await Promise.all(chunk.map((k) => store.get(k.name)))));
+  }
+  for (let idx = 0; idx < sampleKeys.length; idx++) {
+    const k = sampleKeys[idx];
+    const raw = sampleRaws[idx];
     if (!raw) continue;
     census.detailSampled++;
+    // Counted only for records actually read, so `permanent` below
+    // shares one denominator and can never go negative when the key
+    // list and the values briefly disagree.
+    if (k.expiration || (k.metadata && k.metadata.expiresAt)) expiring++;
     sizes.push(raw.length);
     let rec = null;
     try { rec = JSON.parse(raw); } catch {}
@@ -2134,8 +2163,8 @@ async function diagCensus(env) {
   const cacheKeys = await listAll('ipcache:');
   let cacheFresh = 0;
   let cacheSampled = 0;
-  for (const k of cacheKeys.slice(0, 50)) {
-    const raw = await store.get(k.name);
+  const cacheRaws = await Promise.all(cacheKeys.slice(0, 50).map((k) => store.get(k.name)));
+  for (const raw of cacheRaws) {
     if (!raw) continue;
     cacheSampled++;
     try {
@@ -2172,7 +2201,7 @@ async function handleDiag(request, env) {
     colo: (request.cf && request.cf.colo) || null,
   };
   try {
-    const probeVal = JSON.stringify({ t: Date.now() });
+    const probeVal = JSON.stringify({ t: Date.now(), r: crypto.randomUUID() });
     const p0 = Date.now();
     await store.put('sys:diag-probe', probeVal);
     const p1 = Date.now();
@@ -2217,9 +2246,17 @@ async function recordApiEvent(env, ctx, request, url, status, ms, errName) {
   if (!isApi && !isSub) return;
   if (isSub && status === 200) return;
   if (status === 403) return;
+  // Only known route templates are recorded. An unknown /api path is
+  // caller-controlled text: recording it verbatim would let anyone
+  // write arbitrary strings into the (shareable) diagnostics log.
+  const routePath = isSub
+    ? '/sub/:id'
+    : DIAG_KNOWN_ROUTES.has(p)
+      ? p
+      : '/api/*';
   const evt = {
     kind: 'api',
-    route: `${request.method} ${isSub ? '/sub/:id' : p}`,
+    route: `${request.method} ${routePath}`,
     status,
     ms,
   };

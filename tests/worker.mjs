@@ -1089,5 +1089,21 @@ console.log('worker tests passed');
   }
   const capped = await (await diagPost()).json();
   assert.ok(capped.diag.events.length <= 60, 'event ring is capped at 60');
+
+  // D1/D2: unknown paths are recorded only as a template (never
+  // verbatim — the path is caller-controlled text), a junk flood
+  // collapses into a single counted entry, and real history survives.
+  await worker.fetch(new Request('https://x.pages.dev/api/deadbeefdeadbeefdeadbeefdeadbeef/xyz'), env);
+  const templated = await (await diagPost()).json();
+  assert.ok(!JSON.stringify(templated).includes('deadbeef'), 'crafted path segments never enter the ring');
+  assert.ok(templated.diag.events.some((e) => e.route === 'GET /api/*'), 'unknown paths recorded under one template');
+  for (let i = 0; i < 65; i++) {
+    await worker.fetch(new Request(`https://x.pages.dev/api/junk${i}`), env);
+  }
+  const flooded = await (await diagPost()).json();
+  const star = flooded.diag.events.find((e) => e.route === 'GET /api/*');
+  assert.ok(star && (star.n || 1) >= 60, 'junk flood collapses into one counted entry');
+  assert.ok(flooded.diag.events.some((e) => e.route === 'POST /api/tag-order'), 'legit history survives the flood');
+  assert.ok(flooded.diag.events.length <= 60, 'ring still capped after the flood');
   console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');
 }

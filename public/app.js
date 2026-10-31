@@ -2276,10 +2276,11 @@ async function buildDiagReport() {
         const evts = d.events || [];
         if (!evts.length) lines.push('（无）');
         for (const e of evts) {
+          const times = e.n && e.n > 1 ? `，共 ${e.n} 次` : '';
           if (e.kind === 'ip-source') {
-            lines.push(`${diagTime(e.t)} 来源 ${e.host} ${e.result === 'failed' ? '抓取失败' : '用旧缓存兜底'}（${e.err || '?'}），${e.ms}ms`);
+            lines.push(`${diagTime(e.t)} 来源 ${e.host} ${e.result === 'failed' ? '抓取失败' : '用旧缓存兜底'}（${e.err || '?'}），${e.ms}ms${times}`);
           } else {
-            lines.push(`${diagTime(e.t)} ${e.route} → HTTP ${e.status}，${e.ms}ms${e.err ? `，错误 ${e.err}` : ''}`);
+            lines.push(`${diagTime(e.t)} ${e.route} → HTTP ${e.status}，${e.ms}ms${e.err ? `，错误 ${e.err}` : ''}${times}`);
           }
         }
       }

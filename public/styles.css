@@ -913,6 +913,15 @@ button.small {
 
 /* ---- Back-to-top round button (sits in the quick dock; its hidden
    state keeps the slot via visibility, so the dock never jumps) ---- */
+.page-diag {
+  max-width: 960px;
+  margin: 8px auto 28px;
+  padding: 0 16px;
+  text-align: center;
+}
+.page-diag .hint {
+  margin-top: 8px;
+}
 .back-top {
   width: 52px;
   height: 52px;

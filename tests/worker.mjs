@@ -1026,3 +1026,68 @@ console.log('worker tests passed');
   assert.equal(home.status, 200, 'non-API paths still reach the static site');
   console.log('audit round 4 suite: unknown/wrong-method API paths return JSON 404: passed');
 }
+
+// --- Diagnostics suite: /api/diag shape, redaction, event ring ---
+{
+  const diagPost = (body = { token: 'tok' }) => worker.fetch(new Request('https://x.pages.dev/api/diag', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }), env);
+  const noTok = await diagPost({});
+  assert.equal(noTok.status, 403, 'diag without token is 403');
+  const wrongTok = await diagPost({ token: 'nope' });
+  assert.equal(wrongTok.status, 403, 'diag with wrong token is 403');
+  const queryTok = await worker.fetch(new Request('https://x.pages.dev/api/diag?token=tok', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  }), env);
+  assert.equal(queryTok.status, 403, 'diag never accepts a query token');
+
+  // Seed an entry carrying secrets in every user-controlled field.
+  const seeded = await generate({ nodeLinks: node, preferredIps: '203.0.113.7', namePrefix: 'diagseed' });
+  await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', id: seeded.shortId, note: '秘密备注XYZ' }),
+  }), env);
+  await worker.fetch(new Request('https://x.pages.dev/api/tags', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', id: seeded.shortId, tags: ['秘密标签'] }),
+  }), env);
+
+  const okResp = await diagPost();
+  assert.equal(okResp.status, 200);
+  const okJson = await okResp.json();
+  assert.equal(okJson.ok, true);
+  const diagText = JSON.stringify(okJson);
+  for (const secret of ['秘密备注XYZ', '秘密标签', '203.0.113.7', seeded.shortId, 'f541611e-0aeb-4900-aa47', 'walh6h3rdnazjx']) {
+    assert.ok(!diagText.includes(secret), `diag output must not contain: ${secret}`);
+  }
+  assert.ok(!diagText.includes('vmess://') && !diagText.includes('vless://'), 'diag output carries no node links');
+  assert.equal(okJson.diag.kvProbe.match, true, 'KV probe round-trips');
+  assert.equal(store.get('sys:diag-probe'), undefined, 'KV probe key is cleaned up');
+  assert.ok(okJson.diag.census.entries >= 1, 'census counts entries');
+  assert.ok(okJson.diag.census.withNote >= 1 && okJson.diag.census.withTags >= 1, 'census counts note/tag presence without contents');
+  assert.ok(Array.isArray(okJson.diag.events), 'diag returns the event ring');
+  assert.ok(
+    okJson.diag.events.some((e) => e.kind === 'api' && String(e.route).includes('/api/tags')),
+    'ring recorded the tags save',
+  );
+  assert.ok(!okJson.diag.events.some((e) => e.status === 403), 'auth failures are never recorded');
+
+  // A dead dynamic source leaves a hashed-host ring event, never the URL.
+  await generate({ nodeLinks: node, preferredIps: '203.0.113.8\nhttps://dead-source.invalid/x', namePrefix: 'diagsrc' });
+  const afterSrc = await (await diagPost()).json();
+  const srcEvt = afterSrc.diag.events.find((e) => e.kind === 'ip-source');
+  assert.ok(srcEvt, 'failed source fetch left a ring event');
+  assert.ok(String(srcEvt.host).startsWith('h:'), 'source host is a keyed hash, not the hostname');
+  assert.ok(!JSON.stringify(afterSrc).includes('dead-source.invalid'), 'source hostname never appears in diag output');
+
+  // The ring is capped.
+  for (let i = 0; i < 65; i++) {
+    await worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'tok', order: ['甲'] }),
+    }), env);
+  }
+  const capped = await (await diagPost()).json();
+  assert.ok(capped.diag.events.length <= 60, 'event ring is capped at 60');
+  console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');
+}

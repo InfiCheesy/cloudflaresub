@@ -323,16 +323,28 @@ async function getSourceEndpoints(env, rawUrl, now = Date.now()) {
   if (cached && now - (cached.lastAttempt || 0) < IP_SOURCE_RETRY_MS) {
     return { url, endpoints: cached.endpoints, fromCache: true, fetchedAt: cached.fetchedAt };
   }
+  const fetchStartedAt = Date.now();
   try {
     const fresh = await fetchIpSource(url);
     if (!fresh.endpoints.length) throw new Error('来源没有返回可用的优选地址');
     await writeIpCache(env, url, { url, fetchedAt: now, lastAttempt: now, endpoints: fresh.endpoints });
     return { url, endpoints: fresh.endpoints, fromCache: false, fetchedAt: now, candidates: fresh.candidates };
   } catch (e) {
+    // Source trouble is the classic hard-to-see failure: leave a
+    // redacted trace (hashed host, coarse error kind, duration) in the
+    // diagnostics ring. The URL itself never enters the ring.
+    let host = 'h:none';
+    try { host = await diagHash(env, `host:${new URL(url).hostname}`); } catch {}
     if (cached) {
       await writeIpCache(env, url, { ...cached, lastAttempt: now });
+      await diagRecord(env, {
+        kind: 'ip-source', host, result: 'stale-cache', err: sourceErrKind(e), ms: Date.now() - fetchStartedAt,
+      });
       return { url, endpoints: cached.endpoints, fromCache: true, fetchedAt: cached.fetchedAt, refreshError: e.message };
     }
+    await diagRecord(env, {
+      kind: 'ip-source', host, result: 'failed', err: sourceErrKind(e), ms: Date.now() - fetchStartedAt,
+    });
     throw e;
   }
 }
@@ -1983,10 +1995,242 @@ async function handleSub(request, env, url) {
   return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
 }
 
-export default {
-  async fetch(request, env) {
+// ---- Diagnostics: keyed hashes, event ring, /api/diag ----------------------
+// Everything recorded for diagnostics is whitelist-shaped: route
+// templates, status codes, durations, counts and keyed short hashes.
+// The admin token, node links, preferred IPs, notes, tag names and entry
+// contents NEVER enter the ring or the report — that is what makes an
+// exported log safe to share for troubleshooting.
+let diagHmacCache = { secret: null, promise: null };
+function diagHash(env, value) {
+  const secret = env.SUB_ACCESS_TOKEN || '';
+  if (!secret) return Promise.resolve('h:none');
+  if (diagHmacCache.secret !== secret) {
+    diagHmacCache = {
+      secret,
+      promise: crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign'],
+      ),
+    };
+  }
+  return diagHmacCache.promise
+    .then((key) => crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`diag:${value}`)))
+    .then((sig) => 'h:' + [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 10))
+    .catch(() => 'h:error');
+}
+
+const DIAG_EVENTS_KEY = 'sys:diag-events';
+const DIAG_RING_MAX = 60;
+
+async function readDiagEvents(env) {
+  try {
+    const raw = await env.SUB_STORE.get(DIAG_EVENTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// Best-effort append; never throws, never blocks a response on failure.
+async function diagRecord(env, evt) {
+  try {
+    if (!env || !env.SUB_STORE) return;
+    const arr = await readDiagEvents(env);
+    arr.push({ t: Date.now(), ...evt });
+    if (arr.length > DIAG_RING_MAX) arr.splice(0, arr.length - DIAG_RING_MAX);
+    await env.SUB_STORE.put(DIAG_EVENTS_KEY, JSON.stringify(arr));
+  } catch {}
+}
+
+function sourceErrKind(e) {
+  if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) return 'timeout';
+  const m = String((e && e.message) || '');
+  if (m.includes('可用的优选地址')) return 'empty';
+  if (/timeout|timed out/i.test(m)) return 'timeout';
+  return 'fetch-failed';
+}
+
+async function diagCensus(env) {
+  const store = env.SUB_STORE;
+  const listAll = async (prefix) => {
+    const keys = [];
+    let cursor;
+    do {
+      const page = await store.list({ prefix, cursor, limit: 256 });
+      keys.push(...page.keys);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return keys;
+  };
+  const subKeys = await listAll('sub:');
+  const census = { entries: subKeys.length, detailSampled: 0 };
+  let dynamic = 0;
+  let expiring = 0;
+  let withTags = 0;
+  let withNote = 0;
+  const vocab = new Set();
+  const hostnames = new Set();
+  const sizes = [];
+  let oldest = null;
+  let newest = null;
+  for (const k of subKeys.slice(0, 300)) {
+    if (k.expiration || (k.metadata && k.metadata.expiresAt)) expiring++;
+    const raw = await store.get(k.name);
+    if (!raw) continue;
+    census.detailSampled++;
+    sizes.push(raw.length);
+    let rec = null;
+    try { rec = JSON.parse(raw); } catch {}
+    if (!rec) continue;
+    if (rec.dynamic) dynamic++;
+    if (Array.isArray(rec.tags)) {
+      const clean = rec.tags.filter((t) => typeof t === 'string');
+      if (clean.length) withTags++;
+      for (const t of clean) vocab.add(t.toLowerCase());
+    }
+    if (typeof rec.note === 'string' && rec.note) withNote++;
+    if (typeof rec.createdAt === 'number') {
+      oldest = oldest === null ? rec.createdAt : Math.min(oldest, rec.createdAt);
+      newest = newest === null ? rec.createdAt : Math.max(newest, rec.createdAt);
+    }
+    const srcUrls = rec.dynamic && Array.isArray(rec.dynamic.sources)
+      ? rec.dynamic.sources.map((s) => s && s.url)
+      : rec.dynamic && rec.dynamic.sourceUrl
+        ? [rec.dynamic.sourceUrl]
+        : [];
+    for (const u of srcUrls) {
+      try { hostnames.add(new URL(u).hostname); } catch {}
+    }
+  }
+  census.dynamic = dynamic;
+  census.expiring = expiring;
+  census.permanent = census.detailSampled - expiring;
+  census.withTags = withTags;
+  census.withNote = withNote;
+  census.tagVocab = vocab.size;
+  if (sizes.length) {
+    sizes.sort((a, b) => a - b);
+    census.recordBytes = {
+      total: sizes.reduce((a, b) => a + b, 0),
+      min: sizes[0],
+      p50: sizes[Math.floor(sizes.length / 2)],
+      max: sizes[sizes.length - 1],
+    };
+  }
+  if (oldest !== null) {
+    census.oldestAgeDays = Math.round((Date.now() - oldest) / 864000) / 100;
+    census.newestAgeDays = Math.round((Date.now() - newest) / 864000) / 100;
+  }
+  census.sourceHosts = [];
+  for (const h of hostnames) census.sourceHosts.push(await diagHash(env, `host:${h}`));
+  const dedupKeys = await listAll('dedup:');
+  census.dedupKeys = dedupKeys.length;
+  const cacheKeys = await listAll('ipcache:');
+  let cacheFresh = 0;
+  let cacheSampled = 0;
+  for (const k of cacheKeys.slice(0, 50)) {
+    const raw = await store.get(k.name);
+    if (!raw) continue;
+    cacheSampled++;
     try {
-      const url = new URL(request.url);
+      const c = JSON.parse(raw);
+      if (c && Date.now() - (c.fetchedAt || 0) < IP_SOURCE_FRESH_MS) cacheFresh++;
+    } catch {}
+  }
+  census.ipcache = { keys: cacheKeys.length, sampled: cacheSampled, freshInSample: cacheFresh };
+  const orderRaw = await store.get('meta:tag-order');
+  if (!orderRaw) {
+    census.tagOrder = { exists: false };
+  } else {
+    try {
+      const o = JSON.parse(orderRaw);
+      census.tagOrder = {
+        exists: true,
+        size: Array.isArray(o.order) ? o.order.length : 0,
+        ageSec: o.updatedAt ? Math.max(0, Math.round((Date.now() - o.updatedAt) / 1000)) : null,
+      };
+    } catch {
+      census.tagOrder = { exists: true, corrupt: true };
+    }
+  }
+  return census;
+}
+
+async function handleDiag(request, env) {
+  const { error } = await parseAdminBody(request, env);
+  if (error) return error;
+  const store = env.SUB_STORE;
+  const diag = {
+    version: APP_VERSION,
+    serverTime: new Date().toISOString(),
+    colo: (request.cf && request.cf.colo) || null,
+  };
+  try {
+    const probeVal = JSON.stringify({ t: Date.now() });
+    const p0 = Date.now();
+    await store.put('sys:diag-probe', probeVal);
+    const p1 = Date.now();
+    const got = await store.get('sys:diag-probe');
+    const p2 = Date.now();
+    await store.delete('sys:diag-probe');
+    diag.kvProbe = { putMs: p1 - p0, getMs: p2 - p1, match: got === probeVal };
+  } catch (e) {
+    diag.kvProbe = { error: (e && e.name) || 'Error' };
+  }
+  try {
+    diag.census = await diagCensus(env);
+  } catch (e) {
+    diag.census = { error: (e && e.name) || 'Error' };
+  }
+  try {
+    const rel = await getLatestRelease(env, false);
+    diag.versionCheck = {
+      status: rel.status,
+      latest: rel.tag || null,
+      checkedAt: rel.checkedAt || null,
+      updateAvailable: rel.tag ? compareVersions(rel.tag, APP_VERSION) > 0 : false,
+    };
+  } catch {
+    diag.versionCheck = { status: 'failed' };
+  }
+  diag.events = await readDiagEvents(env);
+  return json({ ok: true, diag });
+}
+
+// Which requests leave a ring entry: every admin/API call except the
+// public version check (chatty, low signal) and the diag export itself,
+// plus failed subscription fetches. Auth failures (403) are skipped on
+// purpose: rejected requests must not write anything, as the security
+// audits established.
+async function recordApiEvent(env, ctx, request, url, status, ms, errName) {
+  if (request.method === 'OPTIONS') return;
+  const p = url.pathname;
+  if (p === '/api/diag' || p === '/api/version') return;
+  const isApi = p.startsWith('/api/');
+  const isSub = p.startsWith('/sub/');
+  if (!isApi && !isSub) return;
+  if (isSub && status === 200) return;
+  if (status === 403) return;
+  const evt = {
+    kind: 'api',
+    route: `${request.method} ${isSub ? '/sub/:id' : p}`,
+    status,
+    ms,
+  };
+  if (errName) evt.err = String(errName).slice(0, 40);
+  const done = diagRecord(env, evt);
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(done);
+  else await done;
+}
+
+async function dispatch(request, env) {
+    const url = new URL(request.url);
 
       if (request.method === 'OPTIONS') {
         return new Response(null, {
@@ -2038,6 +2282,10 @@ export default {
         return await handleTagOrderSave(request, env);
       }
 
+      if (request.method === 'POST' && url.pathname === '/api/diag') {
+        return await handleDiag(request, env);
+      }
+
       if (request.method === 'POST' && url.pathname === '/api/retention') {
         return await handleRetention(request, env);
       }
@@ -2063,11 +2311,23 @@ export default {
         return await env.ASSETS.fetch(request);
       }
       return text('Not found. Static assets are not available: deploy as a Cloudflare Pages project with build output directory "public" (see README).', 404);
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const startedAt = Date.now();
+    let url = null;
+    try { url = new URL(request.url); } catch {}
+    try {
+      const response = await dispatch(request, env);
+      if (url) await recordApiEvent(env, ctx, request, url, response.status, Date.now() - startedAt, null);
+      return response;
     } catch (err) {
       // Never let an uncaught exception bubble up as a bare 1101 page,
       // and never leak internal error details to the caller: the real
       // error goes to the server log only.
       console.error(err);
+      if (url) await recordApiEvent(env, ctx, request, url, 500, Date.now() - startedAt, err && err.name);
       return json({ ok: false, error: 'Internal error' }, 500);
     }
   },

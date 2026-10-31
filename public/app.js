@@ -14,6 +14,48 @@ async function fetchEntry(id, token) {
   return { resp, data: await resp.json().catch(() => null) };
 }
 
+// ---- Diagnostics journal ---------------------------------------------------
+// A session ring of what the page DID: every API call's route template,
+// status and duration, plus a few lifecycle events. Whitelist-shaped by
+// construction — no bodies, no query strings, no user content — so the
+// exported log is safe to hand to a maintainer. (The error ring lives in
+// window.__diagErrors, installed by the inline script in index.html so
+// it also catches failures from before this file loads.)
+const diagJournal = [];
+function diagPush(evt) {
+  diagJournal.push({ t: Date.now(), ...evt });
+  if (diagJournal.length > 120) diagJournal.splice(0, diagJournal.length - 120);
+}
+window.__diagJournal = diagJournal;
+diagPush({ kind: 'event', name: 'boot' });
+window.addEventListener('online', () => diagPush({ kind: 'event', name: 'online' }));
+window.addEventListener('offline', () => diagPush({ kind: 'event', name: 'offline' }));
+document.addEventListener('visibilitychange', () => {
+  diagPush({ kind: 'event', name: document.visibilityState === 'visible' ? 'page-visible' : 'page-hidden' });
+});
+const rawFetch = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const urlStr = typeof input === 'string' ? input : (input && input.url) || '';
+  let path = '';
+  try { path = new URL(urlStr, location.origin).pathname; } catch {}
+  const track = path.startsWith('/api/') || path.startsWith('/sub/');
+  const template = path.startsWith('/sub/') ? '/sub/:id' : path;
+  const method = (init && init.method) || (input && input.method) || 'GET';
+  const started = performance.now();
+  try {
+    const resp = await rawFetch(input, init);
+    if (track) {
+      diagPush({ kind: 'api', route: `${method} ${template}`, status: resp.status, ms: Math.round(performance.now() - started) });
+    }
+    return resp;
+  } catch (e) {
+    if (track) {
+      diagPush({ kind: 'api', route: `${method} ${template}`, status: 0, ms: Math.round(performance.now() - started), err: (e && e.name) || 'Error' });
+    }
+    throw e;
+  }
+};
+
 const form = byId('generator-form');
 const submitBtn = byId('submitBtn');
 const fillDemoBtn = byId('fillDemoBtn');
@@ -2083,3 +2125,193 @@ if (versionRetryBtn) {
   versionRetryBtn.addEventListener('click', () => loadVersionStatus(true));
 }
 loadVersionStatus(false);
+
+// ---- Diagnostics export ----------------------------------------------------
+// Assembles the redacted troubleshooting report behind the footer
+// button: environment, a live version/clock probe, the session journal,
+// the page error ring, aggregate page state, and (with an admin token)
+// the server-side diag report including its event ring. A final
+// regex pass strips anything that still looks like a secret, an
+// address or a node link, in case an error message smuggled one in.
+function sanitizeDiagText(s) {
+  return s
+    .replace(/(?:vmess|vless|trojan|ss):\/\/\S+/gi, '‹节点链接›')
+    .replace(/https?:\/\/[^\s"']+/g, (u) => {
+      try {
+        const x = new URL(u);
+        return x.origin + x.pathname;
+      } catch {
+        return '‹网址›';
+      }
+    })
+    .replace(/\b[0-9a-f]{32,}\b/gi, '‹长串已抹除›')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '‹IP›')
+    .replace(/\b(?:[0-9a-f]{1,4}:){3,}[0-9a-f:]*\b/gi, '‹IPv6›');
+}
+
+function diagTime(t) {
+  try {
+    return new Date(t).toLocaleTimeString('zh-CN', { hour12: false });
+  } catch {
+    return '';
+  }
+}
+
+async function buildDiagReport() {
+  const lines = [];
+  lines.push('cloudflaresub 诊断日志（已脱敏）');
+  lines.push(`导出时间（本机）：${new Date().toString()}`);
+  try {
+    const t0 = performance.now();
+    const resp = await fetch('/api/version', { cache: 'no-store' });
+    const ms = Math.round(performance.now() - t0);
+    const data = await resp.json().catch(() => null);
+    lines.push(`应用版本：${data?.version ?? '未知'}（最新发布：${data?.latest ?? '未知'}，更新检查：${data?.checkStatus ?? '未知'}）`);
+    lines.push(`现测 /api/version：HTTP ${resp.status}，${ms}ms`);
+    const serverDate = resp.headers && typeof resp.headers.get === 'function' ? resp.headers.get('date') : null;
+    if (serverDate) {
+      const skew = Math.round((Date.now() - new Date(serverDate).getTime()) / 1000);
+      lines.push(`时钟偏差（本机 - 服务器）：${skew}s`);
+    }
+  } catch (e) {
+    lines.push(`现测 /api/version：失败（${(e && e.name) || 'Error'}）`);
+  }
+
+  lines.push('', '[环境]');
+  const nav = navigator;
+  lines.push(`UA：${nav.userAgent}`);
+  if (nav.userAgentData) {
+    lines.push(`UA-CH：platform=${nav.userAgentData.platform || '?'}，mobile=${nav.userAgentData.mobile ? '是' : '否'}`);
+  }
+  lines.push(`语言：${nav.language || '?'} / ${(nav.languages || []).join(', ')}`);
+  try {
+    lines.push(`时区：${Intl.DateTimeFormat().resolvedOptions().timeZone || '未知'}`);
+  } catch {
+    lines.push('时区：未知');
+  }
+  lines.push(`屏幕：${screen.width}x${screen.height}，视口：${window.innerWidth}x${window.innerHeight}，DPR：${window.devicePixelRatio}`);
+  lines.push(`触屏：${'ontouchstart' in window ? '是' : '否'}（maxTouchPoints ${nav.maxTouchPoints || 0}）`);
+  lines.push(`在线状态：${nav.onLine ? '在线' : '离线'}`);
+  if (nav.connection) {
+    lines.push(`网络：${nav.connection.effectiveType || '?'}，下行约 ${nav.connection.downlink ?? '?'}Mbps，RTT ${nav.connection.rtt ?? '?'}ms`);
+  }
+  try {
+    lines.push(`深色模式偏好：${window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'}`);
+  } catch {}
+  try {
+    const est = nav.storage && (await nav.storage.estimate());
+    if (est) lines.push(`存储配额：已用 ${est.usage ?? '?'} / ${est.quota ?? '?'} 字节`);
+  } catch {}
+  const keyNames = (storage) => {
+    const out = [];
+    try {
+      for (let i = 0; i < storage.length; i++) out.push(storage.key(i));
+    } catch {}
+    return out;
+  };
+  lines.push(`localStorage 键：${keyNames(localStorage).join(', ') || '（无）'}`);
+  lines.push(`sessionStorage 键：${keyNames(sessionStorage).join(', ') || '（无）'}`);
+
+  lines.push('', '[页面状态]');
+  const items = adminState.items || [];
+  const dynCount = items.filter((i) => i.dynamic).length;
+  const tagCount = items.filter((i) => Array.isArray(i.tags) && i.tags.length).length;
+  const noteCount = items.filter((i) => i.note && i.note.trim()).length;
+  lines.push(`管理列表：${items.length ? `已加载 ${items.length} 条（动态 ${dynCount}，含标签 ${tagCount}，含备注 ${noteCount}）` : '未加载'}`);
+  lines.push(`标签词汇：${allTagCounts().length} 个；已选筛选：${adminState.tagSelected.size} 个；顺序已加载：${tagOrderLoaded ? '是' : '否'}`);
+  const lastList = [...diagJournal].reverse().find((e) => e.kind === 'api' && e.route === 'GET /api/list');
+  if (lastList) lines.push(`最近一次列表加载：HTTP ${lastList.status}，${lastList.ms}ms，${diagTime(lastList.t)}`);
+
+  lines.push('', '[会话操作流水]');
+  if (!diagJournal.length) lines.push('（无）');
+  for (const e of diagJournal) {
+    if (e.kind === 'api') {
+      lines.push(`${diagTime(e.t)} ${e.route} → ${e.status === 0 ? `失败（${e.err || 'Error'}）` : `HTTP ${e.status}`}，${e.ms}ms`);
+    } else {
+      lines.push(`${diagTime(e.t)} 事件：${e.name}`);
+    }
+  }
+
+  lines.push('', '[页面报错]');
+  const errs = window.__diagErrors || [];
+  if (!errs.length) lines.push('（无）');
+  for (const e of errs) {
+    lines.push(`${diagTime(e.t)} ${e.kind}：${e.msg}${e.src ? ` @${e.src}:${e.line || 0}` : ''}`);
+    if (e.stack) lines.push(e.stack);
+  }
+
+  lines.push('', '[服务端诊断]');
+  const token = adminToken();
+  if (!token) {
+    lines.push('（未填管理令牌，跳过服务端诊断）');
+  } else {
+    try {
+      const resp = await fetch('/api/diag', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-admin-token': token },
+        body: JSON.stringify({}),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.diag) {
+        lines.push(`获取失败：HTTP ${resp.status}`);
+      } else {
+        const d = data.diag;
+        lines.push(`服务端时间：${d.serverTime}；落点：${d.colo || '未知'}；版本：${d.version}`);
+        if (d.kvProbe) {
+          lines.push(`KV 探针：写入 ${d.kvProbe.putMs ?? '?'}ms，读取 ${d.kvProbe.getMs ?? '?'}ms，一致：${d.kvProbe.match === true ? '是' : '否'}${d.kvProbe.error ? `，错误 ${d.kvProbe.error}` : ''}`);
+        }
+        const c = d.census || {};
+        if (c.error) {
+          lines.push(`条目普查失败：${c.error}`);
+        } else {
+          lines.push(`条目普查：共 ${c.entries} 条（抽样细查 ${c.detailSampled} 条：动态 ${c.dynamic}，含标签 ${c.withTags}，含备注 ${c.withNote}，永久 ${c.permanent}）`);
+          if (c.recordBytes) lines.push(`记录体积：总 ${c.recordBytes.total} 字节，中位 ${c.recordBytes.p50}，最大 ${c.recordBytes.max}`);
+          if (c.oldestAgeDays !== undefined && c.oldestAgeDays !== null) lines.push(`条目年龄：最老 ${c.oldestAgeDays} 天，最新 ${c.newestAgeDays} 天`);
+          lines.push(`标签词汇：${c.tagVocab} 个；去重键：${c.dedupKeys} 个；来源缓存：${c.ipcache?.keys ?? '?'} 个（抽样 ${c.ipcache?.sampled ?? 0} 个中新鲜 ${c.ipcache?.freshInSample ?? 0} 个）`);
+          lines.push(`动态来源主机（哈希）：${(c.sourceHosts || []).join(', ') || '（无）'}`);
+          lines.push(`标签顺序：${c.tagOrder?.exists ? `存在，${c.tagOrder.size} 个，约 ${c.tagOrder.ageSec ?? '?'} 秒前更新` : '不存在'}`);
+        }
+        lines.push(`版本检查：${d.versionCheck?.status ?? '?'}，最新 ${d.versionCheck?.latest ?? '未知'}，有更新：${d.versionCheck?.updateAvailable ? '是' : '否'}`);
+        lines.push('', '[服务端事件环]');
+        const evts = d.events || [];
+        if (!evts.length) lines.push('（无）');
+        for (const e of evts) {
+          if (e.kind === 'ip-source') {
+            lines.push(`${diagTime(e.t)} 来源 ${e.host} ${e.result === 'failed' ? '抓取失败' : '用旧缓存兜底'}（${e.err || '?'}），${e.ms}ms`);
+          } else {
+            lines.push(`${diagTime(e.t)} ${e.route} → HTTP ${e.status}，${e.ms}ms${e.err ? `，错误 ${e.err}` : ''}`);
+          }
+        }
+      }
+    } catch (e) {
+      lines.push(`获取失败：${(e && e.name) || 'Error'}`);
+    }
+  }
+  return sanitizeDiagText(lines.join('\n'));
+}
+
+const diagExportBtn = byId('diagExportBtn');
+const diagStatusEl = byId('diagStatus');
+if (diagExportBtn) {
+  diagExportBtn.addEventListener('click', async () => {
+    diagExportBtn.disabled = true;
+    if (diagStatusEl) diagStatusEl.textContent = '正在生成…';
+    try {
+      const report = await buildDiagReport();
+      const blob = new Blob([report], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      a.href = URL.createObjectURL(blob);
+      a.download = `cloudflaresub-diag-${stamp}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      if (diagStatusEl) diagStatusEl.textContent = '已导出（已脱敏）。';
+    } catch {
+      if (diagStatusEl) diagStatusEl.textContent = '导出失败，请重试。';
+    } finally {
+      diagExportBtn.disabled = false;
+    }
+  });
+}

@@ -10,6 +10,39 @@
     />
     <link rel="icon" href="/icons/auto.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css" />
+    <script>
+      // Earliest-possible error capture for the diagnostics export:
+      // records only the error kind, a short message and file/line —
+      // never page content — so even failures before app.js loads are
+      // visible in an exported log.
+      window.__diagErrors = [];
+      (function () {
+        var push = function (e) {
+          try {
+            if (window.__diagErrors.length < 30) window.__diagErrors.push(e);
+          } catch (x) {}
+        };
+        window.addEventListener('error', function (ev) {
+          push({
+            t: Date.now(),
+            kind: 'error',
+            msg: String(ev.message || '').slice(0, 200),
+            src: String(ev.filename || '').split('/').pop(),
+            line: ev.lineno || 0,
+            col: ev.colno || 0,
+          });
+        });
+        window.addEventListener('unhandledrejection', function (ev) {
+          var r = ev.reason;
+          push({
+            t: Date.now(),
+            kind: 'rejection',
+            msg: String((r && r.message) || r || '').slice(0, 200),
+            stack: String((r && r.stack) || '').split('\n').slice(0, 4).join('\n'),
+          });
+        });
+      })();
+    </script>
   </head>
   <body>
     <main class="container">
@@ -400,6 +433,12 @@ https://example.com/ips.txt"
         </div>
       </section>
     </main>
+
+    <footer class="page-diag">
+      <button id="diagExportBtn" type="button" class="secondary small">导出诊断日志（已脱敏）</button>
+      <span id="diagStatus" class="hint" role="status" aria-live="polite"></span>
+      <p class="hint">遇到故障时点此导出一份日志文件发给维护者排查。日志只含版本号、环境、操作成败与耗时、计数等信息，已脱敏：不含管理令牌、节点链接、优选地址、备注与标签内容。</p>
+    </footer>
 
     <div class="quick-dock">
       <div class="quick-nav-group" role="navigation" aria-label="快速定位">

@@ -66,6 +66,14 @@ assert.equal(payload.nodes.length, 2);
 // drifted before (YAML escaping, Surge name sanitizing). Feed ONE
 // battery of hostile names through both and require the rendered
 // proxy NAME lists to agree exactly, in Clash and in Surge.
+// SCOPE, stated plainly (audit round 10): this battery guards NAMES
+// only. The two renderers are different generations and differ in
+// emitted fields (ipv6, ws-opts, fingerprint, test URLs, group
+// titles) by history — field-level equality is deliberately NOT
+// asserted. What it additionally guarantees: core's renderers accept
+// the worker's stored node shape (e.g. a string `alpn`) without
+// throwing — see the rich vmess node in the battery below, which
+// core's clash renderer used to crash on.
 {
   const { default: worker } = await import('../src/worker.js');
   const eqStore = new Map();
@@ -92,6 +100,9 @@ assert.equal(payload.nodes.length, 2);
     { type: 'trojan', name: 'x,y', server: 'd.example.com', port: 443, password: 'pw', tls: true, sni: '', host: '', path: '/' },
     { type: 'vmess', name: 'x y', server: 'e.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', host: '', path: '/' },
     { type: 'vless', name: 'vless名', server: 'f.example.com', port: 443, uuid: U, network: 'tcp', tls: false, sni: '', host: '', path: '/' },
+    // Rich worker-shaped node: string alpn. Core's own parser makes
+    // an array, and its clash renderer used to throw on the string.
+    { type: 'vmess', name: 'alpn节点', server: 'g.example.com', port: 443, uuid: U, cipher: 'auto', network: 'ws', tls: true, sni: 's.example.com', hostHeader: 'h.example.com', path: '/ws', alpn: 'h2', fp: 'chrome' },
   ];
   eqStore.set('sub:EqTest01', { value: JSON.stringify({ id: 'EqTest01', nodes: battery, storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z' }) });
   const eqList = await (await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'tok' } }), eqEnv)).json();
@@ -100,10 +111,16 @@ assert.equal(payload.nodes.length, 2);
   const wSurge = await (await worker.fetch(new Request(`https://x.pages.dev/sub/EqTest01?token=${eqTok}&target=surge`), eqEnv)).text();
   const clashNames = (doc) => [...doc.split('proxy-groups:')[0].matchAll(/- name: "([^"]+)"/g)].map((m) => m[1]);
   const surgeNames = (doc) => doc.split('\n').map((l) => /^(.+?) = (?:vmess|trojan),/.exec(l)).filter(Boolean).map((m) => m[1]);
-  assert.deepEqual(clashNames(wClash), ['同名', '同名 (2)', 'a b', 'x,y', 'x y', 'vless名'], 'worker clash battery names');
-  assert.deepEqual(surgeNames(wSurge), ['同名', '同名 (2)', 'a b', 'x y', 'x y (2)'], 'worker surge battery names');
+  assert.deepEqual(clashNames(wClash), ['同名', '同名 (2)', 'a b', 'x,y', 'x y', 'vless名', 'alpn节点'], 'worker clash battery names');
+  assert.deepEqual(surgeNames(wSurge), ['同名', '同名 (2)', 'a b', 'x y', 'x y (2)', 'alpn节点'], 'worker surge battery names');
   assert.deepEqual(clashNames(renderClashSubscription(battery)), clashNames(wClash), 'core/worker clash names agree');
   assert.deepEqual(surgeNames(renderSurgeSubscription(battery, 'https://x.pages.dev/sub/EqTest01')), surgeNames(wSurge), 'core/worker surge names agree');
+  // Core-only: its own group titles are reserved names there (the
+  // worker's groups have different titles, so this stays core-local).
+  const coreReserved = renderClashSubscription([
+    { type: 'vmess', name: '🚀 节点选择', server: 'h.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', hostHeader: '', path: '/' },
+  ]);
+  assert.ok(coreReserved.includes('- name: "🚀 节点选择 (2)"'), 'core clash renames a node named like its select group');
   console.log('equivalence battery: worker/core rendered names agree');
 }
 

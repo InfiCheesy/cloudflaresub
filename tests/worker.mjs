@@ -1194,3 +1194,45 @@ console.log('worker tests passed');
   assert.ok((await surge9.text()).includes('Surge 仅支持 VMess / Trojan'), 'surge error explains the supported types');
   console.log('audit round 9 suite: duplicate names + surge empty-profile error: passed');
 }
+
+// ===== Audit round 10: reserved group names + empty records =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const reservedNodes = [
+    { type: 'vmess', name: '节点选择', server: 'a.example.com', port: 443, uuid: U, cipher: 'auto', network: 'ws', tls: true, sni: '', host: '', path: '/' },
+    { type: 'trojan', name: 'Proxy', server: 'b.example.com', port: 443, password: 'pw', tls: true, sni: '', host: '', path: '/' },
+    { type: 'vmess', name: '自动选择', server: 'c.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', host: '', path: '/' },
+  ];
+  await env.SUB_STORE.put('sub:ResvR10', JSON.stringify({
+    id: 'ResvR10', nodes: reservedNodes, storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  await env.SUB_STORE.put('sub:EmptyR10', JSON.stringify({
+    id: 'EmptyR10', nodes: [], storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr10 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('ResvR10', lr10.items.find((i) => i.id === 'ResvR10').linkToken);
+  linkTokens.set('EmptyR10', lr10.items.find((i) => i.id === 'EmptyR10').linkToken);
+  // Clash: proxies and groups share one namespace — every `- name:`
+  // in the document must be unique.
+  const clashDoc = (await getSub('ResvR10', 'clash')).body;
+  const allNames = [...clashDoc.matchAll(/- name: "([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(allNames).size, allNames.length, 'clash: no duplicate definition names across proxies and groups');
+  assert.ok(allNames.includes('节点选择 (2)') && allNames.includes('自动选择 (2)'), 'clash: nodes named like groups are renamed');
+  // Surge: exactly one `Proxy =` definition line (the group); the
+  // trojan proxy of that name is renamed.
+  const surgeDoc = (await getSub('ResvR10', 'surge')).body;
+  const proxyDefs = surgeDoc.split('\n').filter((l) => l.startsWith('Proxy ='));
+  assert.equal(proxyDefs.length, 1, 'surge: only the group defines Proxy');
+  assert.ok(proxyDefs[0].startsWith('Proxy = select,'), 'surge: the surviving Proxy definition is the group');
+  assert.ok(surgeDoc.includes('Proxy (2) = trojan,'), 'surge: the trojan node named Proxy is renamed');
+  // Empty node list (hand-corrupted record): every target answers a
+  // clear 400 instead of a degenerate 200.
+  for (const target of ['clash', 'plain']) {
+    const r = await getSub('EmptyR10', target);
+    assert.equal(r.status, 400, `empty record: ${target} is a clear 400`);
+    assert.ok(r.body.includes('节点列表为空'), `empty record: ${target} explains itself`);
+  }
+  const rawR = await getSub('EmptyR10');
+  assert.equal(rawR.status, 400, 'empty record: default raw target is a clear 400 too');
+  console.log('audit-10 suite: reserved names renamed, empty records refuse clearly');
+}

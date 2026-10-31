@@ -529,6 +529,11 @@ button.small {
   position: fixed;
   inset: 0;
   z-index: 1000;
+  /* The dialog is ~430px tall plus its top margin: on short or
+     landscape viewports it would otherwise overflow the fixed layer
+     and clip its tail (the subscription URL) with no way to scroll. */
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .modal.hidden {

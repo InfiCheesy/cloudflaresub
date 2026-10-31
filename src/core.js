@@ -188,8 +188,11 @@ export function expandNodes(baseNodes, endpoints, options = {}) {
 // Mirror of the worker's helper: Clash/Surge key proxies by name and
 // reject duplicates, so later occurrences of a name get a " (n)"
 // suffix, bumped past any name that already ends that way.
-export function dedupeNodeNames(nodes) {
-  const used = new Set();
+export function dedupeNodeNames(nodes, reserved = []) {
+  // `reserved` seeds the used set with the caller's own group titles
+  // (see the worker's copy): a node named like a group would define
+  // both under one name, which clients reject.
+  const used = new Set(reserved);
   const counts = new Map();
   return nodes.map((node) => {
     const base = node.name || '';
@@ -263,7 +266,7 @@ export function renderRawSubscription(nodes) {
 }
 
 export function renderClashSubscription(nodes) {
-  const supportedNodes = dedupeNodeNames(nodes).filter(isClashSupportedNode);
+  const supportedNodes = dedupeNodeNames(nodes, ['🚀 节点选择', '♻️ 自动选择']).filter(isClashSupportedNode);
   if (!supportedNodes.length) {
     throw new Error('没有可导出为 Clash 的节点。当前版本主要支持 VMess/VLESS/Trojan 的 WS/TCP/GRPC/HTTP 常见格式。');
   }
@@ -308,6 +311,7 @@ export function renderSurgeSubscription(nodes, requestUrl) {
   // to the same Surge name, and Surge keys proxies by that form.
   const supportedNodes = dedupeNodeNames(
     filtered.map((node) => ({ ...node, name: sanitizeSurgeName(node.name) })),
+    ['🚀 节点选择', '♻️ 自动选择'],
   );
 
   const proxyNames = supportedNodes.map((node) => node.name);
@@ -368,7 +372,7 @@ export function renderVmessUri(node) {
     tls: node.tls ? (node.security || 'tls') : '',
     sni: node.sni || '',
     fp: node.fp || '',
-    alpn: Array.isArray(node.alpn) && node.alpn.length ? node.alpn.join(',') : '',
+    alpn: alpnList(node).join(','),
   };
   return `vmess://${encodeBase64Utf8(JSON.stringify(payload))}`;
 }
@@ -387,7 +391,7 @@ export function renderVlessUri(node) {
   setQueryParam(params, 'path', node.path || '');
   setQueryParam(params, 'host', node.hostHeader || '');
   setQueryParam(params, 'sni', node.sni || '');
-  setQueryParam(params, 'alpn', node.alpn?.length ? node.alpn.join(',') : '');
+  setQueryParam(params, 'alpn', alpnList(node).join(','));
   setQueryParam(params, 'fp', node.fp || '');
   setQueryParam(params, 'flow', node.flow || '');
   setQueryParam(params, 'serviceName', node.serviceName || '');
@@ -407,7 +411,7 @@ export function renderTrojanUri(node) {
   setQueryParam(params, 'path', node.path || '');
   setQueryParam(params, 'host', node.hostHeader || '');
   setQueryParam(params, 'sni', node.sni || '');
-  setQueryParam(params, 'alpn', node.alpn?.length ? node.alpn.join(',') : '');
+  setQueryParam(params, 'alpn', alpnList(node).join(','));
   setQueryParam(params, 'fp', node.fp || '');
   setQueryParam(params, 'serviceName', node.serviceName || '');
   setQueryParam(params, 'authority', node.authority || '');
@@ -627,8 +631,8 @@ function renderClashProxy(node) {
     if (servername) {
       lines.push(`    servername: ${yamlQuote(servername)}`);
     }
-    if (node.alpn?.length) {
-      lines.push(`    alpn: [${node.alpn.map(yamlQuote).join(', ')}]`);
+    if (alpnList(node).length) {
+      lines.push(`    alpn: [${alpnList(node).map(yamlQuote).join(', ')}]`);
     }
     if (node.fp) {
       lines.push(`    client-fingerprint: ${yamlQuote(node.fp)}`);
@@ -783,6 +787,15 @@ function setQueryParam(params, key, value) {
   } else {
     params.delete(key);
   }
+}
+
+// Node shapes differ between this library (alpn as an array, from
+// its own parser) and the worker's stored records (alpn as a plain
+// string). Accept both everywhere instead of throwing on the other
+// implementation's records.
+function alpnList(node) {
+  if (Array.isArray(node.alpn)) return node.alpn;
+  return node.alpn ? [node.alpn] : [];
 }
 
 function yamlQuote(value) {

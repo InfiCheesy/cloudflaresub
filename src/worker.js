@@ -623,8 +623,12 @@ function parseRawLinks(input) {
 // same link pasted twice — used to produce duplicate names and a
 // subscription the client refused to import. Later occurrences get a
 // " (n)" suffix, bumped past any name that already ends that way.
-function dedupeNodeNames(nodes) {
-  const used = new Set();
+function dedupeNodeNames(nodes, reserved = []) {
+  // `reserved` seeds the used set with names the caller will emit
+  // itself (proxy-group titles): a node carrying one of those names
+  // would otherwise define a proxy and a group under one name, which
+  // clients reject just like a duplicate proxy name.
+  const used = new Set(reserved);
   const counts = new Map();
   return nodes.map((node) => {
     const base = node.name || '';
@@ -752,7 +756,7 @@ function pushClashWsOpts(lines, node) {
 function renderClash(nodes) {
   // Stored records predate build-time dedupe: rename again here so an
   // old entry with duplicate names still imports cleanly.
-  nodes = dedupeNodeNames(nodes);
+  nodes = dedupeNodeNames(nodes, ['自动选择', '节点选择']);
   const proxies = nodes
     .map((node) => {
       if (node.type === 'vmess') {
@@ -904,6 +908,7 @@ function renderSurge(nodes, baseUrl, linkToken) {
     dedupeNodeNames(nodes)
       .filter((node) => node.type === 'vmess' || node.type === 'trojan')
       .map((node) => ({ ...node, name: surgeName(node.name) })),
+    ['Proxy'],
   );
   const proxies = supported
     .map((node) => {
@@ -2005,6 +2010,13 @@ async function handleSub(request, env, url) {
       const rebuilt = buildNodes(record.baseNodes, eps, record.options || {});
       if (rebuilt.length) nodes = rebuilt;
     }
+  }
+  if (!nodes.length) {
+    // Only reachable for a hand-corrupted record (generation always
+    // stores at least one node): every format would otherwise return
+    // a 200 with an empty or group-only body that clients reject
+    // opaquely. Same treatment as the Surge no-supported-nodes case.
+    return text('该条目的节点列表为空，无法生成订阅内容。', 400, 'text/plain; charset=utf-8');
   }
   let target = (url.searchParams.get('target') || '').toLowerCase();
   if (!target || target === 'auto') {

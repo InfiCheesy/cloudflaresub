@@ -1122,6 +1122,7 @@ async function deleteTagEverywhere(tag) {
   if (!affected.length) return;
   if (!window.confirm(`确定要把标签「${tag}」从全部 ${affected.length} 条订阅上删除吗？此操作不可恢复。`)) return;
   const token = adminToken();
+  await flushNoteAutosaves(affected.map((item) => item.id));
   adminMsg.textContent = `正在从 ${affected.length} 条订阅上删除标签「${tag}」…`;
   const failed = [];
   for (const item of affected) {
@@ -1688,6 +1689,27 @@ async function settleNoteAutosaves(ids) {
   await Promise.all(ids.map((id) => noteSaveStates.get(id)?.promise).filter(Boolean).map((p) => p.catch(() => {})));
 }
 
+// Tags/retention saves rewrite the SAME record the note autosave
+// writes, and every handler puts the whole record from its own read:
+// an autosave landing mid-save reverts the other field (possibly
+// after the UI already showed success). Flush instead of cancel —
+// fire a queued autosave now with the input's current value, then
+// await the chain — so the writes serialize. (Deletes deliberately
+// use settleNoteAutosaves: there the queued save is dropped because
+// the entry is going away.)
+async function flushNoteAutosaves(ids) {
+  for (const id of ids) {
+    const saveState = noteSaveStates.get(id);
+    if (!saveState || !saveState.timer) continue;
+    clearTimeout(saveState.timer);
+    saveState.timer = null;
+    const entry = [...adminBody.querySelectorAll('.entry')].find((el) => el.dataset.id === id);
+    const box = entry?.querySelector('.note-input');
+    if (box) requestNoteSave(id, box.value);
+  }
+  await Promise.all(ids.map((id) => noteSaveStates.get(id)?.promise).filter(Boolean).map((p) => p.catch(() => {})));
+}
+
 if (adminBody) {
   adminBody.addEventListener('input', (event) => {
     const box = event.target.closest?.('.note-input');
@@ -1907,6 +1929,7 @@ document.addEventListener('click', async (event) => {
   const panel = entry.querySelector('.entry-retention');
   const mode = panel.querySelector('.ret-mode')?.value || 'permanent';
   const days = Number(panel.querySelector('.ret-days')?.value);
+  await flushNoteAutosaves([id]);
   saveBtn.disabled = true;
   saveBtn.removeAttribute('data-save-state');
   saveBtn.textContent = '保存中…';
@@ -2077,6 +2100,7 @@ document.addEventListener('click', async (event) => {
   const id = entry.dataset.id;
   const token = adminToken();
   if (!id || !token) return;
+  await flushNoteAutosaves([id]);
   saveBtn.disabled = true;
   saveBtn.removeAttribute('data-save-state');
   saveBtn.textContent = '保存中…';

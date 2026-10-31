@@ -307,7 +307,13 @@ function setGenTags(tags, touched) {
 }
 
 async function loadGenTagVocab() {
-  if (genTagVocab) return;
+  // The vocabulary DATA stays cached, but focusing the picker always
+  // re-renders the suggestions so their ORDER reflects the current
+  // canonical (filter-bar) order, not the order at first load.
+  if (genTagVocab) {
+    renderGenTagSuggestions();
+    return;
+  }
   const token = adminToken();
   if (!token) return;
   try {
@@ -715,6 +721,23 @@ function loadTagOrder() {
 function saveTagOrder(tags) {
   try { localStorage.setItem(TAG_ORDER_KEY, JSON.stringify(tags)); } catch {}
 }
+// The single broadcast every tag-order change goes through: ALL
+// vocabulary views re-render from the one canonical order — the
+// filter bar, the generate picker's suggestions, and every entry
+// panel ever built, open or closed. (Panels are built once and then
+// cached in the DOM, so refreshing only the visible ones left closed
+// panels stale until the next full list reload.)
+function refreshTagVocabViews() {
+  renderTagFilterBar();
+  if (genTagVocab) renderGenTagSuggestions();
+  if (adminBody) {
+    for (const panel of adminBody.querySelectorAll('.entry-tags-panel')) renderTagsPanel(panel);
+  }
+}
+function setTagOrder(tags) {
+  saveTagOrder(tags);
+  refreshTagVocabViews();
+}
 // One ordering for every tag vocabulary display: the filter bar is
 // the reference, and the suggestion areas (generate picker, entry
 // panel) follow it — the stored custom order wins, everything else
@@ -789,9 +812,14 @@ async function deleteTagEverywhere(tag) {
     if (t.toLowerCase() === lower) adminState.tagSelected.delete(t);
   }
   saveTagOrder(loadTagOrder().filter((t) => t.toLowerCase() !== lower));
+  const hadVocab = genTagVocab !== null;
   genTagVocab = null;
   renderAdminList();
   updateAdminCount();
+  // The deleted tag also leaves every other vocabulary view; the
+  // picker vocabulary refetches so its suggestions drop it too.
+  refreshTagVocabViews();
+  if (hadVocab) void loadGenTagVocab();
   adminMsg.textContent = failed.length
     ? `标签「${tag}」已从 ${affected.length - failed.length} 条订阅上删除；${failed.length} 条失败：${failed.join('、')}`
     : `标签「${tag}」已从全部 ${affected.length} 条订阅上删除。`;
@@ -804,12 +832,7 @@ if (tagFilterChips) {
   });
   makeChipsSortable(tagFilterChips, '.tag-chip', {
     onReorder: (values) => {
-      saveTagOrder(values);
-      renderTagFilterBar();
-      // Keep every suggestion area in sync with the new order, even
-      // ones already open on screen.
-      renderGenTagSuggestions();
-      for (const panel of adminBody.querySelectorAll('.entry-tags-panel:not(.hidden)')) renderTagsPanel(panel);
+      setTagOrder(values);
     },
     trashEl: tagFilterBar?.querySelector('.tag-filter-label'),
     onTrash: (tag) => { void deleteTagEverywhere(tag); },

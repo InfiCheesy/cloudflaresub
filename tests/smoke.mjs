@@ -29,6 +29,13 @@ assert.equal(expanded.nodes[1].port, 2053);
 const raw = renderRawSubscription(expanded.nodes);
 assert.ok(raw.length > 10);
 
+// Audit-8: yamlQuote must escape whitespace controls in names (a raw
+// newline survives only via YAML line folding and silently renames
+// the node in Clash) and drop the other C0 controls outright.
+const clashCtrl = renderClashSubscription([{ ...nodes[0], name: 'a\nb\rc\td\x07e' }]);
+assert.ok(clashCtrl.includes('a\\nb\\rc\\td'), 'clash escapes name whitespace controls');
+assert.ok(!clashCtrl.includes('\x07'), 'clash output carries no raw control characters');
+
 const clash = renderClashSubscription(expanded.nodes);
 assert.match(clash, /proxies:/);
 assert.match(clash, /edge\.example\.com/);

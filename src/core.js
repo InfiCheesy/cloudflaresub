@@ -757,7 +757,18 @@ function setQueryParam(params, key, value) {
 
 function yamlQuote(value) {
   const text = String(value ?? '');
-  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  // Escape the whitespace controls as YAML escapes (a raw newline in
+  // a double-quoted scalar only survives via line folding, which
+  // silently renames the node in Clash) and drop the remaining C0
+  // controls outright — they are never legitimate in a name/host.
+  const cleaned = text
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+  return `"${cleaned}"`;
 }
 
 function sanitizeSurgeName(name) {

@@ -463,9 +463,9 @@ form.addEventListener('submit', async (event) => {
   try {
     const response = await postJson('/api/generate', payload);
 
-    const data = await response.json();
-    if (!response.ok || !data.ok) {
-      throw new Error(data.error || '生成失败');
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || !data.ok) {
+      throw new Error((data && data.error) || '生成失败');
     }
     genTagVocab = null; // this generate may have introduced new tags
 
@@ -571,6 +571,9 @@ document.addEventListener('click', async (event) => {
       correctLevel: window.QRCode.CorrectLevel.M,
     });
     playQrMotion(true);
+    if (closeQrModal && typeof closeQrModal.focus === 'function') {
+      closeQrModal.focus({ preventScroll: true });
+    }
     return;
   }
 
@@ -580,6 +583,10 @@ document.addEventListener('click', async (event) => {
 });
 
 closeQrModal.addEventListener('click', closeQrDialog);
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !qrModal.classList.contains('hidden')) closeQrDialog();
+});
 
 // The QR dialog grows out of the button that opened it and shrinks
 // back into the same button on close ("从哪来，回哪去"): the flight is
@@ -660,6 +667,10 @@ function hideQrDialogNow() {
   qrModal.classList.add('hidden');
   qrModal.setAttribute('aria-hidden', 'true');
   qrCanvas.innerHTML = '';
+  // Focus returns to the button that opened the dialog.
+  if (qrOriginBtn && qrOriginBtn.isConnected && typeof qrOriginBtn.focus === 'function') {
+    qrOriginBtn.focus({ preventScroll: true });
+  }
 }
 
 function closeQrDialog() {
@@ -703,8 +714,30 @@ const adminState = {
   tagMode: 'and',
 };
 
-if (adminTokenInput && sessionStorage.getItem('cfsub_admin_token')) {
-  adminTokenInput.value = sessionStorage.getItem('cfsub_admin_token');
+// Web storage can be present-but-throwing (blocked cookies/storage
+// in hardened browsers and in-app webviews) — even reading the global
+// can throw, and an unguarded access at load time used to kill the
+// whole page script. Every access goes through these helpers and
+// degrades to "no storage": a page that cannot remember the admin
+// token still works.
+function storageGet(name, key) {
+  try { return window[name].getItem(key); } catch { return null; }
+}
+function storageSet(name, key, value) {
+  try { window[name].setItem(key, value); } catch {}
+}
+function storageKeyNames(name) {
+  const out = [];
+  try {
+    const s = window[name];
+    for (let i = 0; i < s.length; i++) out.push(s.key(i));
+  } catch {}
+  return out;
+}
+
+const savedAdminToken = storageGet('sessionStorage', 'cfsub_admin_token');
+if (adminTokenInput && savedAdminToken) {
+  adminTokenInput.value = savedAdminToken;
 }
 
 function adminToken() {
@@ -1153,10 +1186,19 @@ function retentionDaysText(st) {
   return Number.isFinite(n) ? String(n) : '?';
 }
 
+// One guarded formatter for every date the admin list prints: a
+// hand-corrupted record must show a placeholder, never the literal
+// text "Invalid Date".
+function fmtDateTime(value) {
+  if (!value) return '-';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? '-' : d.toLocaleString('zh-CN', { hour12: false });
+}
+
 function retentionHtml(item) {
   const st = item.storage || { mode: 'permanent' };
   return st.mode === 'days'
-    ? `${retentionDaysText(st)} 天后删除<br><span class="hint">${st.expiresAt ? '到期：' + new Date(st.expiresAt).toLocaleString('zh-CN', { hour12: false }) : ''}</span>`
+    ? `${retentionDaysText(st)} 天后删除<br><span class="hint">${st.expiresAt ? '到期：' + fmtDateTime(st.expiresAt) : ''}</span>`
     : '永久';
 }
 
@@ -1180,7 +1222,7 @@ function renderAdminList() {
   }
   adminBody.innerHTML = visible
     .map((item) => {
-      const created = item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN', { hour12: false }) : '-';
+      const created = fmtDateTime(item.createdAt);
       const retention = retentionHtml(item);
       return `<div class="entry" data-id="${escapeHtml(item.id)}">
         <div class="entry-row">
@@ -1212,7 +1254,7 @@ async function loadAdminList() {
     adminMsg.textContent = '请先填入 SUB_ACCESS_TOKEN。';
     return;
   }
-  sessionStorage.setItem('cfsub_admin_token', token);
+  storageSet('sessionStorage', 'cfsub_admin_token', token);
   adminMsg.textContent = '加载中...';
   // The shared tag order loads in parallel; when it lands it
   // broadcasts, re-rendering every vocabulary view canonically.
@@ -1220,8 +1262,8 @@ async function loadAdminList() {
   try {
     // The admin token travels in a header, never in the URL.
     const resp = await fetch('/api/list', { headers: { 'x-admin-token': token } });
-    const data = await resp.json();
-    if (!resp.ok || !data.ok) throw new Error(data.error || '加载失败');
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data || !data.ok) throw new Error((data && data.error) || '加载失败');
     adminState.items = data.items || [];
     // Ingestion boundary: whatever the server (or a future regression
     // in it) sends, an item's tags are a string array by the time any
@@ -1763,7 +1805,7 @@ function buildRetentionPanel(item) {
   const panel = document.createElement('div');
   panel.className = 'entry-retention hidden';
   const current = st.mode === 'days'
-    ? `${retentionDaysText(st)} 天后删除${st.expiresAt ? '（到期：' + new Date(st.expiresAt).toLocaleString('zh-CN', { hour12: false }) + '）' : ''}`
+    ? `${retentionDaysText(st)} 天后删除${st.expiresAt ? '（到期：' + fmtDateTime(st.expiresAt) + '）' : ''}`
     : '永久保存';
   panel.innerHTML = `
     <div class="ret-current">当前有效期：<strong>${escapeHtml(current)}</strong></div>
@@ -2293,15 +2335,8 @@ async function buildDiagReport() {
     const est = nav.storage && (await nav.storage.estimate());
     if (est) lines.push(`存储配额：已用 ${est.usage ?? '?'} / ${est.quota ?? '?'} 字节`);
   } catch {}
-  const keyNames = (storage) => {
-    const out = [];
-    try {
-      for (let i = 0; i < storage.length; i++) out.push(storage.key(i));
-    } catch {}
-    return out;
-  };
-  lines.push(`localStorage 键：${keyNames(localStorage).join(', ') || '（无）'}`);
-  lines.push(`sessionStorage 键：${keyNames(sessionStorage).join(', ') || '（无）'}`);
+  lines.push(`localStorage 键：${storageKeyNames('localStorage').join(', ') || '（无）'}`);
+  lines.push(`sessionStorage 键：${storageKeyNames('sessionStorage').join(', ') || '（无）'}`);
 
   lines.push('', '[页面状态]');
   const items = adminState.items || [];

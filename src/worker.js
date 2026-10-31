@@ -11,9 +11,9 @@ function json(data, status = 200) {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,OPTIONS',
-      'access-control-allow-headers': 'content-type, x-admin-token',
+      // API JSON is same-origin only (the page calls its own /api) and
+      // must never be cached: no wildcard CORS grant, no-store.
+      'cache-control': 'no-store',
     },
   });
 }
@@ -2289,6 +2289,19 @@ async function handleDiag(request, env) {
 // plus failed subscription fetches. Auth failures (403) are skipped on
 // purpose: rejected requests must not write anything, as the security
 // audits established.
+const apiFailureSeen = new Map();
+function apiFailureEventDue(sig) {
+  const now = Date.now();
+  if (now - (apiFailureSeen.get(sig) || 0) < 10 * 60 * 1000) return false;
+  apiFailureSeen.set(sig, now);
+  if (apiFailureSeen.size > 200) {
+    for (const [k, t] of apiFailureSeen) {
+      if (now - t >= 10 * 60 * 1000) apiFailureSeen.delete(k);
+    }
+  }
+  return true;
+}
+
 async function recordApiEvent(env, ctx, request, url, status, ms, errName) {
   if (request.method === 'OPTIONS') return;
   const p = url.pathname;
@@ -2306,6 +2319,17 @@ async function recordApiEvent(env, ctx, request, url, status, ms, errName) {
     : DIAG_KNOWN_ROUTES.has(p)
       ? p
       : '/api/*';
+  // Failure events are throttled per signature (method + route
+  // template + status + error name). Each recorded event costs a KV
+  // read and a write, and the failure paths are precisely the ones
+  // that can repeat without any token: junk requests to unknown /api
+  // paths (404) and dead subscription links retried by clients (404).
+  // Unthrottled, a few hundred of those could burn the free tier's
+  // daily write quota and take the owner's own saves down with it.
+  // The first sighting of each failure still lands immediately, and
+  // successes are never throttled (the activity timeline is the
+  // point, and those paths are token-gated or healthy fetches).
+  if (status !== 200 && !apiFailureEventDue(`${request.method} ${routePath}|${status}|${errName || ''}`)) return;
   const evt = {
     kind: 'api',
     route: `${request.method} ${routePath}`,

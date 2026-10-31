@@ -1106,7 +1106,10 @@ console.log('worker tests passed');
   const flooded = await (await diagPost()).json();
   const stars = flooded.diag.events.filter((e) => e.route === 'GET /api/*');
   const starTotal = stars.reduce((a, e) => a + (e.n || 1), 0);
-  assert.ok(starTotal >= 60, 'junk flood is fully counted across the shards');
+  // H1 supersedes the D2-era expectation here: failure events are
+  // throttled per signature at the door, so a junk flood now costs a
+  // single KV write per window instead of being fully counted.
+  assert.ok(starTotal <= 2, 'junk flood is throttled to a single counted event per window');
   assert.ok(stars.length <= 8, 'flood occupies at most one collapsed entry per shard');
   assert.ok(flooded.diag.events.some((e) => e.route === 'POST /api/tag-order'), 'legit history survives the flood');
   assert.ok(flooded.diag.events.length <= 60, 'ring still capped after the flood');
@@ -1122,5 +1125,33 @@ console.log('worker tests passed');
     withJunk.diag.events.every((e) => e && typeof e === 'object' && typeof e.t === 'number'),
     'merged events are all well-formed',
   );
+
+  // H1: failure events are throttled per signature. A burst of junk
+  // 404s (no token needed) and a dead-link /sub retry loop may each
+  // add at most ONE ring entry per window — otherwise a few hundred
+  // requests could burn the free tier's daily KV write quota.
+  const countSig = (j, route, status) => j.diag.events.filter((e) => e.route === route && e.status === status).length;
+  const junkBefore = countSig(await (await diagPost()).json(), 'GET /api/*', 404);
+  for (let i = 0; i < 20; i++) {
+    await worker.fetch(new Request(`https://sub.test/api/nope-${i}`), env);
+  }
+  const junkAfter = await (await diagPost()).json();
+  assert.ok(countSig(junkAfter, 'GET /api/*', 404) - junkBefore <= 1, 'junk 404 burst throttled to one event');
+  const deadGen = await generate({ nodeLinks: node, preferredIps: '203.0.113.7' });
+  await worker.fetch(new Request('https://x.pages.dev/api/delete', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', id: deadGen.shortId }),
+  }), env);
+  const subBefore = countSig(await (await diagPost()).json(), 'GET /sub/:id', 404);
+  for (let i = 0; i < 20; i++) {
+    await worker.fetch(new Request(`https://x.pages.dev/sub/${deadGen.shortId}?token=${linkTokens.get(deadGen.shortId)}`), env);
+  }
+  const subAfter = await (await diagPost()).json();
+  assert.ok(countSig(subAfter, 'GET /sub/:id', 404) - subBefore <= 1, 'dead-link retry loop throttled to one event');
+
+  // H2: API JSON is no-store and carries no wildcard CORS grant.
+  const versionResp = await worker.fetch(new Request('https://sub.test/api/version'), env);
+  assert.equal(versionResp.headers.get('cache-control'), 'no-store', 'API JSON is no-store');
+  assert.equal(versionResp.headers.get('access-control-allow-origin'), null, 'no wildcard CORS on API JSON');
   console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');
 }

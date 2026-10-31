@@ -270,7 +270,9 @@ let genTagVocab = null; // [{tag, count}] from GET /api/tags, lazy
 
 function renderGenTagSuggestions() {
   if (!genTagSuggestions) return;
-  const vocab = (genTagVocab || []).filter(
+  // The picker suggestions follow the filter bar's (stored) order,
+  // not the server vocabulary's raw count order.
+  const vocab = applyTagOrder(genTagVocab || []).filter(
     (v) => !genTags.some((t) => t.toLowerCase() === String(v.tag).toLowerCase()),
   );
   genTagSuggestions.innerHTML = vocab
@@ -713,14 +715,20 @@ function loadTagOrder() {
 function saveTagOrder(tags) {
   try { localStorage.setItem(TAG_ORDER_KEY, JSON.stringify(tags)); } catch {}
 }
-function orderedTagVocab() {
-  const vocab = allTagCounts();
+// One ordering for every tag vocabulary display: the filter bar is
+// the reference, and the suggestion areas (generate picker, entry
+// panel) follow it — the stored custom order wins, everything else
+// falls back to count, then name.
+function applyTagOrder(vocab) {
   const pos = new Map(loadTagOrder().map((t, i) => [t.toLowerCase(), i]));
-  return vocab.sort((a, b) => {
+  return [...vocab].sort((a, b) => {
     const pa = pos.get(String(a.tag).toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
     const pb = pos.get(String(b.tag).toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
     return pa - pb || b.count - a.count || a.tag.localeCompare(b.tag, 'zh-Hans-CN');
   });
+}
+function orderedTagVocab() {
+  return applyTagOrder(allTagCounts());
 }
 
 function renderTagFilterBar() {
@@ -798,6 +806,10 @@ if (tagFilterChips) {
     onReorder: (values) => {
       saveTagOrder(values);
       renderTagFilterBar();
+      // Keep every suggestion area in sync with the new order, even
+      // ones already open on screen.
+      renderGenTagSuggestions();
+      for (const panel of adminBody.querySelectorAll('.entry-tags-panel:not(.hidden)')) renderTagsPanel(panel);
     },
     trashEl: tagFilterBar?.querySelector('.tag-filter-label'),
     onTrash: (tag) => { void deleteTagEverywhere(tag); },
@@ -1570,7 +1582,7 @@ function renderTagsPanel(panel) {
   }
   const sugg = panel.querySelector('.tags-edit-suggest');
   if (sugg) {
-    const vocab = allTagCounts().filter((v) => !panel._tags.some((t) => t.toLowerCase() === v.tag.toLowerCase()));
+    const vocab = orderedTagVocab().filter((v) => !panel._tags.some((t) => t.toLowerCase() === v.tag.toLowerCase()));
     sugg.innerHTML = vocab
       .map((v) => `<button type="button" class="tag-chip tag-chip-pick" data-tags-pick="${escapeHtml(v.tag)}">${escapeHtml(v.tag)} · ${v.count}</button>`)
       .join('');

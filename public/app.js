@@ -105,14 +105,6 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
   if (!container) return;
   let drag = null;
   const siblings = () => [...container.querySelectorAll(chipSelector)].filter((c) => c !== drag.chip);
-  const readOrder = (d) => {
-    const values = [];
-    for (const node of container.childNodes) {
-      if (node === d.placeholder) values.push(d.chip.dataset.sortValue);
-      else if (node.nodeType === 1 && node !== d.chip && node.matches(chipSelector)) values.push(node.dataset.sortValue);
-    }
-    return values;
-  };
   // Move the placeholder, animating the siblings from their old spots.
   const flipMove = (mutate) => {
     const chips = siblings();
@@ -147,11 +139,20 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
       trashEl.classList.remove('trash-armed', 'is-hot');
     }
     const trashed = commit && d.overTrash && typeof onTrash === 'function';
-    const values = commit && !trashed ? readOrder(d) : null;
-    d.placeholder?.remove();
+    // Put the chip back into the slot the placeholder held, THEN read
+    // the order off the restored DOM. Restoring unconditionally also
+    // keeps the list whole when a trash drop is cancelled at its
+    // confirm dialog.
+    if (d.placeholder) {
+      container.insertBefore(d.chip, d.placeholder);
+      d.placeholder.remove();
+    }
     d.chip.classList.remove('dragging');
     d.chip.style.cssText = '';
     container.classList.remove('chip-sorting');
+    const values = commit && !trashed
+      ? [...container.querySelectorAll(chipSelector)].map((c) => c.dataset.sortValue)
+      : null;
     // The click this gesture is about to produce must not also toggle
     // the chip (filter chips are buttons): swallow exactly one.
     const swallow = (e) => { e.stopPropagation(); e.preventDefault(); };
@@ -168,8 +169,8 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
       return;
     }
     event.preventDefault();
-    drag.chip.style.left = `${event.clientX - drag.grabDX}px`;
-    drag.chip.style.top = `${event.clientY - drag.grabDY}px`;
+    drag.chip.style.left = `${event.clientX - drag.grabDX - (drag.originDX || 0)}px`;
+    drag.chip.style.top = `${event.clientY - drag.grabDY - (drag.originDY || 0)}px`;
     if (trashEl) {
       const r = trashEl.getBoundingClientRect();
       drag.overTrash = event.clientX >= r.left && event.clientX <= r.right
@@ -203,7 +204,7 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
     if (innerBtn && innerBtn !== chip) return;
     const state = {
       chip, x: event.clientX, y: event.clientY,
-      active: false, timer: null, placeholder: null, overTrash: false, grabDX: 0, grabDY: 0, trashText: null,
+      active: false, timer: null, placeholder: null, overTrash: false, grabDX: 0, grabDY: 0, originDX: 0, originDY: 0, trashText: null,
     };
     state.timer = setTimeout(() => {
       state.active = true;
@@ -216,6 +217,12 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
       state.placeholder = ph;
       state.grabDX = state.x - rect.left;
       state.grabDY = state.y - rect.top;
+      // The chip is re-homed to <body> while dragging: left in place,
+      // its position:fixed would be resolved against any transformed
+      // or filtered ancestor instead of the viewport, and the chip
+      // would jump away from the finger (seen live: it flew to the
+      // top of the page). As a body child, fixed means the viewport.
+      document.body.appendChild(chip);
       chip.classList.add('dragging');
       chip.style.position = 'fixed';
       chip.style.left = `${rect.left}px`;
@@ -223,6 +230,16 @@ function makeChipsSortable(container, chipSelector, { onReorder, trashEl = null,
       chip.style.width = `${rect.width}px`;
       chip.style.zIndex = '1000';
       chip.style.pointerEvents = 'none';
+      // Self-calibrate: if the placed chip is not exactly where the
+      // finger grabbed it (any containing-block offset), remember the
+      // delta and compensate for it here and on every move.
+      const placed = chip.getBoundingClientRect();
+      state.originDX = placed.left - rect.left;
+      state.originDY = placed.top - rect.top;
+      if (state.originDX || state.originDY) {
+        chip.style.left = `${rect.left - state.originDX}px`;
+        chip.style.top = `${rect.top - state.originDY}px`;
+      }
       container.classList.add('chip-sorting');
       if (trashEl) {
         state.trashText = trashEl.textContent;

@@ -619,7 +619,8 @@ function renderClashProxy(node) {
   }
   if (node.type === 'vless') {
     lines.push(`    uuid: ${yamlQuote(node.uuid)}`);
-    if (node.flow) {
+    if (node.flow && node.tls) {
+      // Vision flow exists only over TLS/REALITY (see worker's copy).
       lines.push(`    flow: ${yamlQuote(node.flow)}`);
     }
   }
@@ -662,7 +663,9 @@ function renderClashProxy(node) {
 
   if (node.network === 'grpc') {
     lines.push('    grpc-opts:');
-    lines.push(`      grpc-service-name: ${yamlQuote(node.serviceName || '')}`);
+    // VMess links carry the service name in `path` (v2ray convention).
+    const svc = node.serviceName || String(node.path || '').replace(/^\//, '');
+    lines.push(`      grpc-service-name: ${yamlQuote(svc)}`);
   }
 
   if (node.network === 'http' || node.network === 'h2') {

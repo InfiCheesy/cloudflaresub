@@ -14,16 +14,19 @@ function json(data, status = 200) {
       // API JSON is same-origin only (the page calls its own /api) and
       // must never be cached: no wildcard CORS grant, no-store.
       'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
     },
   });
 }
 
-function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
+function text(body, status = 200, contentType = 'text/plain; charset=utf-8', extraHeaders = {}) {
   return new Response(body, {
     status,
     headers: {
       'content-type': contentType,
       'access-control-allow-origin': '*',
+      'x-content-type-options': 'nosniff',
+      ...extraHeaders,
     },
   });
 }
@@ -783,8 +786,20 @@ function pushClashTlsExtras(lines, node) {
 }
 
 function pushClashGrpcOpts(lines, node) {
-  if ((node.network || '') === 'grpc' && node.serviceName) {
-    lines.push('    grpc-opts:', `      grpc-service-name: "${escapeYaml(node.serviceName)}"`);
+  if ((node.network || '') !== 'grpc') return;
+  // VMess links carry the grpc service name in `path` (the v2ray
+  // convention); vless/trojan use an explicit serviceName field.
+  const svc = node.serviceName || String(node.path || '').replace(/^\//, '');
+  lines.push('    grpc-opts:', `      grpc-service-name: "${escapeYaml(svc)}"`);
+}
+
+function pushClashHttpOpts(lines, node) {
+  lines.push('    http-opts:');
+  lines.push(`      path: ["${escapeYaml(node.path || '/')}"]`);
+  const host = node.host || node.sni || '';
+  if (host) {
+    lines.push('      headers:');
+    lines.push(`        Host: ["${escapeYaml(host)}"]`);
   }
 }
 
@@ -832,6 +847,7 @@ function renderClash(nodes) {
           pushClashWsOpts(lines, node);
         }
         pushClashGrpcOpts(lines, node);
+        if (node.network === 'h2' || node.network === 'http') pushClashHttpOpts(lines, node);
         if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -853,7 +869,10 @@ function renderClash(nodes) {
           lines.push(`    servername: "${escapeYaml(node.sni)}"`);
         }
 
-        if (node.flow) {
+        if (node.flow && node.tls) {
+          // flow (XTLS Vision) only exists over TLS/REALITY: emitting
+          // it for a plaintext node produces a combination mihomo
+          // rejects, taking the whole profile down with it.
           lines.push(`    flow: "${escapeYaml(node.flow)}"`);
         }
 
@@ -867,6 +886,7 @@ function renderClash(nodes) {
           pushClashWsOpts(lines, node);
         }
         pushClashGrpcOpts(lines, node);
+        if (node.network === 'h2' || node.network === 'http') pushClashHttpOpts(lines, node);
         if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -898,6 +918,7 @@ function renderClash(nodes) {
           pushClashWsOpts(lines, node);
         }
         pushClashGrpcOpts(lines, node);
+        if (node.network === 'h2' || node.network === 'http') pushClashHttpOpts(lines, node);
         pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -965,7 +986,7 @@ function surgeField(value) {
   return String(value ?? '').replace(/[\r\n,]+/g, ' ').trim();
 }
 
-function renderSurge(nodes, baseUrl, linkToken) {
+function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
   // Dedupe twice: once on the raw names (shared with Clash), then on
   // the Surge-sanitized names — two different raw names can sanitize
   // to the same Surge name ('a,b' vs 'a b'), and Surge keys by the
@@ -986,12 +1007,27 @@ function renderSurge(nodes, baseUrl, linkToken) {
   const proxies = supported
     .map((node) => {
       if (node.type === 'vmess') {
-        return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
+        // The ws parameter block applies ONLY to ws transport: it
+        // used to be emitted unconditionally, rendering tcp and grpc
+        // nodes as ws nodes (with the grpc service name, which lives
+        // in path, stuffed into ws-path).
+        const wsPart = (node.network || 'ws') === 'ws'
+          ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}`
+          : '';
+        return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}${wsPart}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
       }
-      return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`;
+      return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}${(node.network || '') === 'ws' ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}` : ''}`;
     });
 
+  // The MANAGED-CONFIG first line is what makes Surge treat the
+  // profile as a remote subscription and re-pull it on the interval:
+  // without it (the old output started at [General]) the profile was
+  // a local file that never updated — fatal for dynamic entries,
+  // whose whole point is fresh endpoints.
+  const managedUrl = baseUrl + (linkToken ? '?token=' + linkToken : '');
   return [
+    '#!MANAGED-CONFIG ' + managedUrl + ' interval=' + intervalSec + ' strict=false',
+    '',
     '[General]',
     'skip-proxy = 127.0.0.1, localhost',
     '',
@@ -2112,11 +2148,15 @@ async function handleSub(request, env, url) {
     else target = 'raw';
   }
 
+  // Tell subscription clients how often to come back (hours):
+  // dynamic entries track sources that refresh about hourly, static
+  // ones change only when the owner regenerates them.
+  const subHeaders = { 'profile-update-interval': record.dynamic ? '1' : '24' };
   if (target === 'plain' || target === 'links' || target === 'text') {
-    return text(renderPlain(nodes), 200, 'text/plain; charset=utf-8');
+    return text(renderPlain(nodes), 200, 'text/plain; charset=utf-8', subHeaders);
   }
   if (target === 'clash') {
-    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
+    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8', subHeaders);
   }
   if (target === 'surge') {
     // Surge supports only VMess/Trojan: an entry without either used
@@ -2130,12 +2170,13 @@ async function handleSub(request, env, url) {
       );
     }
     return text(
-      renderSurge(nodes, url.origin + url.pathname, await linkTokenFor(id, env)),
+      renderSurge(nodes, url.origin + url.pathname, await linkTokenFor(id, env), record.dynamic ? 3600 : 86400),
       200,
       'text/plain; charset=utf-8',
+      subHeaders,
     );
   }
-  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
+  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8', subHeaders);
 }
 
 // ---- Diagnostics: keyed hashes, event ring, /api/diag ----------------------
@@ -2563,7 +2604,20 @@ async function dispatch(request, env) {
       // plain Worker without [assets] it is undefined, and calling
       // env.ASSETS.fetch() throws -> Cloudflare 1101.
       if (env.ASSETS && typeof env.ASSETS.fetch === 'function') {
-        return await env.ASSETS.fetch(request);
+        const assetResp = await env.ASSETS.fetch(request);
+        // The admin page holds the management token: it must not be
+        // framed by another site (clickjacking), sniffed into a
+        // different content type, or leak its URL as a referrer.
+        const headers = new Headers(assetResp.headers);
+        headers.set('x-frame-options', 'SAMEORIGIN');
+        headers.set('content-security-policy', "frame-ancestors 'self'");
+        headers.set('x-content-type-options', 'nosniff');
+        headers.set('referrer-policy', 'same-origin');
+        return new Response(assetResp.body, {
+          status: assetResp.status,
+          statusText: assetResp.statusText,
+          headers,
+        });
       }
       return text('Not found. Static assets are not available: deploy as a Cloudflare Pages project with build output directory "public" (see README).', 404);
 }

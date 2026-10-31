@@ -1292,3 +1292,65 @@ console.log('worker tests passed');
   assert.ok((bigIps.warnings || []).some((w) => w.includes('存档仅保留前 50000 字符')), 'truncation: preferredIps cap is warned');
   console.log('audit-11 suite: reality/grpc/insecure/alpn in clash, truncation warnings: passed');
 }
+
+// ===== Audit round 12: Surge managed-config + transport fidelity, update-interval and framing headers =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const nodes12 = [
+    { type: 'vmess', name: 'tcp节点', server: 'a.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', host: '', path: '/' },
+    { type: 'vmess', name: 'grpc节点', server: 'b.example.com', port: 443, uuid: U, cipher: 'auto', network: 'grpc', tls: true, sni: '', host: '', path: 'mysvc' },
+    { type: 'trojan', name: 'ws-trojan', server: 'c.example.com', port: 443, password: 'pw', tls: true, sni: '', host: 'h.example.com', path: '/tj', network: 'ws', params: { type: 'ws' } },
+    { type: 'vless', name: 'h2节点', server: 'd.example.com', port: 443, uuid: U, network: 'h2', tls: true, sni: '', host: '', path: '/h2p', params: { type: 'h2' } },
+  ];
+  await env.SUB_STORE.put('sub:FixR1201', JSON.stringify({
+    id: 'FixR1201', nodes: nodes12, storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  await env.SUB_STORE.put('sub:FixR1202', JSON.stringify({
+    id: 'FixR1202', nodes: nodes12.slice(0, 1), dynamic: { sourceUrl: 'https://src.example.com/list.txt', sources: [], limit: 10, literals: [], endpoints: [], snapshotAt: '2026-01-01T00:00:00.000Z' }, baseNodes: [],
+    storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr12 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('FixR1201', lr12.items.find((i) => i.id === 'FixR1201').linkToken);
+  linkTokens.set('FixR1202', lr12.items.find((i) => i.id === 'FixR1202').linkToken);
+
+  const surgeStatic = await getSub('FixR1201', 'surge');
+  const firstLine = surgeStatic.body.split('\n')[0];
+  assert.ok(firstLine.startsWith('#!MANAGED-CONFIG '), 'surge: first line is the managed-config directive');
+  assert.ok(firstLine.includes('interval=86400'), 'surge: static entries re-pull daily');
+  assert.ok(firstLine.includes(linkTokens.get('FixR1201')), 'surge: managed URL carries the link token');
+  const tcpLine = surgeStatic.body.split('\n').find((l) => l.startsWith('tcp节点'));
+  assert.ok(tcpLine && !tcpLine.includes('ws=true'), 'surge: tcp vmess is not dressed as ws');
+  const grpcLine = surgeStatic.body.split('\n').find((l) => l.startsWith('grpc节点'));
+  assert.ok(grpcLine && !grpcLine.includes('ws=true') && !grpcLine.includes('ws-path'), 'surge: grpc vmess gets no ws parameters');
+  const tjLine = surgeStatic.body.split('\n').find((l) => l.startsWith('ws-trojan'));
+  assert.ok(tjLine && tjLine.includes('ws=true') && tjLine.includes('ws-path=/tj'), 'surge: ws trojan carries its ws parameters');
+
+  const surgeDyn = await getSub('FixR1202', 'surge');
+  assert.ok(surgeDyn.body.split('\n')[0].includes('interval=3600'), 'surge: dynamic entries re-pull hourly');
+
+  const clashResp = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1201?target=clash&token=' + linkTokens.get('FixR1201')), env);
+  assert.equal(clashResp.headers.get('profile-update-interval'), '24', 'sub: static clash advertises a 24h update interval');
+  const clash12 = await clashResp.text();
+  assert.ok(clash12.includes('http-opts:'), 'clash: h2 node carries http-opts');
+  assert.ok(clash12.includes('grpc-service-name: "mysvc"'), 'clash: vmess grpc service name comes from path');
+  const clashDynResp = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1202?target=clash&token=' + linkTokens.get('FixR1202')), env);
+  assert.equal(clashDynResp.headers.get('profile-update-interval'), '1', 'sub: dynamic clash advertises a 1h update interval');
+
+  // flow is only emitted over TLS/REALITY (a plaintext vision combo
+  // makes mihomo reject the proxy).
+  const plainFlow = await generate({
+    nodeLinks: 'vless://' + U + '@pf.example.com:443?security=none&flow=xtls-rprx-vision&type=tcp#PF',
+    preferredIps: '1.2.3.4',
+  });
+  const pfClash = await getSub(plainFlow.shortId, 'clash');
+  assert.ok(!pfClash.body.includes('flow:'), 'clash: no flow on a plaintext vless node');
+
+  // The homepage (and every static asset) is not frameable by other
+  // sites, and API JSON carries nosniff.
+  const home = await worker.fetch(new Request('https://x.pages.dev/'), env);
+  assert.equal(home.headers.get('x-frame-options'), 'SAMEORIGIN', 'assets: x-frame-options set');
+  assert.ok((home.headers.get('content-security-policy') || '').includes("frame-ancestors 'self'"), 'assets: CSP frame-ancestors set');
+  const listResp = await worker.fetch(adminReq('/api/list'), env);
+  assert.equal(listResp.headers.get('x-content-type-options'), 'nosniff', 'api: nosniff set');
+  console.log('audit-12 suite: surge managed-config + transports, update intervals, framing headers: passed');
+}

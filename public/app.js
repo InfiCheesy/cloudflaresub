@@ -317,7 +317,10 @@ function addGenTag(raw) {
 }
 
 function setGenTags(tags, touched) {
-  genTags = Array.isArray(tags) ? [...tags] : [];
+  // External data (backfill) is normalized at this boundary: only
+  // strings may enter the picker — downstream code calls string
+  // methods on members without re-checking.
+  genTags = Array.isArray(tags) ? tags.filter((t) => typeof t === 'string') : [];
   genTagsTouched = !!touched;
   if (genTagInput) genTagInput.value = '';
   renderGenTags();
@@ -707,7 +710,9 @@ function allTagCounts() {
       seen.add(lower);
       const cur = byLower.get(lower);
       if (cur) cur.count += 1;
-      else byLower.set(lower, { tag: t, count: 1 });
+      // Display form is always a string, whatever the source sent —
+      // downstream comparators call .localeCompare on it.
+      else byLower.set(lower, { tag: String(t), count: 1 });
     }
   }
   return [...byLower.values()]
@@ -774,6 +779,20 @@ function saveTagOrder(tags) {
   });
 }
 
+// Drop working-order slots for tags no entry carries. Runs at
+// adoption (when the items are already in) and after each list
+// render (when they were not): the order load and the list load
+// race, and either may land first.
+function pruneTagOrderToVocab() {
+  if (!tagOrderLoaded || !adminState.items.length) return;
+  const alive = new Set(allTagCounts().map((v) => v.tag.toLowerCase()));
+  const pruned = tagOrder.filter((t) => alive.has(String(t).toLowerCase()));
+  if (pruned.length !== tagOrder.length) {
+    tagOrder = pruned;
+    refreshTagVocabViews();
+  }
+}
+
 // Runs alongside the admin list load: fetch the shared order, run
 // the one-time legacy import if the server has none yet, then
 // broadcast so every vocabulary view re-renders canonically.
@@ -822,6 +841,11 @@ function loadTagOrderFromServer() {
         // stale) read returned — keep it; the next load confirms.
       } else {
         tagOrder = serverOrder;
+        // Prune slots for tags no entry carries anymore (e.g. one
+        // deleted in the window before this load landed, whose
+        // prune-save was gated off); when the items have not landed
+        // yet, loadAdminList prunes right after rendering instead.
+        pruneTagOrderToVocab();
       }
       refreshTagVocabViews();
     } finally {
@@ -1060,6 +1084,7 @@ async function loadAdminList() {
     adminState.items = data.items || [];
     adminState.selected.clear();
     renderAdminList();
+    pruneTagOrderToVocab();
     updateAdminCount();
   } catch (e) {
     adminMsg.textContent = e.message || '加载失败';
@@ -1151,7 +1176,10 @@ function detailCard(prefix, key, icon, title, desc, url, wide = false) {
 }
 
 function buildDetail(item) {
-  const prefix = `d-${item.id}`;
+  // The prefix lands UNESCAPED in id attributes below; entry ids are
+  // minted alphanumeric, and stripping anything else keeps even a
+  // hand-crafted KV key from breaking out of those attributes.
+  const prefix = `d-${String(item.id).replace(/[^\w-]/g, '')}`;
   const linkToken = item.linkToken || '';
   const detail = document.createElement('div');
   detail.className = 'entry-detail';
@@ -1745,7 +1773,8 @@ function buildTagsPanel(item) {
     </div>
     <div class="tags-edit-suggest tag-suggestions"></div>
     <p class="hint">每条最多 10 个标签，单个最长 24 字；点下方已有标签可直接选用，长按标签可拖动排序。保存后会回读 KV 确认。</p>`;
-  panel._tags = [...(item.tags || [])];
+  // Same boundary rule as the picker: only strings enter the draft.
+  panel._tags = (Array.isArray(item.tags) ? item.tags : []).filter((t) => typeof t === 'string');
   renderTagsPanel(panel);
   makeChipsSortable(panel.querySelector('.tags-edit-chips'), '.tag-chip', {
     onReorder: (values) => {

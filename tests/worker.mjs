@@ -840,6 +840,24 @@ console.log('worker tests passed');
   const listAfter = await (await worker.fetch(adminReq('/api/list'), env)).json();
   assert.ok(!listAfter.items.some((i) => i.id === 'meta:tag-order'), 'the order record never appears as an entry');
 
+  // Read-path sanitization (audit P1): a record hand-edited in KV
+  // with junk tag members must not poison list/entry/vocabulary
+  // responses — one corrupt record used to take the whole admin
+  // list down through the client's sort comparator.
+  const victim = await generate({ nodeLinks: node, preferredIps: '104.16.7.77', tags: ['干净'] });
+  const vKey = `sub:${victim.shortId}`;
+  const vRec = JSON.parse(store.get(vKey).value);
+  vRec.tags = [123, null, { x: 1 }, '  带空格  ', '干净', '干净'];
+  store.set(vKey, { value: JSON.stringify(vRec) });
+  const poisonListRes = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  assert.deepEqual(poisonListRes.items.find((i) => i.id === victim.shortId).tags, ['带空格', '干净'], 'list sanitizes stored tags on read');
+  const poisonEntryRes = await (await worker.fetch(adminReq(`/api/entry?id=${victim.shortId}`), env)).json();
+  assert.deepEqual(poisonEntryRes.tags, ['带空格', '干净'], 'entry sanitizes stored tags on read');
+  assert.deepEqual(poisonEntryRes.backfill.tags, ['带空格', '干净'], 'backfill sanitizes stored tags on read');
+  const poisonVocabRes = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.ok(poisonVocabRes.tags.every((v) => typeof v.tag === 'string'), 'vocabulary never carries non-string tags');
+  assert.ok(!poisonVocabRes.tags.some((v) => v.tag === 'null' || v.tag === '123'), 'vocabulary drops junk members instead of coercing them');
+
   // Audit fixes (2026-10-31): F1 a missing/non-array tags field must be
   // a 400, never a silent wipe; F3 non-string members are dropped, not
   // String()-coerced into junk tags; F7 the per-tag length cap never

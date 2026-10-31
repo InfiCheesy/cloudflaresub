@@ -1362,7 +1362,7 @@ async function handleGenerate(request, env, url) {
       surge: withToken('surge'),
     },
     note: record.note || '',
-    tags: Array.isArray(record.tags) ? record.tags : [],
+    tags: sanitizeTags(record.tags),
     storage: record.storage || { mode: 'permanent' },
     links: nodes.map(encodeNodeLink).filter(Boolean),
     plainText: renderPlain(nodes),
@@ -1480,7 +1480,10 @@ async function handleList(request, env, url) {
         try {
           const rec = JSON.parse(raw);
           item.note = rec.note || '';
-          item.tags = Array.isArray(rec.tags) ? rec.tags : [];
+          // Sanitize on read: a record hand-edited in KV can carry
+          // non-string tag members, and raw passthrough lets one
+          // corrupt record break the whole admin UI downstream.
+          item.tags = sanitizeTags(rec.tags);
           item.createdAt = rec.createdAt || item.createdAt;
           const servers = [...new Set((rec.sources || []).map((x) => x.server).filter(Boolean))];
           if (servers.length) item.sources = servers;
@@ -1574,7 +1577,7 @@ function buildBackfill(record) {
     namePrefix: record.options?.namePrefix || '',
     keepOriginalHost: record.options?.keepOriginalHost !== false,
     note: record.note || '',
-    tags: Array.isArray(record.tags) ? [...record.tags] : [],
+    tags: sanitizeTags(record.tags),
     storage: record.storage || { mode: 'permanent' },
   };
   if (record.inputs && typeof record.inputs.nodeLinks === 'string' && record.inputs.nodeLinks) {
@@ -1624,7 +1627,7 @@ async function handleEntry(request, env, url) {
     ok: true,
     id,
     note: record.note || '',
-    tags: Array.isArray(record.tags) ? record.tags : [],
+    tags: sanitizeTags(record.tags),
     createdAt: record.createdAt || null,
     storage: record.storage || { mode: 'permanent' },
     linkToken: await linkTokenFor(id, env),
@@ -1765,7 +1768,10 @@ async function handleTagsList(request, env, url) {
       if (!Array.isArray(rec.tags)) continue;
       const seen = new Set();
       for (const tag of rec.tags) {
-        const lower = String(tag).toLowerCase();
+        // Skip non-string members outright (hand-edited records): a
+        // String() coercion would invent junk tags like 'null'.
+        if (typeof tag !== 'string') continue;
+        const lower = tag.toLowerCase();
         if (seen.has(lower)) continue;
         seen.add(lower);
         const cur = byLower.get(lower);

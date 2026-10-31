@@ -871,6 +871,21 @@ function setTagOrder(tags) {
   saveTagOrder(tags);
   refreshTagVocabViews();
 }
+
+// Another tab or device may have re-arranged the shared order while
+// this page sat in the background. Refresh it whenever the page
+// becomes visible or regains focus — a drag here always starts from
+// the current base instead of silently overwriting theirs. The load
+// is single-flight and its adoption is save-seq guarded, so this is
+// cheap and cannot undo a save this page just made.
+function refreshTagOrderOnReturn() {
+  if (!tagOrderLoaded) return; // the admin list was never loaded here
+  void loadTagOrderFromServer();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshTagOrderOnReturn();
+});
+window.addEventListener('focus', refreshTagOrderOnReturn);
 // One ordering for every tag vocabulary display: the filter bar is
 // the reference, and the suggestion areas (generate picker, entry
 // panel) follow it — the stored custom order wins, everything else

@@ -887,9 +887,23 @@ function updateAdminCount() {
   adminMsg.textContent = `共 ${total} 条，搜索到 ${visibleAdminItems().length} 条。`;
 }
 
-// Selection covers the currently visible entries only (scheme 1): the
-// header checkbox is tri-state over the visible set, and the bulk-delete
-// button counts selected-and-visible entries.
+// The header checkbox is tri-state over the visible set, and the
+// bulk-delete button counts selected-and-visible entries. Selection
+// itself is PRUNED — not cleared — whenever the filter changes
+// (owner's compromise, round 15): checks on entries that fall out
+// of the new result are forgotten, checks on entries still shown
+// survive. The invariant scheme 1 protected (selection is always a
+// subset of the visible set at render time, and delete only ever
+// touches visible rows) is unchanged; re-filtering just no longer
+// throws away the whole working set. A fresh list load is the one
+// exception: it starts from an empty selection.
+function pruneSelectionToVisible() {
+  const visibleIds = new Set(visibleAdminItems().map((i) => i.id));
+  for (const id of [...adminState.selected]) {
+    if (!visibleIds.has(id)) adminState.selected.delete(id);
+  }
+}
+
 function updateSelectionUI() {
   const visible = visibleAdminItems();
   const selectedVisible = visible.filter((i) => adminState.selected.has(i.id)).length;
@@ -1142,7 +1156,7 @@ function toggleTagFilter(tag) {
   const existing = [...adminState.tagSelected].find((t) => t.toLowerCase() === lower);
   if (existing) adminState.tagSelected.delete(existing);
   else adminState.tagSelected.add(tag);
-  adminState.selected.clear();
+  pruneSelectionToVisible();
   renderAdminList();
   updateAdminCount();
 }
@@ -1216,7 +1230,7 @@ if (adminBody) {
 if (tagFilterClear) {
   tagFilterClear.addEventListener('click', () => {
     adminState.tagSelected.clear();
-    adminState.selected.clear();
+    pruneSelectionToVisible();
     renderAdminList();
     updateAdminCount();
   });
@@ -1224,6 +1238,7 @@ if (tagFilterClear) {
 if (tagModeAndBtn) {
   tagModeAndBtn.addEventListener('click', () => {
     adminState.tagMode = 'and';
+    pruneSelectionToVisible();
     renderAdminList();
     updateAdminCount();
   });
@@ -1231,6 +1246,7 @@ if (tagModeAndBtn) {
 if (tagModeOrBtn) {
   tagModeOrBtn.addEventListener('click', () => {
     adminState.tagMode = 'or';
+    pruneSelectionToVisible();
     renderAdminList();
     updateAdminCount();
   });
@@ -1335,6 +1351,8 @@ async function loadAdminList() {
     for (const item of adminState.items) {
       item.tags = Array.isArray(item.tags) ? item.tags.filter((t) => typeof t === 'string') : [];
     }
+    // A fresh load is a new data snapshot: unlike filter changes
+    // (which only prune), it starts from an empty selection.
     adminState.selected.clear();
     renderAdminList();
     pruneTagOrderToVocab();
@@ -1349,7 +1367,8 @@ if (listBtn) listBtn.addEventListener('click', loadAdminList);
 if (sortSelect) {
   sortSelect.addEventListener('change', () => {
     adminState.sort = sortSelect.value;
-    adminState.selected.clear();
+    // Reordering changes nothing about WHICH entries are visible,
+    // so the selection carries over untouched.
     renderAdminList();
   });
 }
@@ -1358,13 +1377,13 @@ if (adminSearchInput) {
   // included): past a few hundred entries that janks visibly on a
   // phone. Leading+trailing throttle instead — the first keystroke
   // after a pause renders at once, a burst coalesces into a single
-  // trailing render. The selection clear is part of the render: it
-  // still happens on every settled filter change, just not per key.
+  // trailing render. The selection prune is part of the render: it
+  // applies on every settled filter change, just not per keystroke.
   let lastSearchRenderAt = 0;
   let searchRenderTimer = null;
   const renderSearchNow = () => {
     lastSearchRenderAt = Date.now();
-    adminState.selected.clear();
+    pruneSelectionToVisible();
     renderAdminList();
     updateAdminCount();
   };

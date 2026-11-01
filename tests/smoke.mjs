@@ -151,3 +151,26 @@ console.log('smoke test passed');
   assert.ok(!surgeCore.includes('core-grpc'), 'core surge: grpc node filtered out');
   console.log('audit-14 core suite: vmess tcp default, h2-opts, surge transport filter: passed');
 }
+
+// ===== Audit round 15 (core): surge aead follows alterId, comma gate, '=' names, store-selected =====
+{
+  const legacy = [{ type: 'vmess', name: 'core-legacy', server: '203.0.113.30', port: 443, uuid: '00000000-0000-4000-8000-000000000001', cipher: 'auto', alterId: 64, network: 'tcp', tls: false, hostHeader: '', path: '/', sni: '', alpn: '', fp: '' }];
+  const surgeLegacy = renderSurgeSubscription(legacy, 'https://x/sub');
+  assert.ok(surgeLegacy.includes('vmess-aead=false'), 'core surge: legacy vmess is marked non-AEAD');
+  const aead = [{ ...legacy[0], name: 'core-aead', alterId: 0 }];
+  assert.ok(renderSurgeSubscription(aead, 'https://x/sub').includes('vmess-aead=true'), 'core surge: AEAD vmess is marked aead');
+
+  const commaTj = [{ type: 'trojan', name: 'core-tj', server: '203.0.113.31', port: 443, password: 'p,a,ss', network: 'tcp', tls: true, hostHeader: '', path: '/', sni: '', alpn: '', fp: '' }];
+  assert.throws(() => renderSurgeSubscription(commaTj, 'https://x/sub'), /Surge/, 'core surge: comma-password trojan is refused');
+  const mixedCore = [...commaTj, { ...aead[0], name: 'core-ok' }];
+  const surgeMixed = renderSurgeSubscription(mixedCore, 'https://x/sub');
+  assert.ok(surgeMixed.includes('core-ok') && !surgeMixed.includes('core-tj'), 'core surge: comma trojan filtered, clean node kept');
+
+  const eqNodes = [{ ...aead[0], name: 'core=x' }];
+  const surgeEq = renderSurgeSubscription(eqNodes, 'https://x/sub');
+  assert.ok(!surgeEq.includes('core=x') && surgeEq.includes('core x'), 'core surge: = flattens out of names');
+
+  assert.ok(renderClashSubscription(aead).includes('profile:'), 'core clash: profile block present');
+  assert.ok(renderClashSubscription(aead).includes('store-selected: true'), 'core clash: store-selected set');
+  console.log('audit-15 core suite: aead follows aid, comma gate, = names, store-selected: passed');
+}

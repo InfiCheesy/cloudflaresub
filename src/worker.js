@@ -171,9 +171,29 @@ function assertSourceUrl(raw) {
   const bare = host.replace(/^\[|\]$/g, '');
   const isV4Literal = /^(\d{1,3}\.){3}\d{1,3}$/.test(bare);
   const isV6Literal = bare.includes(':');
+  const v4Private = (v4) => /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(v4);
+  // IPv4-mapped IPv6 literals survive canonicalization in IPv6 dress
+  // ('[::ffff:127.0.0.1]' comes out of the URL parser as
+  // '::ffff:7f00:1'), so the prefix checks alone wave them through:
+  // decode the embedded IPv4 (dotted or hex-pair tail) and put it
+  // through the same private-range test.
+  let mappedV4 = null;
+  if (bare.startsWith('::ffff:')) {
+    const tail = bare.slice('::ffff:'.length);
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(tail)) mappedV4 = tail;
+    else {
+      const m = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
+      if (m) {
+        const hi = parseInt(m[1], 16);
+        const lo = parseInt(m[2], 16);
+        mappedV4 = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+      }
+    }
+  }
   if (
-    (isV4Literal && /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(bare)) ||
-    (isV6Literal && (bare === '::1' || /^(fc|fd|fe80)/.test(bare)))
+    (isV4Literal && v4Private(bare)) ||
+    (mappedV4 && v4Private(mappedV4)) ||
+    (isV6Literal && (bare === '::1' || bare === '::' || /^(fc|fd|fe80)/.test(bare)))
   ) {
     throw new Error('来源地址不允许指向内网 IP');
   }
@@ -560,6 +580,11 @@ async function handleVersion(request, env) {
   });
 }
 
+function vmessAlterId(raw) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, 65535) : 0;
+}
+
 function parseVmess(link) {
   const raw = link.slice('vmess://'.length).trim();
   const obj = JSON.parse(b64DecodeUtf8(raw));
@@ -569,6 +594,9 @@ function parseVmess(link) {
     server: stripBrackets(obj.add),
     port: Number(obj.port || 443),
     uuid: obj.id,
+    // The link's alterId used to be dropped on the floor, silently
+    // rewriting legacy (non-AEAD) nodes as AEAD ones in every output.
+    alterId: vmessAlterId(obj.aid),
     cipher: obj.scy || 'auto',
     // A missing `net` means plain TCP in the VMess share format (the
     // URL-style parser below defaults to 'tcp' too): defaulting to
@@ -721,7 +749,7 @@ function encodeVmess(node) {
     add: node.server,
     port: String(node.port),
     id: node.uuid,
-    aid: '0',
+    aid: String(node.alterId ?? 0),
     scy: node.cipher || 'auto',
     net: node.network || 'tcp',
     type: 'none',
@@ -866,7 +894,7 @@ function renderClash(nodes) {
           `    server: "${escapeYaml(node.server)}"`,
           `    port: ${Number(node.port) || 0}`,
           `    uuid: "${escapeYaml(node.uuid)}"`,
-          `    alterId: 0`,
+          `    alterId: ${Number(node.alterId) || 0}`,
           `    cipher: "${escapeYaml(node.cipher || 'auto')}"`,
           `    udp: true`,
           `    tls: ${node.tls ? 'true' : 'false'}`,
@@ -983,6 +1011,8 @@ function renderClash(nodes) {
     `mode: rule`,
     `log-level: info`,
     `ipv6: true`,
+    `profile:`,
+    `  store-selected: true`,
     ``,
     `proxies:`,
     ...(proxies.length ? proxies : []),
@@ -1012,7 +1042,9 @@ function surgeName(name) {
   // otherwise inject config lines or phantom group members). Applied to
   // stored nodes too, so entries created before name sanitizing existed
   // are still safe to export.
-  return String(name || '').replace(/[\r\n,]+/g, ' ').trim();
+  // '=' is Surge's name/value separator: a name carrying one is cut
+  // in half by the parser, so it flattens with the commas.
+  return String(name || '').replace(/[\r\n,=]+/g, ' ').trim();
 }
 
 function surgeField(value) {
@@ -1033,7 +1065,18 @@ function surgeField(value) {
 function surgeExpressible(node) {
   if (node.type !== 'vmess' && node.type !== 'trojan') return false;
   const net = String(node.network || 'tcp').toLowerCase();
-  return net === 'tcp' || net === 'ws';
+  if (net !== 'tcp' && net !== 'ws') return false;
+  // Surge fields are comma-separated with no escaping: a credential
+  // carrying a comma cannot be written verbatim, and the field
+  // flattener would silently rewrite it instead (a trojan password
+  // 'p,a,ss' came out as 'p a ss' — a node that can never
+  // authenticate). Such nodes are inexpressible too, not corrupted.
+  // (Line breaks in a credential are a different case: never a real
+  // password character, always injection debris, and the flattener
+  // already neutralizes them — that long-standing behaviour stays.)
+  const credential = node.type === 'trojan' ? node.password : node.uuid;
+  if (String(credential ?? '').includes(',')) return false;
+  return true;
 }
 
 function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
@@ -1064,7 +1107,7 @@ function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
         const wsPart = (node.network || 'tcp') === 'ws'
           ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}`
           : '';
-        return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}${wsPart}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
+        return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}, vmess-aead=${node.alterId ? 'false' : 'true'}${wsPart}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
       }
       return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}${(node.network || '') === 'ws' ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}` : ''}`;
     });
@@ -2267,6 +2310,22 @@ async function handleSub(request, env, url) {
   // dynamic entries track sources that refresh about hourly, static
   // ones change only when the owner regenerates them.
   const subHeaders = { 'profile-update-interval': record.dynamic ? '1' : '24' };
+  // Give the imported profile a human-recognizable name — the
+  // entry's note when it has one: without a Content-Disposition,
+  // clients name the profile after the raw subscription URL and a
+  // list of entries becomes indistinguishable. filename* carries
+  // the full UTF-8 name; the plain filename is an ASCII-only
+  // fallback, and both are built so even a hand-edited note cannot
+  // inject response headers.
+  const profileName = (typeof record.note === 'string' && record.note.trim()) || `sub-${id}`;
+  const profileExt = target === 'clash' ? 'yaml' : 'txt';
+  const asciiFallback = profileName
+    .replace(/[^\x21-\x7e]/g, '-')
+    .replace(/["\\]/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 60) || `sub-${id}`;
+  subHeaders['content-disposition'] =
+    `attachment; filename="${asciiFallback}.${profileExt}"; filename*=UTF-8''${encodeURIComponent(`${profileName}.${profileExt}`)}`;
   if (target === 'plain' || target === 'links' || target === 'text') {
     return text(renderPlain(nodes), 200, 'text/plain; charset=utf-8', subHeaders);
   }
@@ -2285,11 +2344,13 @@ async function handleSub(request, env, url) {
       );
     }
     if (!nodes.some(surgeExpressible)) {
-      // The types are right but every one rides a transport Surge
-      // cannot express (h2 / gRPC / HTTP): rendering them anyway
-      // would produce silently dead plain-TCP lines.
+      // The types are right but none can be written into a Surge
+      // config: either the transport is one Surge cannot express
+      // (h2 / gRPC / HTTP) or the credential carries a comma, which
+      // Surge's comma-separated fields cannot hold. Rendering them
+      // anyway would produce silently dead or corrupted lines.
       return text(
-        '该条目没有 Surge 可用的节点：Surge 不支持 h2 / gRPC / HTTP 传输，当前条目的 VMess / Trojan 节点均为这类传输。',
+        '该条目没有 Surge 可用的节点：当前条目的 VMess / Trojan 节点或因传输方式（h2 / gRPC / HTTP），或因密码等凭据含有 Surge 无法表达的逗号，均无法写入 Surge 配置。',
         400,
         'text/plain; charset=utf-8',
       );
@@ -2626,7 +2687,15 @@ async function recordApiEvent(env, ctx, request, url, status, ms, errName) {
   const isSub = p.startsWith('/sub/');
   if (!isApi && !isSub) return;
   if (isSub && status === 200) return;
-  if (status === 403) return;
+  // /sub 403s stay unrecorded: a wrong per-entry link token carries
+  // no signal worth a KV write (the tokens are 128-bit HMACs). /api
+  // 403s are different — the admin token is human-chosen, and an
+  // online guessing run used to leave no trace anywhere: no throttle,
+  // no log. They now flow into the same per-signature failure
+  // throttle as every other failure below, so a burst costs at most
+  // one ring write per route template per 10 minutes, while the
+  // first sighting still lands immediately.
+  if (status === 403 && !isApi) return;
   // Only known route templates are recorded. An unknown /api path is
   // caller-controlled text: recording it verbatim would let anyone
   // write arbitrary strings into the (shareable) diagnostics log.

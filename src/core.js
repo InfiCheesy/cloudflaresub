@@ -279,6 +279,8 @@ export function renderClashSubscription(nodes) {
     'mode: rule',
     'log-level: info',
     'ipv6: false',
+    'profile:',
+    '  store-selected: true',
     'proxies:',
   ];
 
@@ -308,7 +310,12 @@ export function renderClashSubscription(nodes) {
 function isSurgeExpressibleNode(node) {
   if (node.type !== 'vmess' && node.type !== 'trojan') return false;
   const net = String(node.network || 'tcp').toLowerCase();
-  return net === 'tcp' || net === 'ws';
+  if (net !== 'tcp' && net !== 'ws') return false;
+  // Credentials carrying a comma, which Surge fields cannot hold
+  // verbatim (see the worker's copy for the full reasoning).
+  const credential = node.type === 'trojan' ? node.password : node.uuid;
+  if (String(credential ?? '').includes(',')) return false;
+  return true;
 }
 
 export function renderSurgeSubscription(nodes, requestUrl) {
@@ -706,7 +713,7 @@ function renderSurgeProxy(node) {
   if (node.type === 'vmess') {
     const params = [
       `username=${node.uuid}`,
-      `vmess-aead=true`,
+      `vmess-aead=${node.alterId ? 'false' : 'true'}`,
       `tls=${node.tls ? 'true' : 'false'}`,
       `skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`,
     ];
@@ -853,7 +860,7 @@ function sanitizeSurgeName(name) {
   // collapse to a space, since Surge's field/group syntax is comma-
   // separated. (This copy previously rewrote them to fullwidth
   // punctuation instead — one of the drifts the battery now guards.)
-  return String(name || '').replace(/[\r\n,]+/g, ' ').trim();
+  return String(name || '').replace(/[\r\n,=]+/g, ' ').trim();
 }
 
 function escapeSurgeHeader(value) {

@@ -924,7 +924,13 @@ console.log('worker tests passed');
   const surgeLines = surge.body.split('\n');
   assert.equal(surgeLines.filter((l) => l === '[Proxy]').length, 1, 'exactly one [Proxy] section');
   assert.ok(!surgeLines.some((l) => l.startsWith('Fake')), 'no forged Surge proxy line');
-  assert.equal(surgeLines.filter((l) => l.includes(' = vmess, ') || l.includes(' = trojan, ')).length, 2, 'both proxies stay on single lines');
+  // Round 15 supersedes the second half of this expectation: the
+  // trojan's password is comma-carrying injection debris, and such
+  // credentials are now excluded from Surge output entirely rather
+  // than flattened into a corrupted line — the vmess stays, alone
+  // and on a single line.
+  assert.equal(surgeLines.filter((l) => l.includes(' = vmess, ') || l.includes(' = trojan, ')).length, 1, 'only the vmess proxy remains in Surge');
+  assert.ok(surgeLines.some((l) => l.includes(' = vmess, ')), 'the vmess proxy stays on a single line');
 
   // Output ceiling: nodes x endpoints is refused past 10000 with the
   // real numbers, and exactly 10000 still succeeds.
@@ -1065,6 +1071,17 @@ console.log('worker tests passed');
     body: JSON.stringify({ token: 'tok', id: seeded.shortId, tags: ['秘密标签'] }),
   }), env);
 
+  // Round 15: an /api 403 (wrong admin token) is recorded through
+  // the failure throttle — a first sighting lands immediately — while
+  // a /sub 403 (wrong link token) never is. POST /api/tag-order has
+  // had no 403 yet in this run, so its first sighting is fresh; the
+  // bogus-token /sub fetch must leave no trace.
+  await worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'nope', order: [] }),
+  }), env);
+  await worker.fetch(new Request('https://x.pages.dev/sub/' + seeded.shortId + '?token=<redacted>', {}), env);
+
   const okResp = await diagPost();
   assert.equal(okResp.status, 200);
   const okJson = await okResp.json();
@@ -1083,7 +1100,14 @@ console.log('worker tests passed');
     okJson.diag.events.some((e) => e.kind === 'api' && String(e.route).includes('/api/tags')),
     'ring recorded the tags save',
   );
-  assert.ok(!okJson.diag.events.some((e) => e.status === 403), 'auth failures are never recorded');
+  assert.ok(
+    okJson.diag.events.some((e) => e.status === 403 && String(e.route).includes('/api/tag-order')),
+    'api auth failures are recorded (round 15: throttled, first sighting immediate)',
+  );
+  assert.ok(
+    !okJson.diag.events.some((e) => e.status === 403 && String(e.route).includes('/sub')),
+    'sub link-token failures are never recorded',
+  );
 
   // A dead dynamic source leaves a hashed-host ring event, never the URL.
   await generate({ nodeLinks: node, preferredIps: '203.0.113.8\nhttps://dead-source.invalid/x', namePrefix: 'diagsrc' });
@@ -1480,7 +1504,7 @@ console.log('worker tests passed');
   const gGrpc = await generate({ nodeLinks: vmessJson({ ps: 'grpcvm', net: 'grpc', tls: 'tls', path: 'mysvc' }), preferredIps: '198.51.100.9' });
   const grpcSurge = await getSub(gGrpc.shortId, 'surge');
   assert.equal(grpcSurge.status, 400, 'surge: grpc-only entry is refused');
-  assert.ok(grpcSurge.body.includes('Surge 不支持'), 'surge: refusal names the transport problem');
+  assert.ok(grpcSurge.body.includes('没有 Surge 可用的节点'), 'surge: refusal names the usability problem');
   const gMix = await generate({ nodeLinks: [vmessJson({ ps: 'grpcvm', net: 'grpc', tls: 'tls', path: 'mysvc' }), vmessJson({ ps: 'wsvm', net: 'ws', tls: 'tls', host: 'w.example.com', path: '/w' })].join('\n'), preferredIps: '198.51.100.10' });
   const mixSurge = await getSub(gMix.shortId, 'surge');
   assert.equal(mixSurge.status, 200, 'surge: mixed entry still serves');
@@ -1534,4 +1558,80 @@ console.log('worker tests passed');
   assert.ok(listPar.count >= 5, 'list: parallel build returns every entry');
   assert.ok(maxInFlight > 1, 'list: record reads overlap (chunked parallel), max in flight = ' + maxInFlight);
   console.log('audit-14 suite: vmess tcp default, h2-opts, surge transport gate, app-level expiry, tags metadata + parallel list: passed');
+}
+
+// ===== Audit round 15: mapped-IPv6 source block, vmess aid + surge aead, comma-credential surge gate, '=' names, profile title, clash store-selected =====
+// (Fix 1 — throttled /api 403 recording with /sub silence — is asserted
+// inside the diagnostics suite above, where the ring is read.)
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const vmessJson = (extra) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', scy: 'auto', type: 'none', tls: '', ...extra })).toString('base64');
+  const genRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+  }), env).then((r) => r.json());
+
+  // 2) An IPv4-mapped IPv6 source literal is refused as internal
+  // before any fetch happens.
+  const fetched15 = [];
+  const realFetch15 = globalThis.fetch;
+  globalThis.fetch = async (u) => { fetched15.push(String(u)); return new Response('203.0.113.99\n', { status: 200 }); };
+  try {
+    const gMapped = await genRaw({ nodeLinks: vmessJson({ ps: 'mapvm', net: 'tcp' }), preferredIps: 'https://[::ffff:7f00:1]/list.txt' });
+    assert.equal(gMapped.ok, false, 'source: mapped-IPv6 loopback is refused');
+    assert.ok(String(gMapped.error).includes('内网'), 'source: refusal names the internal-address reason');
+    assert.ok(!fetched15.some((u) => u.includes('::ffff')), 'source: the mapped URL is never fetched');
+    const gUnspec = await genRaw({ nodeLinks: vmessJson({ ps: 'unspec', net: 'tcp' }), preferredIps: 'https://[::]/list.txt' });
+    assert.equal(gUnspec.ok, false, 'source: the unspecified address is refused too');
+  } finally { globalThis.fetch = realFetch15; }
+
+  // 3+4) The link's alterId survives end to end, and the Surge AEAD
+  // marker follows it; an AEAD node (aid 0) is marked aead=true —
+  // the flag the worker's Surge renderer used to omit entirely.
+  const gAid = await generate({ nodeLinks: vmessJson({ ps: 'legacyvm', aid: '64' }), preferredIps: '198.51.100.21' });
+  assert.equal(JSON.parse(Buffer.from(gAid.plainText.split('vmess://')[1], 'base64').toString('utf8')).aid, '64', 'vmess: aid round-trips into the plain output');
+  const aidClash = await getSub(gAid.shortId, 'clash');
+  assert.ok(aidClash.body.includes('alterId: 64'), 'clash: alterId is the link value, not a hardcoded 0');
+  const aidSurge = await getSub(gAid.shortId, 'surge');
+  assert.ok(aidSurge.body.includes('vmess-aead=false'), 'surge: a legacy vmess is marked non-AEAD');
+  const gAead = await generate({ nodeLinks: vmessJson({ ps: 'aeadvm', net: 'ws', tls: 'tls', host: 'h.example.com', path: '/w' }), preferredIps: '198.51.100.22' });
+  const aeadSurge = await getSub(gAead.shortId, 'surge');
+  assert.ok(aeadSurge.body.includes('vmess-aead=true'), 'surge: an AEAD vmess carries vmess-aead=true');
+
+  // 5) A comma in a trojan password makes the node Surge-inexpressible
+  // (excluded / entry refused), while Clash keeps serving it verbatim.
+  const tjComma = 'trojan://p%2Ca%2Css@tj.example.com:443?security=tls&sni=tj.example.com&type=tcp#tjcomma';
+  const gTjOnly = await generate({ nodeLinks: tjComma, preferredIps: '198.51.100.23' });
+  const tjOnlySurge = await getSub(gTjOnly.shortId, 'surge');
+  assert.equal(tjOnlySurge.status, 400, 'surge: a comma-password-only entry is refused');
+  assert.ok(tjOnlySurge.body.includes('逗号'), 'surge: the refusal names the comma problem');
+  const tjClash = await getSub(gTjOnly.shortId, 'clash');
+  assert.equal(tjClash.status, 200, 'clash: the comma-password entry still serves');
+  const gTjMix = await generate({ nodeLinks: [tjComma, vmessJson({ ps: 'okvm', net: 'tcp' })].join('\n'), preferredIps: '198.51.100.24' });
+  const tjMixSurge = await getSub(gTjMix.shortId, 'surge');
+  assert.equal(tjMixSurge.status, 200, 'surge: a mixed entry still serves');
+  assert.ok(tjMixSurge.body.includes('okvm'), 'surge: the clean node survives');
+  assert.ok(!tjMixSurge.body.includes('tjcomma'), 'surge: the comma-password trojan is excluded, not corrupted');
+
+  // 6) '=' flattens out of Surge node names (proxy and group lines agree).
+  const gEq = await generate({ nodeLinks: vmessJson({ ps: 'x=y节点', net: 'tcp' }), preferredIps: '198.51.100.25' });
+  const eqSurge = await getSub(gEq.shortId, 'surge');
+  assert.ok(!eqSurge.body.includes('x=y节点'), 'surge: = is flattened out of node names');
+  assert.ok(eqSurge.body.includes('x y节点'), 'surge: the flattened name is used consistently');
+
+  // 7) /sub carries a profile title: the entry note when present,
+  // the entry id otherwise.
+  const gNote = await generate({ nodeLinks: vmessJson({ ps: 'notevm', net: 'tcp' }), preferredIps: '198.51.100.26', note: '东京 VPS' });
+  const noteResp = await worker.fetch(new Request('https://x.pages.dev/sub/' + gNote.shortId + '?target=plain&token=' + linkTokens.get(gNote.shortId)), env);
+  const cd = noteResp.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment;'), 'sub: content-disposition is present');
+  assert.ok(cd.includes("filename*=UTF-8''" + encodeURIComponent('东京 VPS.txt')), 'sub: the profile title carries the entry note');
+  const gNoNote = await generate({ nodeLinks: vmessJson({ ps: 'nonote', net: 'tcp' }), preferredIps: '198.51.100.27' });
+  const noNoteResp = await worker.fetch(new Request('https://x.pages.dev/sub/' + gNoNote.shortId + '?target=plain&token=' + linkTokens.get(gNoNote.shortId)), env);
+  assert.ok((noNoteResp.headers.get('content-disposition') || '').includes('sub-' + gNoNote.shortId), 'sub: the title falls back to the entry id');
+
+  // 8) Clash output asks mihomo to remember the selected node.
+  const anyClash = await getSub(gAead.shortId, 'clash');
+  assert.ok(anyClash.body.includes('profile:\n  store-selected: true'), 'clash: profile.store-selected is set');
+
+  console.log('audit-15 suite: mapped-IPv6 source block, aid + aead, comma gate, = names, profile title, store-selected: passed');
 }

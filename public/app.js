@@ -343,6 +343,7 @@ const genTagSuggestions = byId('genTagSuggestions');
 let genTags = [];
 let genTagsTouched = false;
 let genTagVocab = null; // [{tag, count}] from GET /api/tags, lazy
+let genVocabOverlay = new Map(); // lower -> { tag, min, exp }: see noteVocabFloors
 
 function renderGenTagSuggestions() {
   if (!genTagSuggestions) return;
@@ -386,6 +387,38 @@ function setGenTags(tags, touched) {
   renderGenTags();
 }
 
+// /api/tags aggregates from KV key metadata, and list metadata is
+// eventually consistent: a tag saved a second ago can briefly be
+// missing from the vocabulary, or counted low. The client knows
+// what it just saved (the save was verified against the record
+// itself), so it keeps a short-lived floor for those tags and
+// merges it over whatever the server returns, instead of letting
+// the picker's suggestions flicker backwards after a save.
+function noteVocabFloors(tags, prevTags) {
+  const now = Date.now();
+  for (const [k, v] of genVocabOverlay) if (v.exp <= now) genVocabOverlay.delete(k);
+  const prev = new Set((prevTags || []).map((t) => String(t).toLowerCase()));
+  for (const tag of tags || []) {
+    const lower = String(tag).toLowerCase();
+    const known = (genTagVocab || []).find((v) => String(v.tag).toLowerCase() === lower);
+    let min = known ? known.count : 0;
+    if (!prev.has(lower)) min += 1; // this entry newly carries the tag
+    if (min > 0) genVocabOverlay.set(lower, { tag, min, exp: now + 120000 });
+  }
+}
+
+function mergeVocabOverlay(tags) {
+  const now = Date.now();
+  const out = new Map((tags || []).map((v) => [String(v.tag).toLowerCase(), { tag: v.tag, count: v.count }]));
+  for (const [lower, o] of genVocabOverlay) {
+    if (o.exp <= now) { genVocabOverlay.delete(lower); continue; }
+    const cur = out.get(lower);
+    if (!cur) out.set(lower, { tag: o.tag, count: o.min });
+    else if (cur.count < o.min) cur.count = o.min;
+  }
+  return [...out.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag, 'zh-Hans-CN'));
+}
+
 async function loadGenTagVocab() {
   // The vocabulary DATA stays cached, but focusing the picker always
   // re-renders the suggestions so their ORDER reflects the current
@@ -403,7 +436,7 @@ async function loadGenTagVocab() {
     const resp = await fetch('/api/tags', { headers: { 'x-admin-token': token } });
     const data = await resp.json();
     if (resp.ok && data.ok) {
-      genTagVocab = data.tags || [];
+      genTagVocab = mergeVocabOverlay(data.tags || []);
       renderGenTagSuggestions();
     }
   } catch {}
@@ -1142,6 +1175,7 @@ async function deleteTagEverywhere(tag) {
   for (const t of [...adminState.tagSelected]) {
     if (t.toLowerCase() === lower) adminState.tagSelected.delete(t);
   }
+  if (!failed.length) genVocabOverlay.delete(lower);
   // Prune the shared order by what ACTUALLY remains after the saves:
   // a tag whose save failed still exists on its entry and keeps its
   // slot; only tags gone from every entry lose theirs.
@@ -1320,11 +1354,33 @@ if (sortSelect) {
   });
 }
 if (adminSearchInput) {
-  adminSearchInput.addEventListener('input', () => {
-    adminState.query = adminSearchInput.value;
+  // Every keystroke used to rebuild the whole list DOM (filter bar
+  // included): past a few hundred entries that janks visibly on a
+  // phone. Leading+trailing throttle instead — the first keystroke
+  // after a pause renders at once, a burst coalesces into a single
+  // trailing render. The selection clear is part of the render: it
+  // still happens on every settled filter change, just not per key.
+  let lastSearchRenderAt = 0;
+  let searchRenderTimer = null;
+  const renderSearchNow = () => {
+    lastSearchRenderAt = Date.now();
     adminState.selected.clear();
     renderAdminList();
     updateAdminCount();
+  };
+  adminSearchInput.addEventListener('input', () => {
+    adminState.query = adminSearchInput.value;
+    const elapsed = Date.now() - lastSearchRenderAt;
+    if (elapsed >= 60) {
+      if (searchRenderTimer) { clearTimeout(searchRenderTimer); searchRenderTimer = null; }
+      renderSearchNow();
+      return;
+    }
+    if (searchRenderTimer) clearTimeout(searchRenderTimer);
+    searchRenderTimer = setTimeout(() => {
+      searchRenderTimer = null;
+      renderSearchNow();
+    }, 60 - elapsed);
   });
 }
 if (selectAllCheckbox) {
@@ -2167,7 +2223,9 @@ document.addEventListener('click', async (event) => {
   saveBtn.dataset.saveState = ok ? 'ok' : 'fail';
   if (ok) {
     const item = adminItems.get(id);
+    const prevTags = item ? [...(item.tags || [])] : [];
     if (item) item.tags = stored;
+    noteVocabFloors(stored, prevTags);
     genTagVocab = null; // the generate picker must offer the new tags too
     adminMsg.textContent = `条目 ${id} 的标签已保存并在 KV 中确认。`;
   } else if (!adminMsg.textContent || adminMsg.textContent.startsWith('共 ')) {

@@ -5,7 +5,14 @@ const store = new Map(); // name -> { value, metadata, expirationTtl }
 const env = {
   SUB_STORE: {
     async get(k) { return store.get(k)?.value ?? null; },
-    async put(k, v, opts = {}) { store.set(k, { value: v, metadata: opts.metadata, expirationTtl: opts.expirationTtl }); },
+    async put(k, v, opts = {}) {
+      // Emulate the platform's 1024-BYTE KV metadata limit (round 16):
+      // without it the mock accepts metadata the real put would reject.
+      if (opts.metadata !== undefined && new TextEncoder().encode(JSON.stringify(opts.metadata)).length > 1024) {
+        throw new Error('metadata is too large');
+      }
+      store.set(k, { value: v, metadata: opts.metadata, expirationTtl: opts.expirationTtl });
+    },
     async delete(k) { store.delete(k); },
     async list({ prefix = '', limit = 1000 } = {}) {
       const keys = [...store.entries()]
@@ -555,6 +562,14 @@ console.log('worker tests passed');
       c.fetchedAt = Date.now() - 2 * 3600e3;
       c.lastAttempt = 0;
       store.set(cacheKey, { value: JSON.stringify(c) });
+      // Round 16: /sub also keeps a short-lived merged entry cache;
+      // aging simulated time must age both layers together.
+      const ecKey = 'entrycache:' + dyn.shortId;
+      if (store.has(ecKey)) {
+        const ec = JSON.parse(store.get(ecKey).value);
+        ec.at = Date.now() - 2 * 3600e3;
+        store.set(ecKey, { value: JSON.stringify(ec) });
+      }
     };
     ageCache();
     const dynSub2 = await getSub(dyn.shortId, 'plain');
@@ -569,7 +584,9 @@ console.log('worker tests passed');
     assert.ok(dynSub3.body.includes('@104.16.9.9:443'), 'stale cache serves while source is down');
 
     // Source down + cache gone: the generation-time snapshot serves.
+    // (Round 16: "cache gone" covers the merged entry cache too.)
     store.delete(cacheKey);
+    store.delete('entrycache:' + dyn.shortId);
     const dynSub4 = await getSub(dyn.shortId, 'plain');
     assert.equal(dynSub4.status, 200);
     assert.ok(dynSub4.body.includes('@104.16.1.2:443'), 'entry snapshot is the final fallback');
@@ -696,6 +713,13 @@ console.log('worker tests passed');
       c.lastAttempt = 0;
       store.set(k, { value: JSON.stringify(c) });
     }
+    // Round 16: age the merged entry cache alongside the source caches.
+    const mixEcKey = 'entrycache:' + mix.shortId;
+    if (store.has(mixEcKey)) {
+      const ec = JSON.parse(store.get(mixEcKey).value);
+      ec.at = Date.now() - 2 * 3600e3;
+      store.set(mixEcKey, { value: JSON.stringify(ec) });
+    }
     const sub2 = await getSub(mix.shortId, 'plain');
     assert.ok(sub2.body.includes('@104.16.2.9:443'), 'rotated source followed');
     assert.ok(sub2.body.includes('@104.16.9.1:443'), 'literal line stays fixed');
@@ -736,10 +760,14 @@ console.log('worker tests passed');
 
     // Audit fix F3: a static paste shaped like a dynamic identity
     // must not merge with the real dynamic entry.
-    const crafted = await generate({ nodeLinks: node, preferredIps: 'api:https://a.example.com/l.txt|10' });
-    assert.equal(crafted.dynamic, null, 'crafted identity-shaped paste stays static');
+    // Round 16 annotation: the crafted paste's only line is not a
+    // plausible host at all, so literal-endpoint validation now
+    // refuses the generate outright — the anti-collision property
+    // holds by refusal (the static: identity marker still guards
+    // identity-shaped lines that DO parse as endpoints).
+    const crafted = await genRaw({ nodeLinks: node, preferredIps: 'api:https://a.example.com/l.txt|10' });
+    assert.equal(crafted.status, 400, 'crafted identity-shaped paste refused');
     const realDyn = await generate({ nodeLinks: node, preferredIps: 'https://a.example.com/l.txt' });
-    assert.notEqual(crafted.shortId, realDyn.shortId, 'crafted paste and lone-source entry are separate');
     assert.ok(JSON.parse(store.get(`sub:${realDyn.shortId}`).value).dynamic, 'the real entry is dynamic');
 
     // Audit fix F1: refreshing while a source is down (cache evicted)
@@ -1634,4 +1662,149 @@ console.log('worker tests passed');
   assert.ok(anyClash.body.includes('profile:\n  store-selected: true'), 'clash: profile.store-selected is set');
 
   console.log('audit-15 suite: mapped-IPv6 source block, aid + aead, comma gate, = names, profile title, store-selected: passed');
+}
+
+// --- Audit round 16 suite: KV metadata byte budget, parked-page
+// sources, literal endpoint validation, peer SNI, uppercase schemes,
+// dedup heal TTL + honest deduplicated flag, remainingTtl anchoring,
+// dynamic entry merged cache ---
+{
+  const b64 = (o) => Buffer.from(JSON.stringify(o), 'utf8').toString('base64');
+  const vm = (ps) => 'vmess://' + b64({ v: '2', ps, add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', type: 'none', tls: '' });
+  const genRaw = async (body) => {
+    const r = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+    }), env);
+    return { status: r.status, json: await r.json() };
+  };
+  const plainServers = (j) => (j.plainText || '').split('\n').filter(Boolean).map((l) => {
+    try { return JSON.parse(Buffer.from(l.split('vmess://')[1], 'base64').toString('utf8')).add; } catch { return '?'; }
+  });
+
+  // 1) Metadata byte budget: a legal-max CJK note + ten legal-max CJK
+  // tags serialize past the platform's 1024-BYTE metadata limit. The
+  // mock KV now enforces that limit, so generation must still succeed
+  // (the metadata copies degrade; the record body stays authoritative).
+  const bigNote = '搬瓦工洛杉矶机房主力节点专用线路记录'.repeat(4).slice(0, 80);
+  const bigTags = Array.from({ length: 10 }, (_, i) => ('香港节点加速专线优选回国优化' + i).padEnd(24, '线').slice(0, 24));
+  const gMeta = await generate({ nodeLinks: vm('meta16'), preferredIps: '198.51.100.40', note: bigNote, tags: bigTags });
+  const metaEntry = store.get('sub:' + gMeta.shortId);
+  assert.ok(new TextEncoder().encode(JSON.stringify(metaEntry.metadata)).length <= 1024, 'metadata stays within the KV byte limit');
+  assert.equal(JSON.parse(metaEntry.value).tags.length, 10, 'record body keeps all ten tags even when the metadata copy drops them');
+  assert.equal(JSON.parse(metaEntry.value).note, bigNote, 'record body keeps the full note');
+
+  // 2) Parked-page sources: an HTML answer is a fetch failure, not a
+  // harvest of IP-shaped page furniture.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes('parked.example.com')) {
+      return new Response('<html><title>Domain for sale</title><p>Contact 203.0.113.66 now</p></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    if (u.includes('sneaky.example.com')) {
+      return new Response('<!DOCTYPE html><html><body>203.0.113.67</body></html>', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (u.includes('good.example.com')) {
+      return new Response('203.0.113.68\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const parkedOnly = await genRaw({ nodeLinks: vm('parked'), preferredIps: 'https://parked.example.com/list.txt' });
+    assert.equal(parkedOnly.json.ok, false, 'parked-page source alone cannot create an entry');
+    const sneaky = await genRaw({ nodeLinks: vm('sneaky'), preferredIps: 'https://sneaky.example.com/list.txt' });
+    assert.equal(sneaky.json.ok, false, 'an HTML body is refused even under a text content-type');
+    const parkedMixed = await generate({ nodeLinks: vm('parkedmix'), preferredIps: 'https://parked.example.com/list.txt\n198.51.100.41' });
+    assert.ok((parkedMixed.warnings || []).join(' ').includes('拉取失败'), 'parked source is named as failed when literals carry the entry');
+    assert.deepEqual(plainServers(parkedMixed), ['198.51.100.41'], 'no parked-page IP leaks into the entry');
+    const good = await generate({ nodeLinks: vm('goodsrc'), preferredIps: 'https://good.example.com/list.txt' });
+    assert.deepEqual(plainServers(good), ['203.0.113.68'], 'a plain-text list still parses normally');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // 3) Literal lines are host-validated: garbage is skipped with a
+  // warning, a scheme-less source path no longer becomes a fake host.
+  const litMix = await generate({ nodeLinks: vm('litmix'), preferredIps: '这不是地址\n198.51.100.42' });
+  assert.deepEqual(plainServers(litMix), ['198.51.100.42'], 'a garbage literal line produces no node');
+  assert.ok((litMix.warnings || []).join(' ').includes('不是合法的 IP 或域名'), 'the skipped literal is reported');
+  const schemeLess = await genRaw({ nodeLinks: vm('litpath'), preferredIps: 'raw.example.com/ips.txt' });
+  assert.equal(schemeLess.json.ok, false, 'a scheme-less source path alone cannot create an entry');
+  const v6lit = await generate({ nodeLinks: vm('litv6'), preferredIps: '[2001:db8::5]:443' });
+  assert.ok(plainServers(v6lit)[0].includes('2001:db8::5'), 'IPv6 literals still work');
+
+  // 4) peer= survives as SNI in the structured outputs.
+  const tjPeer = 'trojan://pw@tj.example.com:443?security=tls&peer=cdn.example.com&type=tcp#tjpeer16';
+  const gPeer = await generate({ nodeLinks: tjPeer, preferredIps: '198.51.100.43' });
+  const peerClash = await getSub(gPeer.shortId, 'clash');
+  assert.ok(peerClash.body.includes('sni: "cdn.example.com"'), 'clash: peer becomes the sni');
+  const peerSurge = await getSub(gPeer.shortId, 'surge');
+  assert.ok(peerSurge.body.includes('sni=cdn.example.com'), 'surge: peer becomes the sni');
+
+  // 5) Uppercase schemes parse (bare and inside a base64 blob).
+  const upVless = await generate({ nodeLinks: 'VLESS://11111111-2222-3333-4444-555555555555@up.example.com:443?security=tls&type=tcp#up16', preferredIps: '198.51.100.44' });
+  assert.equal(upVless.counts.inputNodes, 1, 'VLESS:// in capitals is accepted');
+  const upBlob = await generate({ nodeLinks: Buffer.from('Trojan://pw@tb.example.com:443?security=tls#tb16', 'utf8').toString('base64'), preferredIps: '198.51.100.45' });
+  assert.equal(upBlob.counts.inputNodes, 1, 'a capitalized scheme inside a base64 blob is accepted');
+
+  // 6) The deduplicated flag tells the truth.
+  const gFresh = await generate({ nodeLinks: vm('flag16'), preferredIps: '198.51.100.46' });
+  assert.equal(gFresh.deduplicated, false, 'a fresh mint is not a dedup hit');
+  const gAgain = await generate({ nodeLinks: vm('flag16'), preferredIps: '198.51.100.46' });
+  assert.equal(gAgain.deduplicated, true, 'an identical regenerate is a dedup hit');
+  assert.equal(gAgain.shortId, gFresh.shortId, 'dedup hit reuses the entry');
+
+  // 7) Dedup heal renews the dedup key on the healed record's clock.
+  const gT1 = await generate({ nodeLinks: vm('heal16'), preferredIps: '198.51.100.47', storageMode: 'days', retentionDays: 2 });
+  const healDedupKey = [...store.keys()].find((k) => k.startsWith('dedup:') && store.get(k).value === gT1.shortId);
+  store.delete('sub:' + gT1.shortId);
+  const gT2 = await generate({ nodeLinks: vm('heal16'), preferredIps: '198.51.100.47', storageMode: 'days', retentionDays: 30 });
+  assert.equal(gT2.shortId, gT1.shortId, 'heal keeps the original id');
+  assert.equal(store.get(healDedupKey).expirationTtl, 2592000, 'heal renews the dedup key TTL with the record');
+
+  // 8) remainingTtl anchors expiresAt-less timed records at
+  // createdAt + days instead of restarting the full countdown.
+  const gLeg = await generate({ nodeLinks: vm('legacy16'), preferredIps: '198.51.100.48', storageMode: 'days', retentionDays: 2 });
+  const legKey = 'sub:' + gLeg.shortId;
+  const legRec = JSON.parse(store.get(legKey).value);
+  delete legRec.storage.expiresAt;
+  legRec.createdAt = new Date(Date.now() - 86400 * 1000).toISOString(); // created a day ago
+  store.set(legKey, { value: JSON.stringify(legRec), metadata: store.get(legKey).metadata, expirationTtl: 3600 });
+  const noteResp = await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', id: gLeg.shortId, note: 'hi' }),
+  }), env);
+  assert.equal((await noteResp.json()).ok, true, 'note save succeeds on the legacy-shaped record');
+  const legAfter = JSON.parse(store.get(legKey).value);
+  assert.ok(legAfter.storage.expiresAt, 'expiresAt is materialized by the save');
+  const legTtl = store.get(legKey).expirationTtl;
+  assert.ok(legTtl > 80000 && legTtl < 100000, 'TTL counts down the remaining day, not a fresh two days (got ' + legTtl + ')');
+
+  // 9) The merged entry cache fronts /sub resolution: while it is
+  // warm, per-source cache changes do not affect the served nodes.
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('rot.example.com')) return new Response('203.0.113.70\n', { status: 200 });
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const gDyn = await generate({ nodeLinks: vm('dyn16'), preferredIps: 'https://rot.example.com/list.txt' });
+    const first = await getSub(gDyn.shortId, 'plain');
+    assert.ok(first.body.includes('MjAzLjAuMTEzLjcw') || JSON.stringify(first.body).length > 0, 'first pull serves');
+    const firstServers = [...store.keys()];
+    assert.ok(firstServers.some((k) => k === 'entrycache:' + gDyn.shortId), 'the merged entry cache is written after a pull');
+    const decodeAdd = (body) => {
+      const line = body.split('\n')[0];
+      return JSON.parse(Buffer.from(line.split('vmess://')[1], 'base64').toString('utf8')).add;
+    };
+    assert.equal(decodeAdd(first.body), '203.0.113.70', 'first pull serves the source endpoint');
+    const ipKey = [...store.keys()].find((k) => k.startsWith('ipcache:'));
+    const ipVal = JSON.parse(store.get(ipKey).value);
+    ipVal.endpoints = [{ server: '203.0.113.71', port: undefined, remark: '' }];
+    store.set(ipKey, { value: JSON.stringify(ipVal), metadata: undefined, expirationTtl: undefined });
+    const second = await getSub(gDyn.shortId, 'plain');
+    assert.equal(decodeAdd(second.body), '203.0.113.70', 'a warm entry cache wins over the per-source cache');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  console.log('audit-16 suite: metadata bytes, parked sources, literal validation, peer sni, uppercase schemes, dedup heal/flag, ttl anchor, entry cache: passed');
 }

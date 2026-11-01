@@ -766,7 +766,14 @@ const adminState = {
   // preference); selections whose tag vanished are pruned on render.
   tagSelected: new Set(),
   tagMode: 'and',
+  // DOM budget for the entry list: rendering thousands of fat rows
+  // (textareas, panels, buttons) freezes phones outright, so the
+  // list renders at most renderLimit rows and grows on demand via
+  // the "show more" footer. This caps DOM nodes only — filtering,
+  // selection and bulk delete always span the full filtered set.
+  renderLimit: 150,
 };
+const ADMIN_RENDER_STEP = 250;
 
 // Web storage can be present-but-throwing (blocked cookies/storage
 // in hardened browsers and in-app webviews) — even reading the global
@@ -1293,7 +1300,8 @@ function renderAdminList() {
     updateSelectionUI();
     return;
   }
-  adminBody.innerHTML = visible
+  const shownItems = visible.slice(0, adminState.renderLimit);
+  adminBody.innerHTML = shownItems
     .map((item) => {
       const created = fmtDateTime(item.createdAt);
       const retention = retentionHtml(item);
@@ -1318,6 +1326,9 @@ function renderAdminList() {
       </div>`;
     })
     .join('');
+  if (visible.length > shownItems.length) {
+    adminBody.innerHTML += `<div class="admin-more"><button type="button" class="secondary" data-admin-more>显示更多（已显示 ${shownItems.length} / 共 ${visible.length} 条）</button></div>`;
+  }
   updateSelectionUI();
 }
 
@@ -1354,6 +1365,7 @@ async function loadAdminList() {
     // A fresh load is a new data snapshot: unlike filter changes
     // (which only prune), it starts from an empty selection.
     adminState.selected.clear();
+    adminState.renderLimit = 150;
     renderAdminList();
     pruneTagOrderToVocab();
     updateAdminCount();
@@ -1889,6 +1901,11 @@ function fillGenerateForm(bf) {
 }
 
 document.addEventListener('click', async (event) => {
+  if (event.target.closest('[data-admin-more]')) {
+    adminState.renderLimit += ADMIN_RENDER_STEP;
+    renderAdminList();
+    return;
+  }
   const btn = event.target.closest('[data-admin-action]');
   if (!btn) return;
   const entry = btn.closest('.entry');

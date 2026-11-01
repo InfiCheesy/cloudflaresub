@@ -103,6 +103,23 @@ function parsePreferredEndpoints(input) {
     });
 }
 
+// A literal preferred "endpoint" is whatever the owner typed, and the
+// parser above splits host:port without judging the host — so a stray
+// line (a sentence, or a source URL pasted without its https://) used
+// to be stored verbatim as a node server. Judge the host shape here:
+// IPv4, an IPv6 literal (hex + colons), or a plausible hostname.
+// Source-derived endpoints don't need this: they are regex-extracted
+// in IP/domain shapes already.
+function isPlausibleHost(server) {
+  const s = String(server || '');
+  if (!s || s.length > 253) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) {
+    return s.split('.').every((o) => Number(o) <= 255);
+  }
+  if (s.includes(':')) return /^[0-9a-fA-F:]+$/.test(s);
+  return /^[a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9_])?(\.[a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9_])?)*$/.test(s);
+}
+
 const MAX_MIXED_SOURCES = 5;
 
 // Split the mixed preferred-IP box into its lines, tagged by kind.
@@ -296,6 +313,17 @@ async function fetchIpSource(rawUrl) {
     // The body read stays inside the abort window: a slow-drip source
     // cannot hold a /sub refresh open past the same 5 seconds.
     text = await readBodyCapped(resp);
+    // A source whose domain lapsed (parked page) or got hijacked can
+    // answer 200 with an HTML page, and the endpoint scanner would
+    // happily harvest IP-shaped strings out of the page furniture
+    // into the subscription. A real address list is never an HTML
+    // document, so refuse it as a fetch failure: the caller falls
+    // back to the cached snapshot and names the source in a warning.
+    const ctype = (resp.headers.get('content-type') || '').toLowerCase();
+    const head = text.replace(/^\uFEFF/, '').trimStart().slice(0, 512).toLowerCase();
+    if (ctype.includes('text/html') || head.startsWith('<!doctype') || head.startsWith('<html') || head.startsWith('<head')) {
+      throw new Error('来源返回了网页内容，不是优选地址列表');
+    }
   } catch (e) {
     if (e && e.name === 'AbortError') throw new Error('来源拉取超时（5 秒）');
     throw e instanceof Error ? e : new Error('来源拉取失败');
@@ -434,8 +462,41 @@ function carryOverFailedSnapshots(next, prev, sourceResults) {
 // The endpoints a dynamic entry should serve right now: the entry's
 // fixed literal lines plus each source's latest list (via cache), or
 // the generation-time snapshot when a source has never been reachable
-// since.
-async function resolveDynamicEndpoints(env, record) {
+// since. A per-entry merged cache fronts the per-source resolution:
+// a warm entry costs ONE KV read per /sub pull instead of one per
+// source (subscription clients poll these links around the clock,
+// and reads are the metered resource on the free tier). Its window
+// is deliberately much shorter than the sources' hourly cadence:
+// a rotation can lag by at most this window beyond the moment the
+// source caches themselves go stale. Keys self-expire after 2h.
+const ENTRY_CACHE_MS = 10 * 60 * 1000;
+async function resolveDynamicEndpoints(env, record, id) {
+  if (id) {
+    try {
+      const raw = await env.SUB_STORE.get(`entrycache:${id}`);
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (c && Array.isArray(c.endpoints) && c.endpoints.length
+          && Date.now() - (c.at || 0) < ENTRY_CACHE_MS) {
+          return c.endpoints;
+        }
+      }
+    } catch {}
+  }
+  const resolved = await resolveDynamicEndpointsFresh(env, record);
+  if (id && resolved && resolved.length) {
+    try {
+      await env.SUB_STORE.put(
+        `entrycache:${id}`,
+        JSON.stringify({ at: Date.now(), endpoints: resolved }),
+        { expirationTtl: 2 * 60 * 60 },
+      );
+    } catch {}
+  }
+  return resolved;
+}
+
+async function resolveDynamicEndpointsFresh(env, record) {
   const dyn = record.dynamic;
   const limit = dyn.limit || 10;
   if (Array.isArray(dyn.sources) && dyn.sources.length) {
@@ -638,7 +699,7 @@ function parseUrlLike(link, type) {
     ),
     host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
     path: u.searchParams.get('path') || '/',
-    sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
+    sni: u.searchParams.get('sni') || u.searchParams.get('peer') || u.searchParams.get('host') || '',
     fp: u.searchParams.get('fp') || '',
     alpn: u.searchParams.get('alpn') || '',
     flow: u.searchParams.get('flow') || '',
@@ -658,20 +719,24 @@ function parseRawLinks(input) {
   let skipped = 0;
   for (const line of lines) {
     try {
-      if (line.startsWith('vmess://')) {
+      // URL schemes are case-insensitive, and some panels export
+      // VLESS:// in capitals: dispatch on a lowered copy but parse
+      // the original line (a vmess payload is case-sensitive base64).
+      const lower = line.toLowerCase();
+      if (lower.startsWith('vmess://')) {
         nodes.push(parseVmess(line));
         continue;
       }
-      if (line.startsWith('vless://')) {
+      if (lower.startsWith('vless://')) {
         nodes.push(parseUrlLike(line, 'vless'));
         continue;
       }
-      if (line.startsWith('trojan://')) {
+      if (lower.startsWith('trojan://')) {
         nodes.push(parseUrlLike(line, 'trojan'));
         continue;
       }
       const decoded = b64DecodeUtf8(line);
-      if (/^(vmess|vless|trojan):\/\//m.test(decoded)) {
+      if (/^(vmess|vless|trojan):\/\//im.test(decoded)) {
         const inner = parseRawLinks(decoded);
         nodes.push(...inner.nodes);
         skipped += inner.skipped;
@@ -1258,16 +1323,23 @@ function notePointerKey(note, id) {
 // bloat the 1024-byte metadata budget (long note + many wide tags):
 // the endpoint then falls back to reading that one record, exactly
 // as it did before this field existed.
+// KV metadata is capped at 1024 BYTES on the platform, and multibyte
+// text breaks char-count budgets (a CJK char is 1 char but 3 bytes), so
+// every metadata budget below is measured in UTF-8 bytes.
+function utf8ByteLength(s) {
+  return new TextEncoder().encode(s).length;
+}
+
 function metaTagsOf(record) {
   const tags = sanitizeTags(record && record.tags);
   if (!tags.length) return [];
-  return JSON.stringify(tags).length <= 384 ? tags : undefined;
+  return utf8ByteLength(JSON.stringify(tags)) <= 384 ? tags : undefined;
 }
 
 function buildRecordMetadata(record) {
   const servers = (record.sources || []).map((x) => x.server).filter(Boolean);
   const st = record.storage || { mode: 'permanent' };
-  return {
+  const meta = {
     note: (typeof record.note === 'string' ? record.note : ''),
     createdAt: record.createdAt || '',
     sources: [...new Set(servers)].slice(0, 3).join(',').slice(0, 200),
@@ -1276,6 +1348,19 @@ function buildRecordMetadata(record) {
     exp: st.mode === 'days' ? (st.expiresAt || '') : '',
     tags: metaTagsOf(record),
   };
+  // Keep the serialized metadata safely under the platform's 1024-byte
+  // limit: a legal max-length CJK note plus ten max-length CJK tags
+  // otherwise pushes past it and the KV put throws, failing the save
+  // with an opaque 500. The tags copy is display-only (the record body
+  // is authoritative), so it is dropped first; the note copy is
+  // truncated next (the record keeps the full note either way).
+  if (utf8ByteLength(JSON.stringify(meta)) > 1000 && meta.tags !== undefined) {
+    meta.tags = undefined;
+  }
+  while (meta.note && utf8ByteLength(JSON.stringify(meta)) > 1000) {
+    meta.note = dropDanglingSurrogate(meta.note.slice(0, -8));
+  }
+  return meta;
 }
 
 // Retention chosen by the owner at generate time:
@@ -1308,6 +1393,19 @@ function applyRetention(record, nowMs) {
 function remainingTtl(record) {
   const st = record.storage;
   if (!st || st.mode !== 'days') return undefined;
+  if (!st.expiresAt && st.days) {
+    // Legacy/hand-shaped timed records carry days but no expiresAt.
+    // Returning the FULL countdown here would restart the entry's
+    // clock on every save, so it could never expire while in use.
+    // Anchor the expiry at createdAt + days instead, and materialize
+    // it onto the record (both callers putRecord this same object
+    // right after) so later saves count down normally. With no
+    // parseable createdAt the only anchor left is now — still
+    // materialized, so the restart happens at most once.
+    const createdMs = Date.parse(record.createdAt || '');
+    const baseMs = Number.isFinite(createdMs) ? createdMs : Date.now();
+    st.expiresAt = new Date(baseMs + st.days * 86400 * 1000).toISOString();
+  }
   if (st.expiresAt) {
     const left = Math.ceil((Date.parse(st.expiresAt) - Date.now()) / 1000);
     return Math.max(60, left);
@@ -1394,7 +1492,17 @@ async function handleGenerate(request, env, url) {
   if (sourceUrls.length > MAX_MIXED_SOURCES) {
     return json({ ok: false, error: `来源链接最多 ${MAX_MIXED_SOURCES} 个，当前有 ${sourceUrls.length} 个` }, 400);
   }
-  const literalEndpoints = parsePreferredEndpoints(mixed.literals.join('\n'));
+  const literalEndpoints = [];
+  const invalidLiteralLines = [];
+  for (const litLine of mixed.literals) {
+    const ep = parsePreferredEndpoints(litLine)[0];
+    if (!ep) continue;
+    if (!isPlausibleHost(ep.server)) {
+      invalidLiteralLines.push(litLine);
+      continue;
+    }
+    literalEndpoints.push(ep);
+  }
   if (literalEndpoints.some((ep) => ep.badPort)) {
     return json({ ok: false, error: '优选地址的端口需要在 1 到 65535 之间' }, 400);
   }
@@ -1434,7 +1542,7 @@ async function handleGenerate(request, env, url) {
       }
     } else {
       const ep = parsePreferredEndpoints(line.text)[0];
-      if (!ep) continue;
+      if (!ep || !isPlausibleHost(ep.server)) continue;
       seenEp.add(epKey(ep));
       preferredEndpoints.push(ep);
     }
@@ -1541,6 +1649,7 @@ async function handleGenerate(request, env, url) {
 
   let id = await env.SUB_STORE.get(dedupKey);
   let record;
+  let deduplicated = false;
 
   if (!id) {
     id = await createUniqueShortId(env);
@@ -1561,6 +1670,7 @@ async function handleGenerate(request, env, url) {
     await putRecord(env, id, record, undefined, ttl);
     await env.SUB_STORE.put(dedupKey, id, ttl ? { expirationTtl: ttl } : {});
   } else {
+    deduplicated = true;
     // Same content generated again: reuse the entry. Rewriting it without
     // a TTL also migrates older (7-day expiry) entries to permanent
     // storage, backfills sources, and applies a newly provided note.
@@ -1614,6 +1724,12 @@ async function handleGenerate(request, env, url) {
       };
       const ttl = applyRetention(record, Date.now());
       await putRecord(env, id, record, undefined, ttl);
+      // The record was gone but its dedup key survived (KV reaped one
+      // and not the other): the healed record just got a fresh TTL,
+      // so renew the dedup key on the same clock — otherwise the key
+      // lapses first and the next identical generate mints a duplicate
+      // entry alongside the healed one.
+      await env.SUB_STORE.put(dedupKey, id, ttl ? { expirationTtl: ttl } : {});
     }
   }
 
@@ -1630,7 +1746,7 @@ async function handleGenerate(request, env, url) {
 
   return json({
     ok: true,
-    deduplicated: true,
+    deduplicated,
     shortId: id,
     urls: {
       auto: withToken(''),
@@ -1675,6 +1791,9 @@ async function handleGenerate(request, env, url) {
     warnings: [
       ...(accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。']),
       ...(skippedLines > 0 ? [`有 ${skippedLines} 行节点链接无法解析或端口不可用，已跳过。`] : []),
+      ...(invalidLiteralLines.length
+        ? [`有 ${invalidLiteralLines.length} 行优选地址不是合法的 IP 或域名，已跳过（例如「${invalidLiteralLines[0].slice(0, 40)}」；若它其实是来源链接，请以 https:// 开头）。`]
+        : []),
       // Generation parses the full text, but the stored copy (what
       // backfill restores) is capped: say so, or the tail silently
       // vanishes from every future backfill-and-regenerate.
@@ -2210,6 +2329,7 @@ async function handleDelete(request, env) {
   if (raw) { try { record = JSON.parse(raw); } catch {} }
 
   await env.SUB_STORE.delete(`sub:${id}`);
+  await env.SUB_STORE.delete(`entrycache:${id}`);
   if (record && record.note) await env.SUB_STORE.delete(notePointerKey(record.note, id));
   if (record && record.dedupHash) await env.SUB_STORE.delete(`dedup:${record.dedupHash}`);
   return json({ ok: true, id, existed: Boolean(raw) });
@@ -2281,7 +2401,7 @@ async function handleSub(request, env, url) {
   if (record.dynamic && Array.isArray(record.baseNodes) && record.baseNodes.length) {
     // Dynamic subscription: rebuild the node list from the source's
     // current preferred IPs. Any failure keeps the stored snapshot.
-    const eps = await resolveDynamicEndpoints(env, record);
+    const eps = await resolveDynamicEndpoints(env, record, id);
     if (eps && eps.length) {
       const rebuilt = buildNodes(record.baseNodes, eps, record.options || {});
       if (rebuilt.length) nodes = rebuilt;
@@ -2492,6 +2612,7 @@ function sourceErrKind(e) {
   if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) return 'timeout';
   const m = String((e && e.message) || '');
   if (m.includes('可用的优选地址')) return 'empty';
+  if (m.includes('网页内容')) return 'html-content';
   if (/timeout|timed out/i.test(m)) return 'timeout';
   return 'fetch-failed';
 }

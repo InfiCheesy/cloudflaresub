@@ -761,6 +761,11 @@ button.small {
   font-size: 0.92rem;
 }
 
+.admin-more {
+  padding: 14px;
+  text-align: center;
+}
+
 /* ---- Header version status + update-check warning ---- */
 .version-status {
   display: inline-flex;

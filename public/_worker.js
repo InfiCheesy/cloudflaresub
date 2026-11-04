@@ -686,7 +686,7 @@ function parseSourceLimit(value) {
 // endpoint costs a handful of GitHub calls a day at most. It reports
 // an explicit checkStatus (ok / stale / failed) so the page can warn
 // visibly instead of mistaking "check failed" for "up to date".
-const APP_VERSION = '1.6.1';
+const APP_VERSION = '1.7.0';
 const UPDATE_REPO = 'realadmin/cloudflaresub';
 const VERSION_CACHE_KEY = 'sys:latest-release';
 const VERSION_CACHE_MS = 6 * 60 * 60 * 1000;

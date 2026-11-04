@@ -2057,17 +2057,163 @@ console.log('worker tests passed');
     } finally { globalThis.fetch = realFetch; }
   }
 
-  // Admin lockout LAST: it poisons this isolate's admin surface for
-  // five minutes, so nothing after this block may need admin access.
+  // Admin throttle LAST in this suite: wrong guesses are counted in
+  // module-level state shared by the whole isolate. Round 17 changed
+  // the semantics — the throttle refuses further WRONG guesses, but
+  // a correct token is always admitted and clears the counter (the
+  // owner can no longer be locked out by strangers).
   {
     const { e } = mkEnv(ADMIN);
-    for (let i = 0; i < 20; i++) {
-      const r = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'wrong-' + i } }), e);
-      assert.equal(r.status, 403, 'wrong guesses are 403 while under the limit');
+    const tryToken = (t) => worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': t } }), e);
+    for (let i = 0; i < 19; i++) {
+      assert.equal((await tryToken('wrong-' + i)).status, 403, 'wrong guesses are 403 while under the limit');
     }
-    const locked = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': ADMIN } }), e);
-    assert.equal(locked.status, 429, 'after 20 failures even the right token waits out the lockout');
+    assert.equal((await tryToken('wrong-19')).status, 429, 'the 20th wrong guess trips the throttle');
+    assert.equal((await tryToken('wrong-20')).status, 429, 'further wrong guesses stay throttled');
+    assert.equal((await tryToken(ADMIN)).status, 200, 'a correct token is admitted during the throttle');
+    assert.equal((await tryToken('wrong-again')).status, 403, 'the successful login cleared the counter');
   }
 
   console.log('external audit fixes suite: token floor/lockout, fail-closed, stored link tokens, headers, static refresh, literal dedupe, target 400, vmess fidelity, ws host, flow gate, sni fallback, source parsing + DNS, list paging, byte cap, entry-cache invalidation, github token: passed');
+}
+
+// --- Audit round 17 suite: CSV header gate, CNAME following, body
+// cap, clash camouflage, paged-list read cost, entry-cache stamps,
+// OPTIONS posture ---
+{
+  const ADMIN = 'tok-0123456789abcdef';
+  const post = (e, path, body) => worker.fetch(new Request('https://x.pages.dev' + path, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }), e);
+  const vmJson = (obj) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'R17', add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', net: 'tcp', type: 'none', tls: '', ...obj }), 'utf8').toString('base64');
+
+  // CSV: a packets-sent column is NOT a port (CloudflareSpeedTest shape).
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === 'https://speed.example.com/result.csv') {
+        return new Response('IP 地址,已发送,已接收,丢包率,平均延迟,下载速度 (MB/s)\n104.16.1.2,4,4,0.00,123.45,67.89\n104.16.1.3,4,4,0.00,98.10,55.20', { status: 200 });
+      }
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const r = await post(env, '/api/ip-source-test', { token: ADMIN, url: 'https://speed.example.com/result.csv' }).then((x) => x.json());
+      assert.equal(r.count, 2, 'speed-test csv parsed');
+      assert.ok(r.sample.includes('104.16.1.2'), 'bare IP kept');
+      assert.ok(!r.sample.some((x) => x.endsWith(':4')), 'packets-sent column is not read as a port');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // DoH guard follows a CNAME-only answer to the address it lands on.
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.startsWith('https://cloudflare-dns.com/dns-query')) {
+        const name = new URL(u).searchParams.get('name');
+        const type = new URL(u).searchParams.get('type');
+        let answer = [];
+        if (name === 'chain.example.com' && type === 'CNAME') answer = [{ type: 5, data: 'inner.example.com.' }];
+        if (name === 'inner.example.com' && type === 'A') answer = [{ type: 1, data: '10.0.0.9' }];
+        if (name === 'chain2.example.com' && type === 'CNAME') answer = [{ type: 5, data: 'pub.example.com.' }];
+        if (name === 'pub.example.com' && type === 'A') answer = [{ type: 1, data: '1.1.1.1' }];
+        return new Response(JSON.stringify({ Answer: answer }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+      }
+      if (u === 'https://chain.example.com/l.txt' || u === 'https://chain2.example.com/l.txt') return new Response('6.6.6.6', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const bad = await post(env, '/api/ip-source-test', { token: ADMIN, url: 'https://chain.example.com/l.txt' }).then((x) => x.json());
+      assert.equal(bad.ok, false, 'CNAME chain landing on a private address is refused');
+      const good = await post(env, '/api/ip-source-test', { token: ADMIN, url: 'https://chain2.example.com/l.txt' }).then((x) => x.json());
+      assert.equal(good.ok, true, 'CNAME chain landing on a public address passes');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // Request bodies are size-capped before parsing (and before auth).
+  {
+    const huge = { token: 'wrong-on-purpose', nodeLinks: 'x'.repeat(17 * 1024 * 1024), preferredIps: '1.1.1.1' };
+    const r = await post(env, '/api/generate', huge);
+    assert.equal(r.status, 413, 'oversized body refused pre-auth with 413');
+    const r2 = await post(env, '/api/note', { token: ADMIN, id: 'x', note: 'y'.repeat(17 * 1024 * 1024) });
+    assert.equal(r2.status, 413, 'admin endpoints share the cap');
+  }
+
+  // VMess http camouflage renders as mihomo's http transport in Clash.
+  {
+    const camo = await generate({ nodeLinks: vmJson({ ps: 'R17Camo', type: 'http', host: 'cdn.example.com' }), preferredIps: '198.51.100.60' });
+    const clash = await getSub(camo.shortId, 'clash');
+    assert.ok(clash.body.includes('network: "http"'), 'camo vmess uses http transport in clash');
+    assert.ok(clash.body.includes('http-opts:'), 'camo vmess carries http-opts');
+    const plain = await generate({ nodeLinks: vmJson({ ps: 'R17Plain' }), preferredIps: '198.51.100.61' });
+    const clash2 = await getSub(plain.shortId, 'clash');
+    assert.ok(clash2.body.includes('network: "tcp"'), 'plain vmess stays tcp');
+    assert.ok(!clash2.body.includes('http-opts:'), 'plain vmess has no http-opts');
+  }
+
+  // Paged list reads only the page's records.
+  {
+    const st = new Map();
+    let recordGets = 0;
+    const e = {
+      SUB_ACCESS_TOKEN: ADMIN,
+      SUB_STORE: {
+        async get(k) { if (k.startsWith('sub:')) recordGets++; const v = st.get(k); return v ? v.value : null; },
+        async put(k, v, o = {}) { st.set(k, { value: v, metadata: o.metadata }); },
+        async delete(k) { st.delete(k); },
+        async list({ prefix = '', limit = 1000 } = {}) {
+          const keys = [...st.entries()].filter(([n]) => n.startsWith(prefix)).slice(0, limit).map(([name, en]) => ({ name, metadata: en.metadata }));
+          return { keys, list_complete: true, cursor: '' };
+        },
+      },
+      ASSETS: { async fetch() { return new Response('HOME'); } },
+    };
+    for (let i = 1; i <= 5; i++) {
+      st.set(`sub:PageTest0${i}`, {
+        value: JSON.stringify({ version: 2, createdAt: `2026-01-0${i}T00:00:00.000Z`, storage: { mode: 'permanent' }, nodes: [{ type: 'vmess', name: 'P' + i, server: '198.51.100.1', port: 443, uuid: '11111111-2222-3333-4444-555555555555', alterId: 0, cipher: 'auto', network: 'tcp', tls: false, host: '', path: '/', sni: '', alpn: '', fp: '' }] }),
+        metadata: { createdAt: `2026-01-0${i}T00:00:00.000Z` },
+      });
+    }
+    const page = await (await worker.fetch(new Request('https://x.pages.dev/api/list?limit=2', { headers: { 'x-admin-token': ADMIN } }), e)).json();
+    assert.equal(page.total, 5, 'paged list reports the full total');
+    assert.equal(page.items.length, 2, 'paged list returns one page');
+    assert.equal(page.items[0].id, 'PageTest05', 'paged list is newest-first');
+    assert.equal(recordGets, 2, 'paged list reads only the page records');
+  }
+
+  // Entry cache is gated by the record stamp, not just freshness.
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === 'https://stamp.example.com/l.txt') return new Response('104.16.30.1', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const g = await generate({ nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@stamp.example.com:443?security=tls&type=ws&path=%2Fws&host=stamp.example.com&sni=stamp.example.com#R17Stamp', preferredIps: 'https://stamp.example.com/l.txt' });
+      const s1 = await getSub(g.shortId, 'plain');
+      assert.ok(s1.body.includes('@104.16.30.1'), 'source endpoints served');
+      const rec = JSON.parse(store.get(`sub:${g.shortId}`).value);
+      const stamp = rec.updatedAt || rec.createdAt;
+      store.set(`entrycache:${g.shortId}`, { value: JSON.stringify({ at: Date.now(), recStamp: 'stale-stamp', endpoints: [{ server: '9.9.9.9', port: null, remark: '' }] }) });
+      const s2 = await getSub(g.shortId, 'plain');
+      assert.ok(!s2.body.includes('@9.9.9.9'), 'a cache stamped by an older record version is ignored');
+      assert.ok(s2.body.includes('@104.16.30.1'), 'fresh resolution serves instead');
+      store.set(`entrycache:${g.shortId}`, { value: JSON.stringify({ at: Date.now(), recStamp: stamp, endpoints: [{ server: '8.8.8.8', port: null, remark: '' }] }) });
+      const s3 = await getSub(g.shortId, 'plain');
+      assert.ok(s3.body.includes('@8.8.8.8'), 'a cache stamped by the current record version is honored');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // OPTIONS: no CORS grants anywhere.
+  {
+    const apiOpt = await worker.fetch(new Request('https://x.pages.dev/api/list', { method: 'OPTIONS' }), env);
+    assert.equal(apiOpt.status, 204, 'api OPTIONS is a bare 204');
+    assert.equal(apiOpt.headers.get('access-control-allow-origin'), null, 'no wildcard on api OPTIONS');
+    const subOpt = await worker.fetch(new Request('https://x.pages.dev/sub/whatever', { method: 'OPTIONS' }), env);
+    assert.equal(subOpt.headers.get('access-control-allow-origin'), null, 'no wildcard on sub OPTIONS');
+  }
+
+  console.log('audit round 17 suite: csv header gate, cname following, body cap, clash camouflage, paged-list reads, entry-cache stamps, options posture: passed');
 }

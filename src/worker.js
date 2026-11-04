@@ -233,17 +233,29 @@ function extractEndpointTokens(text) {
   const tokens = [];
   const re = /\[([0-9a-fA-F:]+)\](?::(\d{1,5}))?|(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?|\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})(?::(\d{1,5}))?/g;
   const lines = String(text).split(/\r?\n/);
+  // The CSV port column is honoured ONLY when a header line names
+  // the second column as the port: the most widely used speed-test
+  // CSV (CloudflareSpeedTest) puts the packets-SENT count there,
+  // and reading it as a port silently redirected every node built
+  // from such a source to port 4.
+  let csvPortColumn = false;
+  for (let i = 0; i < Math.min(3, lines.length); i++) {
+    const cells = lines[i].split(',');
+    if (cells.length > 1 && /^(port|端口)$/i.test((cells[1] || '').trim())) {
+      csvPortColumn = true;
+      break;
+    }
+  }
   for (let i = 0; i < lines.length && i < 20000 && tokens.length < 2000; i++) {
     // An endpoint is short; matching only a line's head bounds the regex
     // work a hostile or broken source can make us do per line.
     const line = lines[i].slice(0, 600);
-    // CSV speed-test tables put the port in its own column
-    // ("104.16.7.7,443,HKG"): when the first cell is an endpoint
-    // without an explicit port and the second cell is a bare port,
-    // that port belongs to the endpoint — dialing the node's own
-    // port instead made such sources silently wrong.
+    // CSV tables whose header names a port column ("IP,port,colo")
+    // carry the port in the second cell: when the first cell is an
+    // endpoint without an explicit port and the second cell is a
+    // bare port, that port belongs to the endpoint.
     const cells = line.split(',');
-    if (cells.length > 1) {
+    if (csvPortColumn && cells.length > 1) {
       const first = cells[0].trim();
       const second = (cells[1] || '').trim();
       if (first && /^\d{1,5}$/.test(second) && !/[:\]]$/.test(first) && !first.includes(':')) {
@@ -352,10 +364,11 @@ function ipAddressIsPrivate(addr) {
 // private. A resolver failure does not block the fetch — the literal
 // checks and the platform fetcher remain as backstops, and source
 // availability should not hinge on a third-party resolver being up.
-async function assertSourceHostResolvesPublic(hostname) {
+async function assertSourceHostResolvesPublic(hostname, depth = 0) {
   const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!host || host.includes(':') || /^(\d{1,3}\.){3}\d{1,3}$/.test(host)) return;
   let answers = [];
+  let cnames = [];
   try {
     const query = async (type, typeNum) => {
       const u = 'https://cloudflare-dns.com/dns-query?' + new URLSearchParams({ name: host, type });
@@ -367,11 +380,18 @@ async function assertSourceHostResolvesPublic(hostname) {
         .map((a) => a.data);
     };
     answers = [...(await query('A', 1)), ...(await query('AAAA', 28))];
+    if (!answers.length && depth < 2) cnames = await query('CNAME', 5);
   } catch {
     return;
   }
   if (answers.some((a) => ipAddressIsPrivate(a))) {
     throw new Error('来源域名解析到了内网地址，已拒绝');
+  }
+  // An answer carrying only a CNAME and no addresses would
+  // otherwise sail through unchecked: follow the target and apply
+  // the same rule to wherever the chain lands.
+  if (!answers.length && cnames.length) {
+    await assertSourceHostResolvesPublic(cnames[0].replace(/\.$/, ''), depth + 1);
   }
 }
 
@@ -559,12 +579,21 @@ function carryOverFailedSnapshots(next, prev, sourceResults) {
 // source caches themselves go stale. Keys self-expire after 2h.
 const ENTRY_CACHE_MS = 10 * 60 * 1000;
 async function resolveDynamicEndpoints(env, record, id) {
+  // The cache is stamped with the record version it was resolved
+  // from (updatedAt, falling back to createdAt). Regeneration
+  // deletes the cache, but a /sub in flight at that moment could
+  // re-write the stale merge with a FRESH timestamp afterwards;
+  // the stamp makes such a zombie cache unreadable, because the
+  // regenerated record carries a newer stamp. Caches written
+  // before stamps existed simply miss once and are rewritten.
+  const recStamp = record.updatedAt || record.createdAt || '';
   if (id) {
     try {
       const raw = await env.SUB_STORE.get(`entrycache:${id}`);
       if (raw) {
         const c = JSON.parse(raw);
         if (c && Array.isArray(c.endpoints) && c.endpoints.length
+          && c.recStamp === recStamp
           && Date.now() - (c.at || 0) < ENTRY_CACHE_MS) {
           return c.endpoints;
         }
@@ -576,7 +605,7 @@ async function resolveDynamicEndpoints(env, record, id) {
     try {
       await env.SUB_STORE.put(
         `entrycache:${id}`,
-        JSON.stringify({ at: Date.now(), endpoints: resolved }),
+        JSON.stringify({ at: Date.now(), recStamp, endpoints: resolved }),
         { expirationTtl: 2 * 60 * 60 },
       );
     } catch {}
@@ -1031,6 +1060,16 @@ function pushClashGrpcOpts(lines, node) {
   lines.push('    grpc-opts:', `      grpc-service-name: "${escapeYaml(svc)}"`);
 }
 
+// The network a VMess node is emitted as in Clash: header
+// camouflage 'http' over raw TCP is mihomo's http transport —
+// emitting plain 'tcp' would silently drop the camouflage the
+// link carries (raw/plain links preserve the field; Clash was the
+// remaining format that lost it).
+function clashNetworkOf(node) {
+  const net = node.network || 'tcp';
+  return net === 'tcp' && node.headerType === 'http' ? 'http' : net;
+}
+
 function pushClashHttpOpts(lines, node) {
   lines.push('    http-opts:');
   lines.push(`      path: ["${escapeYaml(node.path || '/')}"]`);
@@ -1086,7 +1125,7 @@ function renderClash(nodes) {
           `    cipher: "${escapeYaml(node.cipher || 'auto')}"`,
           `    udp: true`,
           `    tls: ${node.tls ? 'true' : 'false'}`,
-          `    network: "${escapeYaml(node.network || 'tcp')}"`,
+          `    network: "${escapeYaml(clashNetworkOf(node))}"`,
         ];
 
         if (node.sni) {
@@ -1098,7 +1137,7 @@ function renderClash(nodes) {
         }
         pushClashGrpcOpts(lines, node);
         if (node.network === 'h2') pushClashH2Opts(lines, node);
-        else if (node.network === 'http') pushClashHttpOpts(lines, node);
+        else if (clashNetworkOf(node) === 'http') pushClashHttpOpts(lines, node);
         if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -1593,12 +1632,9 @@ async function handleGenerateBody(request, env, url) {
   if (!env.SUB_STORE) {
     return json({ ok: false, error: '服务端未绑定 KV：请在 Pages 项目 Settings -> Bindings 中添加 KV namespace，变量名必须为 SUB_STORE，然后重新部署' }, 500);
   }
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
-  }
+  const parsedBody = await parseJsonBody(request);
+  if (parsedBody.error) return parsedBody.error;
+  const body = parsedBody.body;
 
   // Generating writes to KV, so it sits behind the same gate as the
   // admin endpoints — including when no token is configured at all.
@@ -2014,7 +2050,6 @@ async function safeEqual(a, b) {
 const ADMIN_TOKEN_MIN_LENGTH = 16;
 const ADMIN_FAIL_WINDOW_MS = 10 * 60 * 1000;
 const ADMIN_FAIL_LIMIT = 20;
-const ADMIN_LOCKOUT_MS = 5 * 60 * 1000;
 const adminFailureTimes = [];
 
 async function checkAdmin(request, env, url, body, flavor) {
@@ -2025,29 +2060,33 @@ async function checkAdmin(request, env, url, body, flavor) {
   if (expected.length < ADMIN_TOKEN_MIN_LENGTH) {
     return json({ ok: false, error: `SUB_ACCESS_TOKEN 太短（当前 ${expected.length} 个字符，至少需要 ${ADMIN_TOKEN_MIN_LENGTH} 个）：弱令牌可被离线破解，请在 Pages 项目里换一个更长的随机令牌后重新部署` }, 403);
   }
-  const now = Date.now();
-  while (adminFailureTimes.length && now - adminFailureTimes[0] > ADMIN_FAIL_WINDOW_MS) {
-    adminFailureTimes.shift();
-  }
-  if (adminFailureTimes.length >= ADMIN_FAIL_LIMIT
-    && now - adminFailureTimes[adminFailureTimes.length - 1] < ADMIN_LOCKOUT_MS) {
-    return json({ ok: false, error: '管理令牌已连续多次输错，管理接口暂时锁定，请 5 分钟后再试' }, 429);
-  }
   // Body field or the dedicated header only — never the URL query, so the
   // admin token stays out of browser history, proxy logs and referrers.
   const provided =
     (body && typeof body.token === 'string' && body.token) ||
     request.headers.get('x-admin-token') ||
     '';
-  if (!(await safeEqual(provided, expected))) {
-    adminFailureTimes.push(now);
-    if (flavor === 'generate') {
-      return json({ ok: false, error: '生成订阅需要管理令牌：请先在页面下方「KV 条目管理」处填入 SUB_ACCESS_TOKEN（生成与管理共用同一个令牌）' }, 403);
-    }
-    return json({ ok: false, error: '管理令牌不正确' }, 403);
+  if (await safeEqual(provided, expected)) {
+    // A CORRECT token is always admitted — even while wrong guesses
+    // are being throttled. The throttle exists to brake guessing,
+    // and guessing is unaffected by letting the owner in; the other
+    // arrangement handed any stranger a lever to lock the owner out
+    // of their own admin surface indefinitely.
+    adminFailureTimes.length = 0;
+    return null;
   }
-  adminFailureTimes.length = 0;
-  return null;
+  const now = Date.now();
+  while (adminFailureTimes.length && now - adminFailureTimes[0] > ADMIN_FAIL_WINDOW_MS) {
+    adminFailureTimes.shift();
+  }
+  adminFailureTimes.push(now);
+  if (adminFailureTimes.length >= ADMIN_FAIL_LIMIT) {
+    return json({ ok: false, error: '管理令牌错误次数过多，已暂时拒绝继续尝试，请 5 分钟后再试（正确令牌不受影响）' }, 429);
+  }
+  if (flavor === 'generate') {
+    return json({ ok: false, error: '生成订阅需要管理令牌：请先在页面下方「KV 条目管理」处填入 SUB_ACCESS_TOKEN（生成与管理共用同一个令牌）' }, 403);
+  }
+  return json({ ok: false, error: '管理令牌不正确' }, 403);
 }
 
 // One admin-list row, resolved from its record. Returns null for a
@@ -2103,6 +2142,37 @@ async function handleList(request, env, url) {
   // The key list only tells us WHICH entries exist. Every displayed
   // field is read from the record itself: list-index metadata lags
   // fresh writes and caused false failure reports and stale displays.
+  // Paged reads (limit/offset present) take an index-driven path:
+  // keys are ordered by the list index's createdAt metadata and
+  // only the requested page's records are read, so a script paging
+  // through a big store pays reads for one page, not for every
+  // record. The ORDER is the one thing taken from index metadata
+  // (eventually consistent — a just-written entry can briefly sort
+  // by a stale createdAt); every displayed field still comes from
+  // the record itself, and the unpaged path below is unchanged.
+  const offsetRaw = Number(url.searchParams.get('offset'));
+  const limitRaw = Number(url.searchParams.get('limit'));
+  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.trunc(offsetRaw) : 0;
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(5000, Math.trunc(limitRaw)) : null;
+  if (limit !== null || offset > 0) {
+    const keys = [];
+    let cur;
+    do {
+      const page = await env.SUB_STORE.list({ prefix: 'sub:', cursor: cur, limit: 256 });
+      keys.push(...page.keys);
+      cur = page.list_complete ? undefined : page.cursor;
+    } while (cur);
+    keys.sort((a, b) => String((b.metadata || {}).createdAt || '').localeCompare(String((a.metadata || {}).createdAt || '')));
+    const total = keys.length;
+    const pageKeys = keys.slice(offset, limit === null ? undefined : offset + limit);
+    const pageItems = [];
+    for (let i = 0; i < pageKeys.length; i += 25) {
+      const built = await Promise.all(pageKeys.slice(i, i + 25).map((key) => buildListItem(env, key)));
+      for (const item of built) if (item) pageItems.push(item);
+    }
+    return json({ ok: true, count: total, total, offset, limit, items: pageItems });
+  }
+
   // One source of truth: the record.
   const items = [];
   let cursor;
@@ -2120,19 +2190,7 @@ async function handleList(request, env, url) {
   } while (cursor);
 
   items.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-  // Optional server-side paging for API consumers: the admin page
-  // still loads the full set (its search/sort/filter run client-side
-  // over everything, with the rendered rows capped separately), but
-  // a script no longer has to pull every record body to see a slice.
-  const total = items.length;
-  const offsetRaw = Number(url.searchParams.get('offset'));
-  const limitRaw = Number(url.searchParams.get('limit'));
-  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.trunc(offsetRaw) : 0;
-  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(5000, Math.trunc(limitRaw)) : null;
-  const pageItems = limit === null && offset === 0
-    ? items
-    : items.slice(offset, limit === null ? undefined : offset + limit);
-  return json({ ok: true, count: total, total, offset, limit, items: pageItems });
+  return json({ ok: true, count: items.length, total: items.length, offset: 0, limit: null, items });
 }
 
 // ---- Form backfill -------------------------------------------------------
@@ -2280,12 +2338,39 @@ async function handleEntry(request, env, url) {
 // address before generating a dynamic subscription from it. Always
 // fetches live (never the cache) and requires the admin token, like
 // every other server-side fetch trigger.
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+
+// JSON request bodies are size-capped BEFORE parsing — and therefore
+// before auth: without a ceiling, an unauthenticated client could
+// make the worker buffer and parse arbitrarily large payloads on
+// every POST endpoint. The legitimate maximum is far lower (the
+// biggest real request is a large generate paste, a few MB at the
+// output-node cap), so 16MB refuses abuse without touching real use.
+async function parseJsonBody(request) {
+  const tooBig = () => json({ ok: false, error: `请求体过大（上限 ${MAX_REQUEST_BODY_BYTES / 1048576} MB）` }, 413);
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > MAX_REQUEST_BODY_BYTES) return { error: tooBig() };
+  let raw;
+  try {
+    raw = await request.text();
+  } catch {
+    return { error: json({ ok: false, error: '请求体不是合法 JSON' }, 400) };
+  }
+  if (utf8ByteLength(raw) > MAX_REQUEST_BODY_BYTES) return { error: tooBig() };
+  try {
+    return { body: JSON.parse(raw) };
+  } catch {
+    return { error: json({ ok: false, error: '请求体不是合法 JSON' }, 400) };
+  }
+}
+
 // Shared prelude of the POST admin endpoints: KV bound, JSON body
 // parsed, admin token verified. Returns { body } or { error }.
 async function parseAdminBody(request, env) {
   if (!env.SUB_STORE) return { error: json({ ok: false, error: 'SUB_STORE KV 未绑定' }, 500) };
-  let body;
-  try { body = await request.json(); } catch { return { error: json({ ok: false, error: '请求体不是合法 JSON' }, 400) }; }
+  const parsed = await parseJsonBody(request);
+  if (parsed.error) return { error: parsed.error };
+  const body = parsed.body;
   const denied = await checkAdmin(request, env, new URL(request.url), body);
   return denied ? { error: denied } : { body };
 }
@@ -3102,13 +3187,14 @@ async function dispatch(request, env) {
     const url = new URL(request.url);
 
       if (request.method === 'OPTIONS') {
-        return new Response(null, {
-          headers: {
-            'access-control-allow-origin': '*',
-            'access-control-allow-methods': 'GET,POST,OPTIONS',
-            'access-control-allow-headers': 'content-type, x-admin-token',
-          },
-        });
+        // No CORS grants at all: the admin UI is same-origin and
+        // needs no preflight, and subscription bodies are
+        // credentials. The wildcard preflight this replaces (any
+        // origin, x-admin-token allowed) contradicted the removal
+        // of ACAO from the actual responses. A bare 204 tells
+        // browsers there is simply nothing cross-origin here.
+        if (url.pathname.startsWith('/api/')) return new Response(null, { status: 204 });
+        return text('not found', 404);
       }
 
       if (request.method === 'POST' && url.pathname === '/api/generate') {

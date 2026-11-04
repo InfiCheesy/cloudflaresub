@@ -342,8 +342,7 @@ cloudflaresub/
 │  ├─ _worker.js     # Pages 入口（与 src/worker.js 保持内容一致）
 │  └─ icons/         # 客户端图标
 ├─ src/
-│  ├─ worker.js      # 服务端源码（改代码改这里，再同步到 public/_worker.js）
-│  └─ core.js        # 解析 / 渲染核心函数（测试使用）
+│  └─ worker.js      # 服务端唯一实现（改代码改这里，再同步到 public/_worker.js）
 ├─ tests/            # 自动化测试
 ├─ wrangler.toml     # Pages 项目配置
 └─ package.json

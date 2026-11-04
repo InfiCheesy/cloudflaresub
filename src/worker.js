@@ -774,9 +774,9 @@ function parseVmess(link) {
     alpn: obj.alpn || '',
     fp: obj.fp || '',
     // The header-camouflage type and the insecure-cert flag used to
-    // be dropped here (core's parser keeps both): http-camouflage
-    // nodes were silently rewritten as plain ones, and self-signed
-    // VMess endpoints lost the flag every output format needs.
+    // be dropped here: http-camouflage nodes were silently rewritten
+    // as plain ones, and self-signed VMess endpoints lost the flag
+    // every output format needs.
     headerType: String(obj.type || ''),
     allowInsecure: obj.allowInsecure === true || obj.allowInsecure === 1
       || ['1', 'true'].includes(String(obj.allowInsecure || '').toLowerCase()),
@@ -910,7 +910,7 @@ function buildNodes(baseNodes, preferredEndpoints, options = {}) {
         server: ep.server,
         port: ep.port || node.port,
         // With keepOriginalHost off, host/sni used to be BLANKED.
-        // Core's rule (mirrored here) is subtler: a host/sni that is
+        // The rule instead: a host/sni that is
         // empty or merely repeats the origin server follows the
         // preferred endpoint instead; a DISTINCT one (a CDN front
         // domain) survives — it was never the origin's identity, and
@@ -1012,8 +1012,8 @@ function pushClashWsOpts(lines, node) {
 }
 
 // TLS-family options the links can carry and Clash understands. The
-// renderer used to drop all of them (core's copy emits them), which
-// silently degraded or broke nodes in Clash only.
+// renderer used to drop all of them, which silently degraded or
+// broke nodes in Clash only.
 function pushClashTlsExtras(lines, node) {
   if (node.allowInsecure) lines.push('    skip-cert-verify: true');
   if (node.fp) lines.push(`    client-fingerprint: "${escapeYaml(node.fp)}"`);

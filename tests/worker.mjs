@@ -514,7 +514,9 @@ console.log('worker tests passed');
     if (u === 'https://ips.example.com/list.txt') return new Response(txtList, { status: 200 });
     if (u === 'https://fcdn.example.com/ips.txt' || u === 'https://10.example.com/ips.txt') return new Response(txtList, { status: 200 });
     if (u === 'https://ips.example.com/redir') {
-      return { ok: true, status: 200, url: 'https://127.0.0.1/evil', headers: { get: () => null }, text: async () => txtList };
+      // A real 302: redirects are followed manually since round 18,
+      // so the hop is validated (and refused) before being fetched.
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/evil' } });
     }
     if (u === 'https://ips.example.com/list.json') return new Response(JSON.stringify(['104.16.5.5', '104.16.5.6:8443']), { status: 200 });
     if (u === 'https://ips.example.com/list.csv') return new Response('IP,port,colo\n104.16.7.7,443,HKG\n104.16.7.8,8443,SIN', { status: 200 });
@@ -2216,4 +2218,96 @@ console.log('worker tests passed');
   }
 
   console.log('audit round 17 suite: csv header gate, cname following, body cap, clash camouflage, paged-list reads, entry-cache stamps, options posture: passed');
+}
+
+// --- Audit round 18 suite: xhttp opts, profile-title header,
+// non-semver tag filtering, manual redirect validation ---
+{
+  const ADMIN = 'tok-0123456789abcdef';
+
+  // xhttp nodes carry path/host/mode into Clash.
+  {
+    const link = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@x.example.com:443?security=tls&type=xhttp&path=%2Fx&host=cdn.example.com&mode=stream-one#R18X';
+    const g = await generate({ nodeLinks: link, preferredIps: '198.51.100.70' });
+    const clash = await getSub(g.shortId, 'clash');
+    assert.ok(clash.body.includes('xhttp-opts:'), 'xhttp-opts emitted');
+    assert.ok(clash.body.includes('path: "/x"'), 'xhttp path preserved');
+    assert.ok(clash.body.includes('host: "cdn.example.com"'), 'xhttp host preserved');
+    assert.ok(clash.body.includes('mode: "stream-one"'), 'xhttp mode preserved');
+  }
+
+  // profile-title header rides alongside content-disposition.
+  {
+    const g = await generate({ nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@p.example.com:443?security=tls&type=ws&path=%2Fws#R18P', preferredIps: '198.51.100.71' });
+    await worker.fetch(new Request('https://x.pages.dev/api/note', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: ADMIN, id: g.shortId, note: '搬瓦工主力' }),
+    }), env);
+    const tok = new URLSearchParams(new URL(g.urls.auto).search).get('token');
+    const resp = await worker.fetch(new Request(`https://x.pages.dev/sub/${g.shortId}?token=${tok}`), env);
+    const expected = 'base64:' + Buffer.from('搬瓦工主力', 'utf8').toString('base64');
+    assert.equal(resp.headers.get('profile-title'), expected, 'profile-title carries the note as base64 utf8');
+    assert.ok(resp.headers.get('content-disposition').includes('filename*='), 'content-disposition still present');
+  }
+
+  // The version check ignores non-semver 'latest' tags.
+  {
+    const vStore = new Map();
+    const e = {
+      SUB_ACCESS_TOKEN: ADMIN,
+      SUB_STORE: {
+        async get(k) { return vStore.get(k)?.value ?? null; },
+        async put(k, v, o = {}) { vStore.set(k, { value: v, metadata: o.metadata }); },
+        async delete(k) { vStore.delete(k); },
+        async list() { return { keys: [], list_complete: true, cursor: '' }; },
+      },
+      ASSETS: { async fetch() { return new Response('HOME'); } },
+    };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('api.github.com')) {
+        return new Response(JSON.stringify({ tag_name: 'v2026.11.4-3', html_url: 'https://example.com/rel' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const v = await (await worker.fetch(new Request('https://x.pages.dev/api/version'), e)).json();
+      assert.equal(v.checkStatus, 'ok', 'a date-tagged latest release is a successful check');
+      assert.equal(v.latest, null, 'a date tag is not reported as the latest version');
+      assert.equal(v.updateAvailable, false, 'no bogus update for a date tag');
+      const v2 = await (await worker.fetch(new Request('https://x.pages.dev/api/version'), e)).json();
+      assert.equal(v2.checkStatus, 'ok', 'the ignored tag is cached, not refetched as a failure');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // Redirects are validated BEFORE the hop is fetched.
+  {
+    const fetched = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      fetched.push(u);
+      if (u === 'https://hop.example.com/start') return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/evil' } });
+      if (u === 'https://hop.example.com/good') return new Response(null, { status: 302, headers: { location: '/final.txt' } });
+      if (u === 'https://hop.example.com/final.txt') return new Response('104.16.40.1', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const bad = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: ADMIN, url: 'https://hop.example.com/start' }),
+      }), env);
+      assert.equal(bad.status, 400, 'a redirect to a private target is refused');
+      assert.ok(!fetched.some((u) => u.includes('127.0.0.1')), 'the private hop was never fetched');
+      const good = await (await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: ADMIN, url: 'https://hop.example.com/good' }),
+      }), env)).json();
+      assert.equal(good.ok, true, 'a legitimate relative redirect still works');
+      assert.equal(good.count, 1, 'the redirected list is parsed');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  console.log('audit round 18 suite: xhttp opts, profile-title, semver tag filter, manual redirects: passed');
 }

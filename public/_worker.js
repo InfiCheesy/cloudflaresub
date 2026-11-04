@@ -402,18 +402,33 @@ async function fetchIpSource(rawUrl) {
   const timer = setTimeout(() => ctrl.abort(), 5000);
   let text;
   try {
-    const resp = await fetch(url, {
-      signal: ctrl.signal,
-      redirect: 'follow',
-      headers: { 'user-agent': 'cloudflaresub (preferred-ip source)', accept: 'text/plain, application/json, */*' },
-    });
-    if (!resp.ok) throw new Error(`来源返回 HTTP ${resp.status}`);
-    // A redirect must not smuggle the fetch to an http or private
-    // target the original URL check would have rejected.
-    if (resp.url) {
-      assertSourceUrl(resp.url);
-      await assertSourceHostResolvesPublic(new URL(resp.url).hostname);
+    // Redirects are followed MANUALLY, one validated hop at a
+    // time: with redirect:'follow' the runtime completed the whole
+    // chain — including a smuggled http or private hop — before
+    // any check could run on the final URL, so a bad target WAS
+    // contacted even though its content was then discarded. Here
+    // every hop passes the same gates as the original URL BEFORE
+    // it is requested.
+    let current = url;
+    let resp = null;
+    for (let hop = 0; ; hop++) {
+      resp = await fetch(current, {
+        signal: ctrl.signal,
+        redirect: 'manual',
+        headers: { 'user-agent': 'cloudflaresub (preferred-ip source)', accept: 'text/plain, application/json, */*' },
+      });
+      const location = resp.headers.get('location');
+      if (resp.status >= 300 && resp.status < 400 && location) {
+        if (hop >= 5) throw new Error('来源重定向次数过多');
+        const target = new URL(location, current).toString();
+        assertSourceUrl(target);
+        await assertSourceHostResolvesPublic(new URL(target).hostname);
+        current = target;
+        continue;
+      }
+      break;
     }
+    if (!resp.ok) throw new Error(`来源返回 HTTP ${resp.status}`);
     // The body read stays inside the abort window: a slow-drip source
     // cannot hold a /sub refresh open past the same 5 seconds.
     text = await readBodyCapped(resp);
@@ -710,6 +725,9 @@ async function getLatestRelease(env, forceRetry = false) {
       };
     }
   } else if (cached) {
+    if (cached.ignoredTag && now - lastAttempt < VERSION_NEGATIVE_MS) {
+      return { tag: null, url: null, checkedAt: cached.checkedAt || null, status: 'ok' };
+    }
     const retryAfter = forceRetry ? VERSION_RETRY_MS : VERSION_NEGATIVE_MS;
     if (now - lastAttempt < retryAfter) {
       return { tag: null, url: null, checkedAt: null, status: 'failed' };
@@ -733,6 +751,18 @@ async function getLatestRelease(env, forceRetry = false) {
     const data = await resp.json();
     const tag = String(data.tag_name || '').replace(/^v/, '');
     if (!tag) throw new Error('GitHub response has no tag_name');
+    if (!/^\d+\.\d+\.\d+$/.test(tag)) {
+      // Not a version-shaped tag: the release workflow's manual
+      // dispatch channel tags its test builds v<YYYY.MM.DD>-<run>,
+      // which compareVersions would rank above every real release
+      // and make every deployed site cry 'update' at a test build.
+      // The check SUCCEEDED — there is simply no applicable
+      // release. Cache the ignored tag so GitHub is not refetched
+      // on every page load while it stays the latest release.
+      const ignored = { tag: '', ignoredTag: tag, checkedAt: now, lastAttempt: now };
+      try { await env.SUB_STORE.put(VERSION_CACHE_KEY, JSON.stringify(ignored)); } catch {}
+      return { tag: null, url: null, checkedAt: now, status: 'ok' };
+    }
     const fresh = {
       tag,
       url: data.html_url || `https://github.com/${UPDATE_REPO}/releases`,
@@ -1052,6 +1082,21 @@ function pushClashTlsExtras(lines, node) {
   }
 }
 
+function pushClashXhttpOpts(lines, node) {
+  if ((node.network || '') !== 'xhttp') return;
+  // mihomo's xhttp transport reads path/host/mode from xhttp-opts;
+  // emitting the node as bare network: "xhttp" silently dropped all
+  // three, and path-gated xhttp endpoints (the common deployment)
+  // then handshook against the root path. The mode lives in the
+  // link's params (the parser does not model it as a node field).
+  const params = node.params || {};
+  lines.push('    xhttp-opts:');
+  lines.push(`      path: "${escapeYaml(node.path || '/')}"`);
+  if (node.host) lines.push(`      host: "${escapeYaml(node.host)}"`);
+  const mode = node.mode || params.mode || '';
+  if (mode) lines.push(`      mode: "${escapeYaml(mode)}"`);
+}
+
 function pushClashGrpcOpts(lines, node) {
   if ((node.network || '') !== 'grpc') return;
   // VMess links carry the grpc service name in `path` (the v2ray
@@ -1179,6 +1224,7 @@ function renderClash(nodes) {
         pushClashGrpcOpts(lines, node);
         if (node.network === 'h2') pushClashH2Opts(lines, node);
         else if (node.network === 'http') pushClashHttpOpts(lines, node);
+        pushClashXhttpOpts(lines, node);
         if (node.tls) pushClashTlsExtras(lines, node);
 
         return lines.join('\n');
@@ -2079,7 +2125,10 @@ async function checkAdmin(request, env, url, body, flavor) {
   while (adminFailureTimes.length && now - adminFailureTimes[0] > ADMIN_FAIL_WINDOW_MS) {
     adminFailureTimes.shift();
   }
-  adminFailureTimes.push(now);
+  // Capped: once the throttle is tripped, more samples change
+  // nothing, and an uncapped array would grow by one entry per
+  // wrong guess for as long as someone keeps guessing.
+  if (adminFailureTimes.length < ADMIN_FAIL_LIMIT) adminFailureTimes.push(now);
   if (adminFailureTimes.length >= ADMIN_FAIL_LIMIT) {
     return json({ ok: false, error: '管理令牌错误次数过多，已暂时拒绝继续尝试，请 5 分钟后再试（正确令牌不受影响）' }, 429);
   }
@@ -2774,6 +2823,11 @@ async function handleSub(request, env, url) {
     .slice(0, 60) || `sub-${id}`;
   subHeaders['content-disposition'] =
     `attachment; filename="${asciiFallback}.${profileExt}"; filename*=UTF-8''${encodeURIComponent(`${profileName}.${profileExt}`)}`;
+  // A whole family of clients (Shadowrocket, Stash, Surge) reads the
+  // profile name from the profile-title HEADER and never looks at
+  // content-disposition; the base64: form is the agreed
+  // Unicode-safe encoding for it.
+  subHeaders['profile-title'] = `base64:${b64EncodeUtf8(profileName)}`;
   if (target === 'plain' || target === 'links' || target === 'text') {
     return text(renderPlain(nodes), 200, 'text/plain; charset=utf-8', subHeaders);
   }

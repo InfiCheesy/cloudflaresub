@@ -23,6 +23,25 @@ jobs:
       - name: 拉取代码
         uses: actions/checkout@v4
 
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 跑测试（不过不发版）
+        run: npm run check
+
+      - name: 校验两个 worker 文件一致（测试测 src、部署用 public/_worker.js）
+        run: cmp src/worker.js public/_worker.js
+
+      - name: 校验版本号与标签一致（手动触发的日期版本除外）
+        if: github.ref_type == 'tag'
+        run: |
+          app_version=$(grep -o "const APP_VERSION = '[^']*'" src/worker.js | head -1 | cut -d"'" -f2)
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "APP_VERSION=$app_version tag=$tag_version"
+          test "$app_version" = "$tag_version"
+
       - name: 制作直传扁平包（public 里的文件摊平到 zip 根目录）
         run: |
           cd public
@@ -54,3 +73,10 @@ jobs:
           下载说明：
           - **在 Cloudflare Pages 里直接上传部署** → 下载 \`cloudflaresub-pages-upload.zip\`，不用解压、整个 zip 直接拖进 Pages 的上传框即可（部署步骤见仓库 README 的方式 A）
           - **连接 GitHub 自动部署 / 保存源码** → 用仓库代码即可，或下载 \`cloudflaresub-pages.zip\` 整仓库包"
+
+      - name: 生成校验和并补挂到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum cloudflaresub-pages-upload.zip cloudflaresub-pages.zip > SHA256SUMS.txt
+          gh release upload "${{ steps.ver.outputs.tag }}" SHA256SUMS.txt

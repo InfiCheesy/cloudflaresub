@@ -24,7 +24,13 @@ function text(body, status = 200, contentType = 'text/plain; charset=utf-8', ext
     status,
     headers: {
       'content-type': contentType,
-      'access-control-allow-origin': '*',
+      // No CORS wildcard and no caching: text() carries subscription
+      // bodies, which ARE node credentials. Subscription clients do
+      // not run CORS, so the wildcard only ever helped a web page
+      // that somehow obtained a link read it cross-origin, and a
+      // cacheable 200 could leave credentials sitting in a browser
+      // or intermediary cache. (json() has always been no-store.)
+      'cache-control': 'no-store',
       'x-content-type-options': 'nosniff',
       ...extraHeaders,
     },
@@ -218,21 +224,42 @@ function assertSourceUrl(raw) {
 }
 
 function extractEndpointTokens(text) {
-  // One candidate endpoint per line, however the source formats it:
-  // plain txt, CSV speed-test results (endpoint in the first cell), or
-  // stray text around the addresses. A CSV's separate port column is
-  // not picked up — endpoints fall back to the node's own port.
+  // Candidate endpoints per line, however the source formats it:
+  // plain txt, CSV speed-test results (endpoint in the first cell,
+  // port in the second), or stray text around the addresses. Every
+  // match on a line counts — a line like "1.1.1.1, 2.2.2.2" carries
+  // two endpoints, and silently keeping only the first wasted the
+  // rest of the list the owner pasted.
   const tokens = [];
-  const re = /\[([0-9a-fA-F:]+)\](?::(\d{1,5}))?|(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?|\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})(?::(\d{1,5}))?/;
+  const re = /\[([0-9a-fA-F:]+)\](?::(\d{1,5}))?|(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?|\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})(?::(\d{1,5}))?/g;
   const lines = String(text).split(/\r?\n/);
   for (let i = 0; i < lines.length && i < 20000 && tokens.length < 2000; i++) {
     // An endpoint is short; matching only a line's head bounds the regex
     // work a hostile or broken source can make us do per line.
-    const m = lines[i].slice(0, 600).match(re);
-    if (!m) continue;
-    if (m[1]) tokens.push(m[2] ? `[${m[1]}]:${m[2]}` : m[1]);
-    else if (m[3]) tokens.push(m[4] ? `${m[3]}:${m[4]}` : m[3]);
-    else if (m[5]) tokens.push(m[6] ? `${m[5]}:${m[6]}` : m[5]);
+    const line = lines[i].slice(0, 600);
+    // CSV speed-test tables put the port in its own column
+    // ("104.16.7.7,443,HKG"): when the first cell is an endpoint
+    // without an explicit port and the second cell is a bare port,
+    // that port belongs to the endpoint — dialing the node's own
+    // port instead made such sources silently wrong.
+    const cells = line.split(',');
+    if (cells.length > 1) {
+      const first = cells[0].trim();
+      const second = (cells[1] || '').trim();
+      if (first && /^\d{1,5}$/.test(second) && !/[:\]]$/.test(first) && !first.includes(':')) {
+        const m = first.match(/^(\[[0-9a-fA-F:]+\]|\d{1,3}(?:\.\d{1,3}){3}|(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})$/);
+        if (m) {
+          tokens.push(`${first}:${second}`);
+          continue;
+        }
+      }
+    }
+    for (const m of line.matchAll(re)) {
+      if (m[1]) tokens.push(m[2] ? `[${m[1]}]:${m[2]}` : m[1]);
+      else if (m[3]) tokens.push(m[4] ? `${m[3]}:${m[4]}` : m[3]);
+      else if (m[5]) tokens.push(m[6] ? `${m[5]}:${m[6]}` : m[5]);
+      if (tokens.length >= 2000) break;
+    }
   }
   return tokens;
 }
@@ -295,8 +322,62 @@ async function readBodyCapped(resp) {
   return out;
 }
 
+// Is a resolved IP address (from a DNS answer) in a private,
+// loopback, link-local or otherwise non-public range? Mirrors the
+// literal checks in assertSourceUrl, applied to addresses a source
+// hostname RESOLVES to — the literal check alone cannot see those.
+function ipAddressIsPrivate(addr) {
+  const a = String(addr || '').toLowerCase();
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(a)) {
+    return /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(a);
+  }
+  if (a.startsWith('::ffff:')) {
+    const tail = a.slice('::ffff:'.length);
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(tail)) return ipAddressIsPrivate(tail);
+    const m = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
+    if (m) {
+      const v4 = `${parseInt(m[1], 16) >> 8}.${parseInt(m[1], 16) & 255}.${parseInt(m[2], 16) >> 8}.${parseInt(m[2], 16) & 255}`;
+      return ipAddressIsPrivate(v4);
+    }
+  }
+  return a === '::1' || a === '::'
+    || /^f[cd][0-9a-f]{2}:/.test(a)
+    || /^fe[89ab][0-9a-f]:/.test(a);
+}
+
+// A source hostname must not resolve to a non-public address: the
+// literal checks in assertSourceUrl only see the hostname string, so
+// a domain pointed (or rebound) at an internal address would sail
+// through. Resolve via DNS-over-HTTPS and refuse when ANY answer is
+// private. A resolver failure does not block the fetch — the literal
+// checks and the platform fetcher remain as backstops, and source
+// availability should not hinge on a third-party resolver being up.
+async function assertSourceHostResolvesPublic(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || host.includes(':') || /^(\d{1,3}\.){3}\d{1,3}$/.test(host)) return;
+  let answers = [];
+  try {
+    const query = async (type, typeNum) => {
+      const u = 'https://cloudflare-dns.com/dns-query?' + new URLSearchParams({ name: host, type });
+      const r = await fetch(u, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(3000) });
+      if (!r.ok) return [];
+      const j = await r.json();
+      return (Array.isArray(j.Answer) ? j.Answer : [])
+        .filter((a) => a && a.type === typeNum && typeof a.data === 'string')
+        .map((a) => a.data);
+    };
+    answers = [...(await query('A', 1)), ...(await query('AAAA', 28))];
+  } catch {
+    return;
+  }
+  if (answers.some((a) => ipAddressIsPrivate(a))) {
+    throw new Error('来源域名解析到了内网地址，已拒绝');
+  }
+}
+
 async function fetchIpSource(rawUrl) {
   const url = assertSourceUrl(rawUrl);
+  await assertSourceHostResolvesPublic(new URL(url).hostname);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 5000);
   let text;
@@ -309,7 +390,10 @@ async function fetchIpSource(rawUrl) {
     if (!resp.ok) throw new Error(`来源返回 HTTP ${resp.status}`);
     // A redirect must not smuggle the fetch to an http or private
     // target the original URL check would have rejected.
-    if (resp.url) assertSourceUrl(resp.url);
+    if (resp.url) {
+      assertSourceUrl(resp.url);
+      await assertSourceHostResolvesPublic(new URL(resp.url).hostname);
+    }
     // The body read stays inside the abort window: a slow-drip source
     // cannot hold a /sub refresh open past the same 5 seconds.
     text = await readBodyCapped(resp);
@@ -338,7 +422,11 @@ async function fetchIpSource(rawUrl) {
   const seen = new Set();
   const endpoints = [];
   for (const ep of parsed) {
-    if (ep.badPort || !ep.server) continue;
+    // Source-derived endpoints get the same plausibility gate as
+    // hand-typed literals: the token regex accepts 999.999.999.999
+    // as an "IPv4" address, and without this check such garbage
+    // occupies per-source limit slots and lands in subscriptions.
+    if (ep.badPort || !ep.server || !isPlausibleHost(ep.server)) continue;
     const key = `${ep.server}:${ep.port ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -509,7 +597,12 @@ async function resolveDynamicEndpointsFresh(env, record) {
       merged.push(ep);
     };
     (Array.isArray(dyn.literals) ? dyn.literals : []).forEach(push);
-    for (const src of dyn.sources) {
+    // Sources resolve in PARALLEL (generation already did): fetching
+    // serially made a 5-source entry's refresh cost the SUM of the
+    // sources' latencies — 5 slow sources x the 5s timeout could
+    // hold a /sub pull open for 25s+. Results merge in source order
+    // regardless of completion order.
+    const perSource = await Promise.all(dyn.sources.map(async (src) => {
       let eps = null;
       try {
         const { endpoints } = await getSourceEndpoints(env, src.url);
@@ -517,8 +610,9 @@ async function resolveDynamicEndpointsFresh(env, record) {
         if (sliced.length) eps = sliced;
       } catch {}
       if (!eps && Array.isArray(src.endpoints)) eps = src.endpoints.slice(0, limit);
-      (eps || []).forEach(push);
-    }
+      return eps || [];
+    }));
+    perSource.forEach((eps) => eps.forEach(push));
     if (merged.length) return merged;
     const snapshot = Array.isArray(dyn.endpoints) ? dyn.endpoints : [];
     return snapshot.length ? snapshot : null;
@@ -594,7 +688,16 @@ async function getLatestRelease(env, forceRetry = false) {
   }
   try {
     const resp = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
-      headers: { 'user-agent': 'cloudflaresub (update check)', accept: 'application/vnd.github+json' },
+      headers: {
+        'user-agent': 'cloudflaresub (update check)',
+        accept: 'application/vnd.github+json',
+        // Unauthenticated GitHub API calls share a tight per-IP rate
+        // limit, and Workers egress IPs are shared with everyone: on
+        // a busy egress the update check used to fail spuriously.
+        // Setting the optional GITHUB_TOKEN secret (any token with
+        // public read access) raises the ceiling for this site.
+        ...(env.GITHUB_TOKEN ? { authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+      },
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) throw new Error(`GitHub HTTP ${resp.status}`);
@@ -670,6 +773,13 @@ function parseVmess(link) {
     sni: obj.sni || obj.host || '',
     alpn: obj.alpn || '',
     fp: obj.fp || '',
+    // The header-camouflage type and the insecure-cert flag used to
+    // be dropped here (core's parser keeps both): http-camouflage
+    // nodes were silently rewritten as plain ones, and self-signed
+    // VMess endpoints lost the flag every output format needs.
+    headerType: String(obj.type || ''),
+    allowInsecure: obj.allowInsecure === true || obj.allowInsecure === 1
+      || ['1', 'true'].includes(String(obj.allowInsecure || '').toLowerCase()),
   };
 }
 
@@ -799,8 +909,18 @@ function buildNodes(baseNodes, preferredEndpoints, options = {}) {
         name: nameParts.join(' | ').replace(/[\r\n]+/g, ' '),
         server: ep.server,
         port: ep.port || node.port,
-        host: options.keepOriginalHost ? node.host : '',
-        sni: options.keepOriginalHost ? node.sni : '',
+        // With keepOriginalHost off, host/sni used to be BLANKED.
+        // Core's rule (mirrored here) is subtler: a host/sni that is
+        // empty or merely repeats the origin server follows the
+        // preferred endpoint instead; a DISTINCT one (a CDN front
+        // domain) survives — it was never the origin's identity, and
+        // blanking it stranded exactly the nodes that needed it.
+        host: options.keepOriginalHost
+          ? node.host
+          : (!node.host || node.host === node.server ? ep.server : node.host),
+        sni: options.keepOriginalHost
+          ? node.sni
+          : (!node.sni || node.sni === node.server ? ep.server : node.sni),
       });
     }
   }
@@ -817,13 +937,14 @@ function encodeVmess(node) {
     aid: String(node.alterId ?? 0),
     scy: node.cipher || 'auto',
     net: node.network || 'tcp',
-    type: 'none',
+    type: node.headerType || 'none',
     host: node.host || '',
     path: node.path || '/',
     tls: node.tls ? 'tls' : '',
     sni: node.sni || '',
     alpn: node.alpn || '',
     fp: node.fp || '',
+    ...(node.allowInsecure ? { allowInsecure: true } : {}),
   };
   return 'vmess://' + b64EncodeUtf8(JSON.stringify(obj));
 }
@@ -880,12 +1001,14 @@ function renderRaw(nodes) {
 }
 
 function pushClashWsOpts(lines, node) {
-  lines.push(
-    `    ws-opts:`,
-    `      path: "${escapeYaml(node.path || '/')}"`,
-    `      headers:`,
-    `        Host: "${escapeYaml(node.host || node.sni || '')}"`
-  );
+  lines.push('    ws-opts:', `      path: "${escapeYaml(node.path || '/')}"`);
+  const host = node.host || node.sni || '';
+  // An explicitly empty Host header is worse than none — servers
+  // may reject it, and mihomo reads a missing headers block as "no
+  // override". The h2/http emitters already guard this way.
+  if (host) {
+    lines.push('      headers:', `        Host: "${escapeYaml(host)}"`);
+  }
 }
 
 // TLS-family options the links can carry and Clash understands. The
@@ -997,10 +1120,11 @@ function renderClash(nodes) {
           lines.push(`    servername: "${escapeYaml(node.sni)}"`);
         }
 
-        if (node.flow && node.tls) {
-          // flow (XTLS Vision) only exists over TLS/REALITY: emitting
-          // it for a plaintext node produces a combination mihomo
-          // rejects, taking the whole profile down with it.
+        if (node.flow && node.tls && (node.network || 'tcp') === 'tcp') {
+          // flow (XTLS Vision) only exists over TLS/REALITY on a raw
+          // TCP connection: emitting it for a plaintext node — or
+          // paired with ws/grpc transport — produces a combination
+          // mihomo rejects, taking the whole profile down with it.
           lines.push(`    flow: "${escapeYaml(node.flow)}"`);
         }
 
@@ -1170,11 +1294,11 @@ function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
         // nodes as ws nodes (with the grpc service name, which lives
         // in path, stuffed into ws-path).
         const wsPart = (node.network || 'tcp') === 'ws'
-          ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}`
+          ? `, ws=true, ws-path=${surgeField(node.path || '/')}${node.host ? `, ws-headers=Host:${surgeField(node.host)}` : ''}`
           : '';
-        return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}, vmess-aead=${node.alterId ? 'false' : 'true'}${wsPart}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}`;
+        return `${surgeName(node.name)} = vmess, ${surgeField(node.server)}, ${surgeField(node.port)}, username=${surgeField(node.uuid)}, vmess-aead=${node.alterId ? 'false' : 'true'}${wsPart}, tls=${node.tls ? 'true' : 'false'}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`;
       }
-      return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}${(node.network || '') === 'ws' ? `, ws=true, ws-path=${surgeField(node.path || '/')}, ws-headers=Host:${surgeField(node.host || '')}` : ''}`;
+      return `${surgeName(node.name)} = trojan, ${surgeField(node.server)}, ${surgeField(node.port)}, password=${surgeField(node.password || '')}, sni=${surgeField(node.sni || '')}, skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}${(node.network || '') === 'ws' ? `, ws=true, ws-path=${surgeField(node.path || '/')}${node.host ? `, ws-headers=Host:${surgeField(node.host)}` : ''}` : ''}`;
     });
 
   // The MANAGED-CONFIG first line is what makes Surge treat the
@@ -1208,10 +1332,19 @@ function renderSurge(nodes, baseUrl, linkToken, intervalSec = 86400) {
 
 function createShortId(length = 10) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  // Rejection sampling: 256 is not a multiple of the alphabet size,
+  // so a bare modulo would favour the first (256 % len) symbols.
+  // Draw with headroom and keep only bytes below the largest
+  // multiple of the alphabet size that fits in a byte.
+  const limit = Math.floor(256 / chars.length) * chars.length;
   let out = '';
-  for (let i = 0; i < length; i++) {
-    out += chars[bytes[i] % chars.length];
+  while (out.length < length) {
+    const bytes = crypto.getRandomValues(new Uint8Array(length * 2));
+    for (const b of bytes) {
+      if (b >= limit) continue;
+      out += chars[b % chars.length];
+      if (out.length === length) break;
+    }
   }
   return out;
 }
@@ -1418,10 +1551,21 @@ function remainingTtl(record) {
 // human-readable `note:<remark>:<id>` pointer key so the owner can tell
 // entries apart at a glance in the Cloudflare KV browser, where only
 // key names are visible in the list.
+const MAX_RECORD_BYTES = 24 * 1024 * 1024;
+
 async function putRecord(env, id, record, prevNote = undefined, ttlSeconds = undefined) {
+  const serialized = JSON.stringify(record);
+  // The node-count cap cannot see bytes: long parameters replicate
+  // into every expanded node, so a record can still outgrow KV's
+  // 25MB value limit and die as a platform error nobody can act on.
+  // Refuse here with the actual size; generation maps it to a 400.
+  const bytes = utf8ByteLength(serialized);
+  if (bytes > MAX_RECORD_BYTES) {
+    throw new Error(`记录体积过大（约 ${(bytes / 1048576).toFixed(1)} MB，上限 ${(MAX_RECORD_BYTES / 1048576).toFixed(0)} MB）`);
+  }
   const opts = { metadata: buildRecordMetadata(record) };
   if (ttlSeconds) opts.expirationTtl = ttlSeconds;
-  await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(record), opts);
+  await env.SUB_STORE.put(`sub:${id}`, serialized, opts);
   if (prevNote && prevNote !== record.note) {
     await env.SUB_STORE.delete(notePointerKey(prevNote, id));
   }
@@ -1435,6 +1579,17 @@ async function putRecord(env, id, record, prevNote = undefined, ttlSeconds = und
 }
 
 async function handleGenerate(request, env, url) {
+  try {
+    return await handleGenerateBody(request, env, url);
+  } catch (e) {
+    if (e && typeof e.message === 'string' && e.message.startsWith('记录体积过大')) {
+      return json({ ok: false, error: `${e.message}。请减少节点数量或优选地址数量。` }, 400);
+    }
+    throw e;
+  }
+}
+
+async function handleGenerateBody(request, env, url) {
   if (!env.SUB_STORE) {
     return json({ ok: false, error: '服务端未绑定 KV：请在 Pages 项目 Settings -> Bindings 中添加 KV namespace，变量名必须为 SUB_STORE，然后重新部署' }, 500);
   }
@@ -1445,16 +1600,13 @@ async function handleGenerate(request, env, url) {
     return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
   }
 
-  // Generating writes to KV, so once an admin token exists it is required
-  // here too — otherwise anyone who finds the page could fill the store
-  // and burn the KV write quota. The page sends the same token the owner
-  // already keeps in the admin section's token box.
-  if (env.SUB_ACCESS_TOKEN) {
-    const denied = await checkAdmin(request, env, url, body);
-    if (denied) {
-      return json({ ok: false, error: '生成订阅需要管理令牌：请先在页面下方「KV 条目管理」处填入 SUB_ACCESS_TOKEN（生成与管理共用同一个令牌）' }, 403);
-    }
-  }
+  // Generating writes to KV, so it sits behind the same gate as the
+  // admin endpoints — including when no token is configured at all.
+  // An unset token used to leave generation wide open during exactly
+  // the setup window where forgetting the secret is easiest (the
+  // admin endpoints already failed closed; generation did not).
+  const denied = await checkAdmin(request, env, url, body, 'generate');
+  if (denied) return denied;
   // Cap the name prefix before it reaches the dedup hash and every node
   // name, so an oversized prefix cannot bloat records or outputs.
   body.namePrefix = String(body.namePrefix || '').trim().slice(0, 100);
@@ -1494,6 +1646,7 @@ async function handleGenerate(request, env, url) {
   }
   const literalEndpoints = [];
   const invalidLiteralLines = [];
+  const seenLiteralEp = new Set();
   for (const litLine of mixed.literals) {
     const ep = parsePreferredEndpoints(litLine)[0];
     if (!ep) continue;
@@ -1501,6 +1654,9 @@ async function handleGenerate(request, env, url) {
       invalidLiteralLines.push(litLine);
       continue;
     }
+    const key = `${ep.server}:${ep.port ?? ''}`;
+    if (seenLiteralEp.has(key)) continue;
+    seenLiteralEp.add(key);
     literalEndpoints.push(ep);
   }
   if (literalEndpoints.some((ep) => ep.badPort)) {
@@ -1521,9 +1677,8 @@ async function handleGenerate(request, env, url) {
   }));
   const resultByUrl = new Map(sourceResults.map((r) => [r.url, r]));
   // Merge in box order: literal lines stay in place, source lines
-  // expand to their (limited) list. Source endpoints dedupe against
-  // everything already emitted (first occurrence wins, like the source
-  // adapter itself); literal lines keep the old no-dedupe behaviour.
+  // expand to their (limited) list. Every endpoint dedupes against
+  // everything already emitted (first occurrence wins).
   const preferredEndpoints = [];
   const seenEp = new Set();
   const epKey = (ep) => `${ep.server}:${ep.port ?? ''}`;
@@ -1543,6 +1698,11 @@ async function handleGenerate(request, env, url) {
     } else {
       const ep = parsePreferredEndpoints(line.text)[0];
       if (!ep || !isPlausibleHost(ep.server)) continue;
+      // Literal lines dedupe like everything else (first occurrence
+      // wins): the README has always promised this, but the literal
+      // branch never checked the seen set, so an address pasted
+      // three times produced three identical nodes.
+      if (seenEp.has(epKey(ep))) continue;
       seenEp.add(epKey(ep));
       preferredEndpoints.push(ep);
     }
@@ -1660,6 +1820,7 @@ async function handleGenerate(request, env, url) {
       tags: providedTags || [],
       storage: retention.storage,
       dedupHash,
+      linkToken: newLinkToken(),
       sources,
       options,
       inputs,
@@ -1700,6 +1861,13 @@ async function handleGenerate(request, env, url) {
         record.baseNodes = baseNodes;
         record.inputs = inputs;
         record.nodes = nodes;
+      } else {
+        // A static hit refreshes the stored nodes too: the generate
+        // response renders THIS request's expansion, and serving the
+        // previously stored order from /sub made the two disagree —
+        // the same links re-pasted in a different order previewed
+        // one name assignment and served another.
+        record.nodes = nodes;
       }
       // The retention picked this time replaces the previous plan, and the
       // countdown restarts from now.
@@ -1707,6 +1875,10 @@ async function handleGenerate(request, env, url) {
       record.updatedAt = new Date().toISOString();
       const ttl = applyRetention(record, Date.now());
       await putRecord(env, id, record, prevNote, ttl);
+      // The entry was just rewritten: its merged /sub cache must not
+      // keep serving the pre-regeneration endpoints for the rest of
+      // its 10-minute window.
+      await env.SUB_STORE.delete(`entrycache:${id}`);
       await env.SUB_STORE.put(dedupKey, id, ttl ? { expirationTtl: ttl } : {});
     } else {
       record = {
@@ -1716,6 +1888,7 @@ async function handleGenerate(request, env, url) {
         tags: providedTags || [],
         storage: retention.storage,
         dedupHash,
+        linkToken: newLinkToken(),
         sources,
         options,
         inputs,
@@ -1724,6 +1897,7 @@ async function handleGenerate(request, env, url) {
       };
       const ttl = applyRetention(record, Date.now());
       await putRecord(env, id, record, undefined, ttl);
+      await env.SUB_STORE.delete(`entrycache:${id}`);
       // The record was gone but its dedup key survived (KV reaped one
       // and not the other): the healed record just got a fresh TTL,
       // so renew the dedup key on the same clock — otherwise the key
@@ -1734,8 +1908,7 @@ async function handleGenerate(request, env, url) {
   }
 
   const origin = url.origin;
-  const accessToken = env.SUB_ACCESS_TOKEN || '';
-  const linkToken = await linkTokenFor(id, env);
+  const linkToken = await effectiveLinkToken(id, env, record);
   const withToken = (target) => {
     const q = new URLSearchParams();
     if (target) q.set('target', target);
@@ -1789,7 +1962,6 @@ async function handleGenerate(request, env, url) {
         }
       : null,
     warnings: [
-      ...(accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。']),
       ...(skippedLines > 0 ? [`有 ${skippedLines} 行节点链接无法解析或端口不可用，已跳过。`] : []),
       ...(invalidLiteralLines.length
         ? [`有 ${invalidLiteralLines.length} 行优选地址不是合法的 IP 或域名，已跳过（例如「${invalidLiteralLines[0].slice(0, 40)}」；若它其实是来源链接，请以 https:// 开头）。`]
@@ -1831,10 +2003,35 @@ async function safeEqual(a, b) {
   return diff === 0;
 }
 
-async function checkAdmin(request, env, url, body) {
+// The admin token guards every stored subscription at once, and a
+// weak one can be brute-forced OFFLINE against a legacy entry's
+// derived link token (an HMAC anyone can recompute for a guessed
+// token) — so the token carries a hard length floor. Repeated wrong
+// guesses also lock the admin surface for a cooldown instead of
+// being merely logged: per-isolate state, so it is a brake, not a
+// wall, but online guessing of a 16+ character token was never the
+// realistic path anyway.
+const ADMIN_TOKEN_MIN_LENGTH = 16;
+const ADMIN_FAIL_WINDOW_MS = 10 * 60 * 1000;
+const ADMIN_FAIL_LIMIT = 20;
+const ADMIN_LOCKOUT_MS = 5 * 60 * 1000;
+const adminFailureTimes = [];
+
+async function checkAdmin(request, env, url, body, flavor) {
   const expected = env.SUB_ACCESS_TOKEN;
   if (!expected) {
     return json({ ok: false, error: '未设置 SUB_ACCESS_TOKEN，出于安全原因管理接口已禁用，请先在 Pages 项目里设置该 Secret' }, 403);
+  }
+  if (expected.length < ADMIN_TOKEN_MIN_LENGTH) {
+    return json({ ok: false, error: `SUB_ACCESS_TOKEN 太短（当前 ${expected.length} 个字符，至少需要 ${ADMIN_TOKEN_MIN_LENGTH} 个）：弱令牌可被离线破解，请在 Pages 项目里换一个更长的随机令牌后重新部署` }, 403);
+  }
+  const now = Date.now();
+  while (adminFailureTimes.length && now - adminFailureTimes[0] > ADMIN_FAIL_WINDOW_MS) {
+    adminFailureTimes.shift();
+  }
+  if (adminFailureTimes.length >= ADMIN_FAIL_LIMIT
+    && now - adminFailureTimes[adminFailureTimes.length - 1] < ADMIN_LOCKOUT_MS) {
+    return json({ ok: false, error: '管理令牌已连续多次输错，管理接口暂时锁定，请 5 分钟后再试' }, 429);
   }
   // Body field or the dedicated header only — never the URL query, so the
   // admin token stays out of browser history, proxy logs and referrers.
@@ -1843,8 +2040,13 @@ async function checkAdmin(request, env, url, body) {
     request.headers.get('x-admin-token') ||
     '';
   if (!(await safeEqual(provided, expected))) {
+    adminFailureTimes.push(now);
+    if (flavor === 'generate') {
+      return json({ ok: false, error: '生成订阅需要管理令牌：请先在页面下方「KV 条目管理」处填入 SUB_ACCESS_TOKEN（生成与管理共用同一个令牌）' }, 403);
+    }
     return json({ ok: false, error: '管理令牌不正确' }, 403);
   }
+  adminFailureTimes.length = 0;
   return null;
 }
 
@@ -1882,13 +2084,14 @@ async function buildListItem(env, key) {
     item.storage = rec.storage || { mode: 'permanent' };
     item.dynamic = !!rec.dynamic;
     if (rec.dynamic && rec.dynamic.sourceUrl) item.sourceUrl = rec.dynamic.sourceUrl;
+    if (typeof rec.linkToken === 'string' && rec.linkToken) item.linkToken = rec.linkToken;
     if (rec.dynamic) {
       item.sourceCount = Array.isArray(rec.dynamic.sources)
         ? rec.dynamic.sources.length
         : (rec.dynamic.sourceUrl ? 1 : 0);
     }
   } catch {}
-  item.linkToken = await linkTokenFor(id, env);
+  item.linkToken = item.linkToken || await linkTokenFor(id, env);
   return item;
 }
 
@@ -1917,7 +2120,19 @@ async function handleList(request, env, url) {
   } while (cursor);
 
   items.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-  return json({ ok: true, count: items.length, items });
+  // Optional server-side paging for API consumers: the admin page
+  // still loads the full set (its search/sort/filter run client-side
+  // over everything, with the rendered rows capped separately), but
+  // a script no longer has to pull every record body to see a slice.
+  const total = items.length;
+  const offsetRaw = Number(url.searchParams.get('offset'));
+  const limitRaw = Number(url.searchParams.get('limit'));
+  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.trunc(offsetRaw) : 0;
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(5000, Math.trunc(limitRaw)) : null;
+  const pageItems = limit === null && offset === 0
+    ? items
+    : items.slice(offset, limit === null ? undefined : offset + limit);
+  return json({ ok: true, count: total, total, offset, limit, items: pageItems });
 }
 
 // ---- Form backfill -------------------------------------------------------
@@ -2056,7 +2271,7 @@ async function handleEntry(request, env, url) {
     tags: sanitizeTags(record.tags),
     createdAt: record.createdAt || null,
     storage: record.storage || { mode: 'permanent' },
-    linkToken: await linkTokenFor(id, env),
+    linkToken: await effectiveLinkToken(id, env, record),
     backfill: buildBackfill(record),
   });
 }
@@ -2336,11 +2551,29 @@ async function handleDelete(request, env) {
 }
 
 // ---- Per-entry subscription link tokens -----------------------------------
-// A subscription link is meant to be shared, so it must never carry the
-// admin secret. Instead the /sub token is an HMAC of the entry id keyed
-// by SUB_ACCESS_TOKEN: it opens exactly that one subscription, is
-// rejected by every admin endpoint, and cannot open other entries.
-// Rotating SUB_ACCESS_TOKEN invalidates all outstanding link tokens.
+// A subscription link is meant to be shared, so it must never carry
+// the admin secret — and it must not be DERIVABLE from it either:
+// an HMAC keyed by the admin token lets anyone holding one link
+// test guesses at that token offline, at full speed, forever.
+// Entries minted by current builds therefore carry their own random
+// link token, stored on the record and compared directly; nothing
+// about such a link verifies an admin-token guess. Entries created
+// before this change have no stored token: their links keep working
+// against the legacy HMAC derivation below until the entry is
+// deleted and regenerated, and rotating SUB_ACCESS_TOKEN still
+// invalidates those legacy links (and only those).
+function newLinkToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function effectiveLinkToken(id, env, record) {
+  if (record && typeof record.linkToken === 'string' && record.linkToken) {
+    return record.linkToken;
+  }
+  return linkTokenFor(id, env);
+}
+
 let hmacKeyCache = { secret: null, promise: null };
 function linkTokenFor(id, env) {
   const secret = env.SUB_ACCESS_TOKEN || '';
@@ -2364,10 +2597,16 @@ function linkTokenFor(id, env) {
     );
 }
 
-async function validateLinkToken(url, env, id) {
-  if (!env.SUB_ACCESS_TOKEN) return { ok: true };
+async function validateLinkToken(url, env, id, record) {
+  // Fail CLOSED when no admin token is configured: an unset token
+  // used to leave every subscription readable by anyone who knew
+  // an entry id, during exactly the setup window where forgetting
+  // the secret is easiest.
+  if (!env.SUB_ACCESS_TOKEN) {
+    return { ok: false, response: text('未设置 SUB_ACCESS_TOKEN，订阅服务已禁用，请先在 Pages 项目里设置该 Secret 后重新部署。', 403) };
+  }
   const provided = url.searchParams.get('token') || '';
-  const expected = await linkTokenFor(id, env);
+  const expected = await effectiveLinkToken(id, env, record);
   if (!provided || !(await safeEqual(provided, expected))) {
     return { ok: false, response: text('Forbidden: invalid token', 403) };
   }
@@ -2381,13 +2620,17 @@ async function handleSub(request, env, url) {
   const id = url.pathname.split('/').pop();
   if (!id) return text('missing id', 400);
 
-  const tokenCheck = await validateLinkToken(url, env, id);
-  if (!tokenCheck.ok) return tokenCheck.response;
-
+  // The record loads BEFORE token validation: an entry carrying a
+  // stored link token validates against it, and only legacy entries
+  // fall back to the derived token. A missing record is a plain 404
+  // regardless of the token (the historical behaviour, and the
+  // honest answer for a deleted link): entry ids are random and
+  // unguessable, so the existence signal costs nothing.
   const raw = await env.SUB_STORE.get(`sub:${id}`);
   if (!raw) return text('not found', 404);
-
   const record = parseStoredRecord(raw);
+  const tokenCheck = await validateLinkToken(url, env, id, record);
+  if (!tokenCheck.ok) return tokenCheck.response;
   if (!record) return text('条目数据损坏，无法生成订阅内容。', 500, 'text/plain; charset=utf-8');
   // Retention expiry is recorded in the record itself, and KV reaps
   // expired keys lazily — without this check an expired entry keeps
@@ -2476,11 +2719,18 @@ async function handleSub(request, env, url) {
       );
     }
     return text(
-      renderSurge(nodes, url.origin + url.pathname, await linkTokenFor(id, env), record.dynamic ? 3600 : 86400),
+      renderSurge(nodes, url.origin + url.pathname, await effectiveLinkToken(id, env, record), record.dynamic ? 3600 : 86400),
       200,
       'text/plain; charset=utf-8',
       subHeaders,
     );
+  }
+  if (target !== 'raw') {
+    // Unknown targets used to fall through to base64 silently, so a
+    // client asking for a format this build does not produce (json,
+    // a typo, another tool's dialect) got a 200 it could not parse
+    // and no hint why. Name the supported set instead.
+    return text(`不支持的订阅格式 target=${target}：可用值为 auto、raw、plain、clash、surge。`, 400, 'text/plain; charset=utf-8');
   }
   return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8', subHeaders);
 }

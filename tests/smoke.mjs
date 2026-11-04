@@ -90,7 +90,7 @@ assert.equal(payload.nodes.length, 2);
       },
     },
     ASSETS: { async fetch() { return new Response('HOME'); } },
-    SUB_ACCESS_TOKEN: 'tok',
+    SUB_ACCESS_TOKEN: 'tok-0123456789abcdef',
   };
   const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
   const battery = [
@@ -105,7 +105,7 @@ assert.equal(payload.nodes.length, 2);
     { type: 'vmess', name: 'alpn节点', server: 'g.example.com', port: 443, uuid: U, cipher: 'auto', network: 'ws', tls: true, sni: 's.example.com', hostHeader: 'h.example.com', path: '/ws', alpn: 'h2', fp: 'chrome' },
   ];
   eqStore.set('sub:EqTest01', { value: JSON.stringify({ id: 'EqTest01', nodes: battery, storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z' }) });
-  const eqList = await (await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'tok' } }), eqEnv)).json();
+  const eqList = await (await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'tok-0123456789abcdef' } }), eqEnv)).json();
   const eqTok = eqList.items.find((i) => i.id === 'EqTest01').linkToken;
   const wClash = await (await worker.fetch(new Request(`https://x.pages.dev/sub/EqTest01?token=${eqTok}&target=clash`), eqEnv)).text();
   const wSurge = await (await worker.fetch(new Request(`https://x.pages.dev/sub/EqTest01?token=${eqTok}&target=surge`), eqEnv)).text();

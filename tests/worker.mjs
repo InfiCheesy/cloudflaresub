@@ -23,15 +23,15 @@ const env = {
     },
   },
   ASSETS: { async fetch() { return new Response('HOME'); } },
-  SUB_ACCESS_TOKEN: 'tok',
+  SUB_ACCESS_TOKEN: 'tok-0123456789abcdef',
 };
 
-const adminReq = (path, token = 'tok') =>
+const adminReq = (path, token = 'tok-0123456789abcdef') =>
   new Request(`https://x.pages.dev${path}`, { headers: { 'x-admin-token': token } });
 const linkTokens = new Map(); // entry id -> its per-entry link token
 async function generate(body) {
   const r = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
   }), env);
   const j = await r.json();
   assert.equal(j.ok, true, JSON.stringify(j));
@@ -122,7 +122,7 @@ console.log('worker tests passed');
   // Rename via admin endpoint
   const noteResp = await worker.fetch(new Request('https://x.pages.dev/api/note', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: g.shortId, note: '主力美国 VPS', token: 'tok' }),
+    body: JSON.stringify({ id: g.shortId, note: '主力美国 VPS', token: 'tok-0123456789abcdef' }),
   }), env);
   assert.equal((await noteResp.json()).ok, true);
   assert.equal(JSON.parse(store.get(`sub:${g.shortId}`).value).note, '主力美国 VPS');
@@ -132,7 +132,7 @@ console.log('worker tests passed');
   // Renaming the LEGACY entry also strips its 7-day TTL (rewritten permanently)
   const legacyNote = await worker.fetch(new Request('https://x.pages.dev/api/note', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: legacyId, note: '旧条目', token: 'tok' }),
+    body: JSON.stringify({ id: legacyId, note: '旧条目', token: 'tok-0123456789abcdef' }),
   }), env);
   assert.equal((await legacyNote.json()).ok, true);
   assert.equal(store.get(`sub:${legacyId}`).expirationTtl, undefined, 'legacy entry migrated to permanent on note save');
@@ -142,7 +142,7 @@ console.log('worker tests passed');
   assert.ok(myDedupKey, 'found this entry dedup key');
   const del = await worker.fetch(new Request('https://x.pages.dev/api/delete', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: g.shortId, token: 'tok' }),
+    body: JSON.stringify({ id: g.shortId, token: 'tok-0123456789abcdef' }),
   }), env);
   assert.equal((await del.json()).ok, true);
   assert.equal(store.has(`sub:${g.shortId}`), false);
@@ -178,7 +178,7 @@ console.log('worker tests passed');
   // saving a note preserves (approximately) the remaining TTL instead of wiping it
   const nr = await worker.fetch(new Request('https://x.pages.dev/api/note', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: timed.shortId, note: '临时条目改名', token: 'tok' }),
+    body: JSON.stringify({ id: timed.shortId, note: '临时条目改名', token: 'tok-0123456789abcdef' }),
   }), env);
   assert.equal((await nr.json()).ok, true);
   const ttlAfter = store.get(`sub:${timed.shortId}`).expirationTtl;
@@ -196,13 +196,13 @@ console.log('worker tests passed');
   // invalid days rejected
   const bad = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', nodeLinks: nodeB, preferredIps: 'bestcf.top', storageMode: 'days', retentionDays: 0 }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', nodeLinks: nodeB, preferredIps: 'bestcf.top', storageMode: 'days', retentionDays: 0 }),
   }), env);
   assert.equal(bad.status, 400);
   console.log('retention: days/permanent switching, TTL values, note-save preservation, validation: all passed');
 
   // --- POST /api/retention: change an existing entry's retention plan ---
-  const retPost = (payload, token = 'tok') => worker.fetch(new Request('https://x.pages.dev/api/retention', {
+  const retPost = (payload, token = 'tok-0123456789abcdef') => worker.fetch(new Request('https://x.pages.dev/api/retention', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ token, ...payload }),
   }), env);
@@ -355,7 +355,7 @@ console.log('worker tests passed');
   assert.equal(keysBefore.length, 3, 'record + note pointer + dedup key exist before delete');
   const delResp = await worker.fetch(new Request('https://x.pages.dev/api/delete', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: genD.shortId, token: 'tok' }),
+    body: JSON.stringify({ id: genD.shortId, token: 'tok-0123456789abcdef' }),
   }), env);
   assert.equal((await delResp.json()).ok, true);
   const keysAfter = [...store.keys()].filter((k) => k.includes(genD.shortId) || k === `dedup:${recD.dedupHash}`);
@@ -380,13 +380,13 @@ console.log('worker tests passed');
 {
   const linkTokA = linkTokens.get(j1.shortId);
   assert.match(linkTokA, /^[0-9a-f]{32}$/, 'link token is a 32-hex HMAC prefix');
-  assert.notEqual(linkTokA, 'tok');
+  assert.notEqual(linkTokA, 'tok-0123456789abcdef');
   assert.ok(!j1.urls.auto.includes('token=tok'), 'generated urls never carry the admin token');
   assert.equal(new URL(j1.urls.auto).searchParams.get('token'), linkTokA);
 
   // The admin token itself no longer opens a subscription; neither does a
   // missing token, nor ANOTHER entry's link token.
-  assert.equal((await getSub(j1.shortId, 'raw', 'tok')).status, 403, 'admin token must not open /sub');
+  assert.equal((await getSub(j1.shortId, 'raw', 'tok-0123456789abcdef')).status, 403, 'admin token must not open /sub');
   assert.equal((await getSub(j1.shortId, 'raw', '')).status, 403, 'missing link token 403');
   const jB = await generate({ nodeLinks: node, preferredIps: '198.51.100.23', namePrefix: 'B' });
   const linkTokB = linkTokens.get(jB.shortId);
@@ -462,7 +462,7 @@ console.log('worker tests passed');
   assert.equal(store.get(ptrKey)?.expirationTtl, 259200, 'pointer carries the same TTL as the record');
   const ret = (payload) => worker.fetch(new Request('https://x.pages.dev/api/retention', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', ...payload }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', ...payload }),
   }), env);
   await ret({ id: timed.shortId, mode: 'permanent' });
   assert.equal(store.get(ptrKey)?.expirationTtl, undefined, 'pointer TTL cleared with permanent');
@@ -472,7 +472,7 @@ console.log('worker tests passed');
   // Out-of-range preferred port is a clear 400, not a generated dud.
   const badPort = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', nodeLinks: node, preferredIps: '1.2.3.4:99999' }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', nodeLinks: node, preferredIps: '1.2.3.4:99999' }),
   }), env);
   assert.equal(badPort.status, 400, 'port 99999 rejected');
 
@@ -527,7 +527,7 @@ console.log('worker tests passed');
     }), env);
     assert.equal(noTok.status, 403, 'ip-source-test requires the admin token');
     const testPost = (url) => worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', url }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', url }),
     }), env).then((r) => r.json());
     const t1 = await testPost('https://ips.example.com/list.txt');
     assert.equal(t1.count, 3, 'txt source parsed');
@@ -536,12 +536,12 @@ console.log('worker tests passed');
     assert.equal((await testPost('https://ips.example.com/list.csv')).count, 2, 'csv source parsed (endpoint = first cell)');
     const tHttp = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', url: 'http://ips.example.com/list.txt' }),
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', url: 'http://ips.example.com/list.txt' }),
     }), env);
     assert.equal(tHttp.status, 400, 'http source rejected');
     const tPriv = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', url: 'https://127.0.0.1/list.txt' }),
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', url: 'https://127.0.0.1/list.txt' }),
     }), env);
     assert.equal(tPriv.status, 400, 'private-IP source rejected');
 
@@ -610,7 +610,7 @@ console.log('worker tests passed');
     assert.equal((await testPost('https://10.example.com/ips.txt')).count, 3, 'DNS names starting with digits are not private IPs');
     const tRedir = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', url: 'https://ips.example.com/redir' }),
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', url: 'https://ips.example.com/redir' }),
     }), env);
     assert.equal(tRedir.status, 400, 'redirect to a private target is rejected');
     const v1 = await generate({ nodeLinks: node, ipMode: 'api', sourceUrl: 'https://IPS.example.com:443/list.txt', sourceLimit: 2 });
@@ -650,7 +650,7 @@ console.log('worker tests passed');
   };
   const genRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/generate', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', ...body }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
   }), env);
   try {
     const mixedText = '104.16.9.1#FIXED\nhttps://a.example.com/l.txt\nhttps://b.example.com/l.txt';
@@ -673,7 +673,7 @@ console.log('worker tests passed');
     // Per-source test-fetch over the whole box.
     const tp = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', text: '1.2.3.4\nhttps://a.example.com/l.txt\nhttps://dead.example.com/l.txt' }),
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', text: '1.2.3.4\nhttps://a.example.com/l.txt\nhttps://dead.example.com/l.txt' }),
     }), env).then((r) => r.json());
     assert.equal(tp.ok, true);
     assert.equal(tp.literalCount, 1, 'literal lines counted');
@@ -837,7 +837,7 @@ console.log('worker tests passed');
   // auth behave like the note endpoint.
   const save = await worker.fetch(new Request('https://x.pages.dev/api/tags', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', id: plain.shortId, tags: [' 直播 ', 'HK'] }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: plain.shortId, tags: [' 直播 ', 'HK'] }),
   }), env).then((r) => r.json());
   assert.deepEqual(save.tags, ['直播', 'HK'], 'save returns the sanitized set');
   assert.deepEqual(recOf(plain.shortId).tags, ['直播', 'HK'], 'save persisted on the record');
@@ -846,7 +846,7 @@ console.log('worker tests passed');
   assert.deepEqual(entry.backfill.tags, ['直播', 'HK'], 'backfill carries tags');
   const missing = await worker.fetch(new Request('https://x.pages.dev/api/tags', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', id: 'NOPE000000', tags: [] }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: 'NOPE000000', tags: [] }),
   }), env);
   assert.equal(missing.status, 404, 'save on a missing entry 404s');
   const saveNoAuth = await worker.fetch(new Request('https://x.pages.dev/api/tags', {
@@ -860,7 +860,7 @@ console.log('worker tests passed');
   // preference that made devices disagree.
   const getOrder = () => worker.fetch(adminReq('/api/tag-order'), env).then((r) => r.json());
   const postOrder = (body) => worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
   }), env);
   assert.deepEqual((await getOrder()).order, [], 'tag order starts empty');
   assert.equal((await worker.fetch(new Request('https://x.pages.dev/api/tag-order'), env)).status, 403, 'tag order read requires the admin token');
@@ -905,7 +905,7 @@ console.log('worker tests passed');
   // splits a surrogate pair; F5+F6 the vocabulary merges case variants
   // and counts entries, not occurrences.
   const postTagsRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/tags', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
   }), env);
   assert.equal((await postTagsRaw({ id: plain.shortId })).status, 400, 'F1: missing tags field 400s');
   assert.equal((await postTagsRaw({ id: plain.shortId, tags: 'HK' })).status, 400, 'F1: string tags 400s');
@@ -965,7 +965,7 @@ console.log('worker tests passed');
   const manyIps = (n) => Array.from({ length: n }, (_, i) => `104.16.${(i >> 8) & 255}.${i & 255}`).join('\n');
   const tooMany = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', nodeLinks: node + '\n' + node.replace('#US-Node-1', '#US-Node-2'), preferredIps: manyIps(6000) }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', nodeLinks: node + '\n' + node.replace('#US-Node-1', '#US-Node-2'), preferredIps: manyIps(6000) }),
   }), env);
   assert.equal(tooMany.status, 400, 'cartesian explosion refused');
   const tooManyJson = await tooMany.json();
@@ -1076,7 +1076,7 @@ console.log('worker tests passed');
 
 // --- Diagnostics suite: /api/diag shape, redaction, event ring ---
 {
-  const diagPost = (body = { token: 'tok' }) => worker.fetch(new Request('https://x.pages.dev/api/diag', {
+  const diagPost = (body = { token: 'tok-0123456789abcdef' }) => worker.fetch(new Request('https://x.pages.dev/api/diag', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   }), env);
   const noTok = await diagPost({});
@@ -1092,11 +1092,11 @@ console.log('worker tests passed');
   const seeded = await generate({ nodeLinks: node, preferredIps: '203.0.113.7', namePrefix: 'diagseed' });
   await worker.fetch(new Request('https://x.pages.dev/api/note', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', id: seeded.shortId, note: '秘密备注XYZ' }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: seeded.shortId, note: '秘密备注XYZ' }),
   }), env);
   await worker.fetch(new Request('https://x.pages.dev/api/tags', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', id: seeded.shortId, tags: ['秘密标签'] }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: seeded.shortId, tags: ['秘密标签'] }),
   }), env);
 
   // Round 15: an /api 403 (wrong admin token) is recorded through
@@ -1149,7 +1149,7 @@ console.log('worker tests passed');
   for (let i = 0; i < 65; i++) {
     await worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', order: ['甲'] }),
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', order: ['甲'] }),
     }), env);
   }
   const capped = await (await diagPost()).json();
@@ -1202,7 +1202,7 @@ console.log('worker tests passed');
   const deadGen = await generate({ nodeLinks: node, preferredIps: '203.0.113.7' });
   await worker.fetch(new Request('https://x.pages.dev/api/delete', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', id: deadGen.shortId }),
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: deadGen.shortId }),
   }), env);
   const subBefore = countSig(await (await diagPost()).json(), 'GET /sub/:id', 404);
   for (let i = 0; i < 20; i++) {
@@ -1224,12 +1224,12 @@ console.log('worker tests passed');
 {
   const gen9 = async (body) => {
     const r = await worker.fetch(new Request('http://x/api/generate', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
     }), env);
     return r.json();
   };
   const listTok9 = async (id) => {
-    const l = await (await worker.fetch(new Request('http://x/api/list', { headers: { 'x-admin-token': 'tok' } }), env)).json();
+    const l = await (await worker.fetch(new Request('http://x/api/list', { headers: { 'x-admin-token': 'tok-0123456789abcdef' } }), env)).json();
     return l.items.find((i) => i.id === id).linkToken;
   };
   // The endpoint carries a remark, so buildNodes composes the SAME
@@ -1424,10 +1424,10 @@ console.log('worker tests passed');
   assert.ok((await badSub.text()).includes('条目数据损坏'), 'corrupt record: /sub says the record is damaged');
   for (const path of ['/api/note', '/api/tags', '/api/retention']) {
     const body = path === '/api/note'
-      ? { token: 'tok', id: 'FixR1301', note: 'x' }
+      ? { token: 'tok-0123456789abcdef', id: 'FixR1301', note: 'x' }
       : path === '/api/tags'
-        ? { token: 'tok', id: 'FixR1301', tags: ['a'] }
-        : { token: 'tok', id: 'FixR1301', mode: 'permanent' };
+        ? { token: 'tok-0123456789abcdef', id: 'FixR1301', tags: ['a'] }
+        : { token: 'tok-0123456789abcdef', id: 'FixR1301', mode: 'permanent' };
     const resp = await worker.fetch(new Request('https://x.pages.dev' + path, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     }), env);
@@ -1472,7 +1472,7 @@ console.log('worker tests passed');
   // The census age summary reads ISO createdAt values (what every
   // record actually stores), not only epoch numbers.
   const diagResp = await worker.fetch(new Request('https://x.pages.dev/api/diag', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok' }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef' }),
   }), env);
   const diagJson = await diagResp.json();
   assert.equal(typeof diagJson.diag.census.oldestAgeDays, 'number', 'census: oldestAgeDays populates from ISO createdAt');
@@ -1595,7 +1595,7 @@ console.log('worker tests passed');
   const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
   const vmessJson = (extra) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', scy: 'auto', type: 'none', tls: '', ...extra })).toString('base64');
   const genRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/generate', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
   }), env).then((r) => r.json());
 
   // 2) An IPv4-mapped IPv6 source literal is refused as internal
@@ -1673,7 +1673,7 @@ console.log('worker tests passed');
   const vm = (ps) => 'vmess://' + b64({ v: '2', ps, add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', type: 'none', tls: '' });
   const genRaw = async (body) => {
     const r = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', ...body }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
     }), env);
     return { status: r.status, json: await r.json() };
   };
@@ -1771,7 +1771,7 @@ console.log('worker tests passed');
   legRec.createdAt = new Date(Date.now() - 86400 * 1000).toISOString(); // created a day ago
   store.set(legKey, { value: JSON.stringify(legRec), metadata: store.get(legKey).metadata, expirationTtl: 3600 });
   const noteResp = await worker.fetch(new Request('https://x.pages.dev/api/note', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok', id: gLeg.shortId, note: 'hi' }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', id: gLeg.shortId, note: 'hi' }),
   }), env);
   assert.equal((await noteResp.json()).ok, true, 'note save succeeds on the legacy-shaped record');
   const legAfter = JSON.parse(store.get(legKey).value);
@@ -1807,4 +1807,267 @@ console.log('worker tests passed');
   }
 
   console.log('audit-16 suite: metadata bytes, parked sources, literal validation, peer sni, uppercase schemes, dedup heal/flag, ttl anchor, entry cache: passed');
+}
+
+// --- External audit fixes suite (2026-11-04): link-token decoupling,
+// token floor + lockout, fail-closed, /sub headers, static refresh,
+// literal dedupe, unknown target, VMess fidelity, ws Host, flow gate,
+// SNI fallback, source parsing, DNS guard, list paging, byte cap,
+// entry-cache invalidation, update-check token ---
+{
+  const { createHmac } = await import('node:crypto');
+  const ADMIN = 'tok-0123456789abcdef';
+  const hmacOf = (id) => createHmac('sha256', ADMIN).update(`sub-link:${id}`).digest('hex').slice(0, 32);
+  const mkEnv = (token) => {
+    const st = new Map();
+    const e = {
+      SUB_STORE: {
+        async get(k) { const v = st.get(k); return v ? v.value : null; },
+        async put(k, v, o = {}) { st.set(k, { value: v, metadata: o.metadata, expirationTtl: o.expirationTtl }); },
+        async delete(k) { st.delete(k); },
+        async list({ prefix = '', limit = 1000 } = {}) {
+          const keys = [...st.entries()].filter(([n]) => n.startsWith(prefix)).slice(0, limit)
+            .map(([name, en]) => ({ name, metadata: en.metadata }));
+          return { keys, list_complete: true, cursor: '' };
+        },
+      },
+      ASSETS: { async fetch() { return new Response('HOME'); } },
+    };
+    if (token !== undefined) e.SUB_ACCESS_TOKEN = token;
+    return { e, st };
+  };
+  const post = (e, path, body) => worker.fetch(new Request('https://x.pages.dev' + path, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }), e);
+  const vmJson = (obj) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'X', add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', net: 'tcp', type: 'none', tls: '', ...obj }), 'utf8').toString('base64');
+
+  // Token floor: a configured-but-short token disables the admin surface.
+  {
+    const { e } = mkEnv('short');
+    const list = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'short' } }), e);
+    assert.equal(list.status, 403, 'short admin token rejected');
+    assert.ok((await list.json()).error.includes('太短'), 'short-token error names the problem');
+    const gen = await post(e, '/api/generate', { token: 'short', nodeLinks: vmJson({}), preferredIps: '198.51.100.1' });
+    assert.equal(gen.status, 403, 'generate also gated by the floor');
+  }
+
+  // Fail-closed when no token is configured at all.
+  {
+    const { e, st } = mkEnv(undefined);
+    st.set('sub:NoToken001', { value: JSON.stringify({ version: 2, createdAt: new Date().toISOString(), nodes: [], storage: { mode: 'permanent' } }) });
+    const gen = await post(e, '/api/generate', { nodeLinks: vmJson({}), preferredIps: '198.51.100.1' });
+    assert.equal(gen.status, 403, 'tokenless generate refused');
+    const sub = await worker.fetch(new Request('https://x.pages.dev/sub/NoToken001'), e);
+    assert.equal(sub.status, 403, 'tokenless /sub refused');
+    const list = await worker.fetch(new Request('https://x.pages.dev/api/list'), e);
+    assert.equal(list.status, 403, 'tokenless list refused (already true before)');
+  }
+
+  // Stored random link tokens: not the HMAC derivation, stable across
+  // a dedup refresh, and the ONLY thing that opens the entry. Legacy
+  // records without a stored token still validate via the derivation.
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtTok' }), preferredIps: '198.51.100.44' });
+    const tok = linkTokens.get(g.shortId);
+    assert.match(tok, /^[0-9a-f]{32}$/, 'link token shape kept');
+    assert.notEqual(tok, hmacOf(g.shortId), 'link token is NOT derivable from the admin token');
+    const rec = JSON.parse(store.get(`sub:${g.shortId}`).value);
+    assert.equal(rec.linkToken, tok, 'random token stored on the record');
+    const again = await generate({ nodeLinks: vmJson({ ps: 'ExtTok' }), preferredIps: '198.51.100.44' });
+    assert.equal(again.deduplicated, true);
+    assert.equal(linkTokens.get(g.shortId), tok, 'dedup refresh keeps the same link token');
+    assert.equal((await getSub(g.shortId, 'raw')).status, 200, 'stored token opens the entry');
+    assert.equal((await getSub(g.shortId, 'raw', hmacOf(g.shortId))).status, 403, 'the derivation does NOT open a stored-token entry');
+
+    const legacyId = 'LegacyX17a';
+    store.set(`sub:${legacyId}`, { value: JSON.stringify({ version: 2, createdAt: new Date().toISOString(), storage: { mode: 'permanent' }, nodes: [{ type: 'vmess', name: 'L', server: '198.51.100.1', port: 443, uuid: '11111111-2222-3333-4444-555555555555', alterId: 0, cipher: 'auto', network: 'tcp', tls: false, host: '', path: '/', sni: '', alpn: '', fp: '' }] }) });
+    const legacyOk = await worker.fetch(new Request(`https://x.pages.dev/sub/${legacyId}?target=plain&token=${hmacOf(legacyId)}`), env);
+    assert.equal(legacyOk.status, 200, 'legacy entry still opens via the derived token');
+    const legacyBad = await worker.fetch(new Request(`https://x.pages.dev/sub/${legacyId}?target=plain&token=${'0'.repeat(32)}`), env);
+    assert.equal(legacyBad.status, 403, 'legacy entry rejects a wrong token');
+  }
+
+  // /sub response headers: no CORS wildcard, no-store.
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtHdr' }), preferredIps: '198.51.100.45' });
+    const r = await worker.fetch(new Request(`https://x.pages.dev/sub/${g.shortId}?target=clash&token=${linkTokens.get(g.shortId)}`), env);
+    assert.equal(r.status, 200, 'clash pull works');
+    assert.equal(r.headers.get('access-control-allow-origin'), null, 'no wildcard CORS on /sub');
+    assert.equal(r.headers.get('cache-control'), 'no-store', '/sub is no-store');
+  }
+
+  // Static dedup-hit refreshes the stored nodes (preview == /sub).
+  {
+    const a = vmJson({ ps: 'ExtAAA', port: '443' });
+    const b = vmJson({ ps: 'ExtBBB', port: '8443' });
+    const g1 = await generate({ nodeLinks: a + '\n' + b, preferredIps: '198.51.100.46' });
+    const g2 = await generate({ nodeLinks: b + '\n' + a, preferredIps: '198.51.100.46' });
+    assert.equal(g2.deduplicated, true, 'reorder still dedups');
+    const sub = await getSub(g1.shortId, 'plain');
+    assert.equal(sub.body, g2.plainText, 'static hit: /sub serves the refreshed expansion');
+  }
+
+  // Literal duplicates dedupe (README parity).
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtDup' }), preferredIps: '1.1.1.1\n1.1.1.1\n1.1.1.1' });
+    assert.equal(g.counts.outputNodes, 1, 'same literal x3 = one node');
+    assert.equal(g.counts.preferredEndpoints, 1, 'endpoint count deduped too');
+  }
+
+  // Unknown targets are a 400, not silent base64.
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtTgt' }), preferredIps: '198.51.100.47' });
+    assert.equal((await getSub(g.shortId, 'json')).status, 400, 'target=json refused loudly');
+    assert.equal((await getSub(g.shortId, 'bogus')).status, 400, 'target=bogus refused loudly');
+    assert.equal((await getSub(g.shortId, 'raw')).status, 200, 'target=raw still fine');
+  }
+
+  // VMess fidelity: allowInsecure + header type survive the whole chain.
+  {
+    const link = vmJson({ ps: 'ExtVmess', type: 'http', tls: 'tls', allowInsecure: true, sni: 'a.example.com' });
+    const g = await generate({ nodeLinks: link, preferredIps: '198.51.100.48' });
+    const plain = await getSub(g.shortId, 'plain');
+    const decoded = JSON.parse(Buffer.from(plain.body.trim().split('vmess://')[1], 'base64').toString('utf8'));
+    assert.equal(decoded.type, 'http', 'vmess header type round-trips');
+    assert.equal(decoded.allowInsecure, true, 'vmess allowInsecure round-trips');
+    const clash = await getSub(g.shortId, 'clash');
+    assert.ok(clash.body.includes('skip-cert-verify: true'), 'clash vmess honors allowInsecure');
+    const surge = await getSub(g.shortId, 'surge');
+    assert.ok(surge.body.includes('skip-cert-verify=true'), 'surge vmess honors allowInsecure');
+  }
+
+  // Empty WS Host is omitted (Clash headers block + Surge ws-headers).
+  {
+    const ws = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@ws.example.com:443?security=tls&type=ws&path=%2Fws#ExtWs';
+    const g = await generate({ nodeLinks: ws, preferredIps: '198.51.100.49', keepOriginalHost: true });
+    const clash = await getSub(g.shortId, 'clash');
+    assert.ok(!clash.body.includes('Host: ""'), 'clash: no empty Host header');
+    assert.ok(!clash.body.includes('headers:'), 'clash: no headers block without a host');
+    const tro = 'trojan://pw@ws2.example.com:443?security=tls&type=ws&path=%2Fws#ExtWsT';
+    const g2 = await generate({ nodeLinks: tro, preferredIps: '198.51.100.50', keepOriginalHost: true });
+    const surge = await getSub(g2.shortId, 'surge');
+    assert.ok(!surge.body.includes('ws-headers=Host:'), 'surge: no bare ws-headers');
+  }
+
+  // Vision flow requires tcp transport.
+  {
+    const mk = (type) => `vless://f541611e-0aeb-4900-aa47-6e95d4916a49@fl.example.com:443?security=tls&type=${type}&flow=xtls-rprx-vision&sni=fl.example.com#ExtFlow`;
+    const gWs = await generate({ nodeLinks: mk('ws'), preferredIps: '198.51.100.51' });
+    assert.ok(!(await getSub(gWs.shortId, 'clash')).body.includes('flow:'), 'vision flow suppressed on ws');
+    const gTcp = await generate({ nodeLinks: mk('tcp'), preferredIps: '198.51.100.52' });
+    assert.ok((await getSub(gTcp.shortId, 'clash')).body.includes('flow: "xtls-rprx-vision"'), 'vision flow kept on tcp');
+  }
+
+  // keepOriginalHost=false: SNI follows the endpoint; a distinct SNI survives.
+  {
+    const mk = (sni) => `vless://f541611e-0aeb-4900-aa47-6e95d4916a49@origin.example.com:443?security=tls&type=tcp&sni=${sni}#ExtSni`;
+    const g1 = await generate({ nodeLinks: mk('origin.example.com'), preferredIps: 'cf.example.com', keepOriginalHost: false });
+    assert.ok((await getSub(g1.shortId, 'clash')).body.includes('servername: "cf.example.com"'), 'sni falls back to the endpoint host');
+    const g2 = await generate({ nodeLinks: mk('cdn.example.com'), preferredIps: 'cf2.example.com', keepOriginalHost: false });
+    assert.ok((await getSub(g2.shortId, 'clash')).body.includes('servername: "cdn.example.com"'), 'distinct sni survives');
+  }
+
+  // Source parsing: multi-address lines, octet validation, CSV port column, DNS guard.
+  {
+    const realFetch = globalThis.fetch;
+    let dohAnswer = [{ type: 1, data: '1.1.1.1' }];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.startsWith('https://cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({ Answer: dohAnswer }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+      }
+      if (u === 'https://multi.example.com/l.txt') return new Response('1.1.1.1, 2.2.2.2, 3.3.3.3', { status: 200 });
+      if (u === 'https://octet.example.com/l.txt') return new Response('999.999.999.999:443\n5.5.5.5', { status: 200 });
+      if (u === 'https://csv.example.com/l.csv') return new Response('IP,port\n104.16.7.7,443', { status: 200 });
+      if (u === 'https://rebind.example.com/l.txt') return new Response('6.6.6.6', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const test = (url) => post(env, '/api/ip-source-test', { token: ADMIN, url }).then((r) => r.json());
+      assert.equal((await test('https://multi.example.com/l.txt')).count, 3, 'all addresses on a line are taken');
+      const oct = await test('https://octet.example.com/l.txt');
+      assert.equal(oct.count, 1, 'invalid IPv4 octets rejected');
+      assert.ok(oct.sample.includes('5.5.5.5'), 'valid endpoint kept');
+      const csv = await test('https://csv.example.com/l.csv');
+      assert.ok(csv.sample.includes('104.16.7.7:443'), 'csv port column applied');
+      const reb = await test('https://rebind.example.com/l.txt');
+      assert.equal(reb.ok, true, 'public DNS answer passes');
+      dohAnswer = [{ type: 1, data: '10.0.0.5' }];
+      const reb2 = await test('https://rebind.example.com/l.txt');
+      assert.equal(reb2.ok, false, 'hostname resolving to a private address refused');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // /api/list paging parameters.
+  {
+    const one = await (await worker.fetch(new Request('https://x.pages.dev/api/list?limit=1', { headers: { 'x-admin-token': ADMIN } }), env)).json();
+    assert.equal(one.items.length, 1, 'limit slices the page');
+    assert.ok(one.total > 1 && one.count === one.total, 'total still reports everything');
+    const past = await (await worker.fetch(new Request('https://x.pages.dev/api/list?offset=100000', { headers: { 'x-admin-token': ADMIN } }), env)).json();
+    assert.equal(past.items.length, 0, 'offset past the end is an empty page');
+  }
+
+  // Oversized records fail as a clear 400, not a platform 500.
+  {
+    const huge = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@big.example.com:443?security=tls&type=ws&path=%2F'
+      + 'a'.repeat(13_500_000) + '#ExtBig';
+    const r = await post(env, '/api/generate', { token: ADMIN, nodeLinks: huge, preferredIps: '198.51.100.53\n198.51.100.54' });
+    assert.equal(r.status, 400, 'oversize generate refused with 400');
+    assert.ok((await r.json()).error.includes('记录体积过大'), 'oversize error names the size');
+  }
+
+  // Regenerating a dynamic entry invalidates its merged /sub cache.
+  {
+    const realFetch = globalThis.fetch;
+    let list = '104.16.20.1';
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === 'https://inv.example.com/l.txt') return new Response(list, { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const body = { nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@inv.example.com:443?security=tls&type=ws&path=%2Fws&host=inv.example.com&sni=inv.example.com#ExtInv', preferredIps: 'https://inv.example.com/l.txt' };
+      const g = await generate(body);
+      const s1 = await getSub(g.shortId, 'plain');
+      assert.ok(s1.body.includes('@104.16.20.1'), 'initial endpoints served (entry cache now warm)');
+      list = '104.16.20.2';
+      for (const k of [...store.keys()]) if (k.startsWith('ipcache:')) store.delete(k);
+      const g2 = await generate(body);
+      assert.equal(g2.deduplicated, true, 'regenerate hits the same dynamic entry');
+      const s2 = await getSub(g.shortId, 'plain');
+      assert.ok(s2.body.includes('@104.16.20.2'), 'post-regeneration /sub serves the new endpoints at once');
+      assert.ok(!s2.body.includes('@104.16.20.1'), 'old endpoints gone');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // The update check sends GITHUB_TOKEN when one is configured.
+  {
+    const { e } = mkEnv(ADMIN);
+    e.GITHUB_TOKEN = 'ghp_test_token';
+    const realFetch = globalThis.fetch;
+    let seenAuth = null;
+    globalThis.fetch = async (url, init) => {
+      seenAuth = (init && init.headers && init.headers.authorization) || null;
+      return new Response(JSON.stringify({ tag_name: 'v9.9.9', html_url: 'https://github.com/x' }), { status: 200 });
+    };
+    try {
+      const v = await (await worker.fetch(new Request('https://x.pages.dev/api/version'), e)).json();
+      assert.equal(v.latest, '9.9.9', 'version check works with a token configured');
+      assert.equal(seenAuth, 'Bearer ghp_test_token', 'github token sent on the update check');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // Admin lockout LAST: it poisons this isolate's admin surface for
+  // five minutes, so nothing after this block may need admin access.
+  {
+    const { e } = mkEnv(ADMIN);
+    for (let i = 0; i < 20; i++) {
+      const r = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'wrong-' + i } }), e);
+      assert.equal(r.status, 403, 'wrong guesses are 403 while under the limit');
+    }
+    const locked = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': ADMIN } }), e);
+    assert.equal(locked.status, 429, 'after 20 failures even the right token waits out the lockout');
+  }
+
+  console.log('external audit fixes suite: token floor/lockout, fail-closed, stored link tokens, headers, static refresh, literal dedupe, target 400, vmess fidelity, ws host, flow gate, sni fallback, source parsing + DNS, list paging, byte cap, entry-cache invalidation, github token: passed');
 }

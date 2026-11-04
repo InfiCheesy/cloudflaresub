@@ -1,0 +1,2313 @@
+import assert from 'node:assert/strict';
+import worker from '../src/worker.js';
+
+const store = new Map(); // name -> { value, metadata, expirationTtl }
+const env = {
+  SUB_STORE: {
+    async get(k) { return store.get(k)?.value ?? null; },
+    async put(k, v, opts = {}) {
+      // Emulate the platform's 1024-BYTE KV metadata limit (round 16):
+      // without it the mock accepts metadata the real put would reject.
+      if (opts.metadata !== undefined && new TextEncoder().encode(JSON.stringify(opts.metadata)).length > 1024) {
+        throw new Error('metadata is too large');
+      }
+      store.set(k, { value: v, metadata: opts.metadata, expirationTtl: opts.expirationTtl });
+    },
+    async delete(k) { store.delete(k); },
+    async list({ prefix = '', limit = 1000 } = {}) {
+      const keys = [...store.entries()]
+        .filter(([name]) => name.startsWith(prefix))
+        .slice(0, limit)
+        .map(([name, e]) => ({ name, metadata: e.metadata }));
+      return { keys, list_complete: true, cursor: '' };
+    },
+  },
+  ASSETS: { async fetch() { return new Response('HOME'); } },
+  SUB_ACCESS_TOKEN: 'tok-0123456789abcdef',
+};
+
+const adminReq = (path, token = 'tok-0123456789abcdef') =>
+  new Request(`https://x.pages.dev${path}`, { headers: { 'x-admin-token': token } });
+const linkTokens = new Map(); // entry id -> its per-entry link token
+async function generate(body) {
+  const r = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+  }), env);
+  const j = await r.json();
+  assert.equal(j.ok, true, JSON.stringify(j));
+  if (j.shortId && j.urls) linkTokens.set(j.shortId, new URL(j.urls.auto).searchParams.get('token') || '');
+  return j;
+}
+async function getSub(id, target, tokenOverride) {
+  const token = tokenOverride !== undefined ? tokenOverride : linkTokens.get(id);
+  const q = new URLSearchParams();
+  if (target) q.set('target', target);
+  if (token) q.set('token', token);
+  const r = await worker.fetch(new Request(`https://x.pages.dev/sub/${id}?${q}`), env);
+  return { status: r.status, body: await r.text() };
+}
+
+// --- Owner's example: plain links must match the expected strings exactly ---
+const node = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@walh6h3rdnazjx.topoffice.dpdns.org:443?alpn=http%2F1.1&encryption=none&fp=chrome&host=walh6h3rdnazjx.topoffice.dpdns.org&path=%2Fws-path&security=tls&sni=walh6h3rdnazjx.topoffice.dpdns.org&type=ws#%E7%BE%8E%E5%9B%BD33-freetrialtelegram';
+const j1 = await generate({ nodeLinks: node, preferredIps: 'bestcf.top\ncf.877774.xyz', namePrefix: 'v4v6双栈-高速优选', keepOriginalHost: true });
+const frag = (n) => encodeURIComponent(n);
+const expect1 = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@bestcf.top:443?alpn=http%2F1.1&encryption=none&fp=chrome&host=walh6h3rdnazjx.topoffice.dpdns.org&path=%2Fws-path&security=tls&sni=walh6h3rdnazjx.topoffice.dpdns.org&type=ws#' + frag('美国33-freetrialtelegram | v4v6双栈-高速优选 | 1');
+const expect2 = expect1.replace('@bestcf.top', '@cf.877774.xyz').replace(frag('| 1'), frag('| 2'));
+assert.equal(j1.plainText, expect1 + '\n' + expect2);
+const sub = await getSub(j1.shortId, 'plain');
+assert.equal(sub.status, 200);
+assert.equal(sub.body, expect1 + '\n' + expect2);
+const rawSub = await getSub(j1.shortId, 'raw');
+assert.equal(Buffer.from(rawSub.body, 'base64').toString('utf8'), expect1 + '\n' + expect2);
+console.log('owner example: plain output matches exactly, raw = base64(plain)');
+
+// --- IPv6 preferred endpoints ---
+const j2 = await generate({ nodeLinks: node, preferredIps: '2606:4700:4700::1111#v6-bare\n[2606:4700:4700::1001]:8443#v6-port\n2001:db8::1', namePrefix: '', keepOriginalHost: true });
+const links = j2.plainText.split('\n');
+assert.equal(links.length, 3);
+assert.ok(links[0].includes('@[2606:4700:4700::1111]:443?'), links[0]); // bare v6 kept whole, default port, bracketed in URL
+assert.ok(links[1].includes('@[2606:4700:4700::1001]:8443?'), links[1]); // bracketed v6 + explicit port
+assert.ok(links[2].includes('@[2001:db8::1]:443?'), links[2]);          // "2001:db8::1" must not lose "::1" as a port
+const clash = await getSub(j2.shortId, 'clash');
+assert.ok(clash.body.includes('server: "2606:4700:4700::1111"'), clash.body.split('\n').slice(8,14).join('\n'));
+const vm = await generate({ nodeLinks: 'vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJkZW1vIiwKICAiYWRkIjogImVkZ2UuZXhhbXBsZS5jb20iLAogICJwb3J0IjogIjQ0MyIsCiAgImlkIjogIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsCiAgInNjeSI6ICJhdXRvIiwKICAibmV0IjogIndzIiwKICAidGxzIjogInRscyIsCiAgInBhdGgiOiAiL3dzIiwKICAiaG9zdCI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAic25pIjogImVkZ2UuZXhhbXBsZS5jb20iCn0=', preferredIps: '2606:4700::1' });
+const vmPayload = JSON.parse(Buffer.from(vm.plainText.replace('vmess://',''), 'base64').toString('utf8'));
+assert.equal(vmPayload.add, '2606:4700::1'); // vmess add is the bare address, no brackets/truncation
+console.log('ipv6: bare, bracketed and bracketed+port all parse and render correctly');
+
+console.log('worker tests passed');
+
+// --- Permanent storage + notes + admin (appended suite) ---
+{
+  // seed a legacy entry: written the OLD way, with a 7-day TTL, no note/metadata
+  const legacyId = 'legacyID01';
+  store.set(`sub:${legacyId}`, {
+    value: JSON.stringify({ version: 1, createdAt: '2026-10-20T00:00:00.000Z', options: {}, nodes: [] }),
+    expirationTtl: 60 * 60 * 24 * 7,
+  });
+
+  const nodeA = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@vps-a.example.com:443?security=tls&type=ws&path=%2Fws&host=vps-a.example.com&sni=vps-a.example.com#VPS-A%E8%8A%82%E7%82%B9';
+  const g = await generate({ nodeLinks: nodeA, preferredIps: 'bestcf.top', note: '搬瓦工 DC6' });
+  assert.equal(g.note, '搬瓦工 DC6');
+  const entry = store.get(`sub:${g.shortId}`);
+  assert.ok(entry, 'record stored');
+  assert.equal(entry.expirationTtl, undefined, 'record must be stored permanently (no TTL)');
+  const rec = JSON.parse(entry.value);
+  assert.equal(rec.note, '搬瓦工 DC6');
+  assert.equal(rec.sources[0].server, 'vps-a.example.com');
+  assert.equal(entry.metadata.note, '搬瓦工 DC6');
+  assert.equal(entry.metadata.sources, 'vps-a.example.com');
+  assert.equal(store.get(`note:搬瓦工 DC6:${g.shortId}`)?.value, g.shortId, 'note pointer key exists');
+  const dedupKey = [...store.keys()].find((k) => k.startsWith('dedup:'));
+  assert.equal(store.get(dedupKey).expirationTtl, undefined, 'dedup key permanent too');
+
+  // Same content again with a different note: same id, note updated, pointers swapped
+  const g2 = await generate({ nodeLinks: nodeA, preferredIps: 'bestcf.top', note: '搬瓦工 DC9' });
+  assert.equal(g2.shortId, g.shortId);
+  assert.equal(JSON.parse(store.get(`sub:${g.shortId}`).value).note, '搬瓦工 DC9');
+  assert.equal(store.has(`note:搬瓦工 DC6:${g.shortId}`), false, 'old pointer removed');
+  assert.equal(store.get(`note:搬瓦工 DC9:${g.shortId}`)?.value, g.shortId);
+
+  // Admin auth
+  const badList = await worker.fetch(adminReq('/api/list', 'wrong'), env);
+  assert.equal(badList.status, 403);
+  const listResp = await worker.fetch(adminReq('/api/list'), env);
+  const list = await listResp.json();
+  assert.equal(list.ok, true);
+  const mine = list.items.find((i) => i.id === g.shortId);
+  assert.equal(mine.note, '搬瓦工 DC9');
+  assert.deepEqual(mine.sources, ['vps-a.example.com']);
+  assert.ok(list.items.some((i) => i.id === legacyId), 'legacy entry listed via fallback');
+
+  // Rename via admin endpoint
+  const noteResp = await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: g.shortId, note: '主力美国 VPS', token: 'tok-0123456789abcdef' }),
+  }), env);
+  assert.equal((await noteResp.json()).ok, true);
+  assert.equal(JSON.parse(store.get(`sub:${g.shortId}`).value).note, '主力美国 VPS');
+  assert.equal(store.get(`note:主力美国 VPS:${g.shortId}`)?.value, g.shortId);
+  assert.equal(store.has(`note:搬瓦工 DC9:${g.shortId}`), false);
+
+  // Renaming the LEGACY entry also strips its 7-day TTL (rewritten permanently)
+  const legacyNote = await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: legacyId, note: '旧条目', token: 'tok-0123456789abcdef' }),
+  }), env);
+  assert.equal((await legacyNote.json()).ok, true);
+  assert.equal(store.get(`sub:${legacyId}`).expirationTtl, undefined, 'legacy entry migrated to permanent on note save');
+
+  // Delete removes record + pointer + dedup key, and the sub link dies
+  const myDedupKey = [...store.entries()].find(([k, e]) => k.startsWith('dedup:') && e.value === g.shortId)?.[0];
+  assert.ok(myDedupKey, 'found this entry dedup key');
+  const del = await worker.fetch(new Request('https://x.pages.dev/api/delete', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: g.shortId, token: 'tok-0123456789abcdef' }),
+  }), env);
+  assert.equal((await del.json()).ok, true);
+  assert.equal(store.has(`sub:${g.shortId}`), false);
+  assert.equal(store.has(`note:主力美国 VPS:${g.shortId}`), false);
+  assert.equal(store.has(myDedupKey), false, 'dedup key removed');
+  const gone = await worker.fetch(new Request(`https://x.pages.dev/sub/${g.shortId}?token=${linkTokens.get(g.shortId)}`), env);
+  assert.equal(gone.status, 404);
+  console.log('permanent storage, notes, pointers, admin list/note/delete, legacy migration: all passed');
+}
+
+// --- Retention choice suite ---
+{
+  const nodeB = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@vps-b.example.com:443?security=tls&type=ws&path=%2Fws&host=vps-b.example.com&sni=vps-b.example.com#B';
+
+  // days mode: both keys carry the TTL, record + metadata know the plan
+  const before = Date.now();
+  const timed = await generate({ nodeLinks: nodeB, preferredIps: 'bestcf.top', storageMode: 'days', retentionDays: 7, note: '临时条目' });
+  assert.equal(timed.storage.mode, 'days');
+  assert.equal(timed.storage.days, 7);
+  const expiresMs = Date.parse(timed.storage.expiresAt);
+  assert.ok(expiresMs - before >= 7 * 86400 * 1000 - 5000 && expiresMs - before <= 7 * 86400 * 1000 + 5000, 'expiresAt ~= now + 7d');
+  assert.equal(store.get(`sub:${timed.shortId}`).expirationTtl, 7 * 86400, 'record TTL = 7d');
+  const dk = [...store.entries()].find(([k, e]) => k.startsWith('dedup:') && e.value === timed.shortId)?.[0];
+  assert.equal(store.get(dk).expirationTtl, 7 * 86400, 'dedup TTL = 7d');
+  assert.equal(store.get(`sub:${timed.shortId}`).metadata.retention, 'days:7');
+  assert.equal(store.get(`sub:${timed.shortId}`).metadata.exp, timed.storage.expiresAt);
+
+  // list surfaces the plan
+  const lr = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  const li = lr.items.find((i) => i.id === timed.shortId);
+  assert.equal(li.storage.mode, 'days'); assert.equal(li.storage.days, 7); assert.equal(li.storage.expiresAt, timed.storage.expiresAt);
+
+  // saving a note preserves (approximately) the remaining TTL instead of wiping it
+  const nr = await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: timed.shortId, note: '临时条目改名', token: 'tok-0123456789abcdef' }),
+  }), env);
+  assert.equal((await nr.json()).ok, true);
+  const ttlAfter = store.get(`sub:${timed.shortId}`).expirationTtl;
+  assert.ok(ttlAfter <= 7 * 86400 && ttlAfter > 7 * 86400 - 3600, `note save keeps remaining TTL, got ${ttlAfter}`);
+  assert.equal(JSON.parse(store.get(`sub:${timed.shortId}`).value).storage.expiresAt, timed.storage.expiresAt, 'expiresAt unchanged by note save');
+
+  // regenerate same content as permanent: same id, TTL gone, plan switched
+  const again = await generate({ nodeLinks: nodeB, preferredIps: 'bestcf.top', storageMode: 'permanent' });
+  assert.equal(again.shortId, timed.shortId);
+  assert.equal(again.storage.mode, 'permanent');
+  assert.equal(store.get(`sub:${timed.shortId}`).expirationTtl, undefined, 'switched back to permanent');
+  assert.equal(store.get(dk).expirationTtl, undefined, 'dedup permanent again');
+  assert.equal(JSON.parse(store.get(`sub:${timed.shortId}`).value).note, '临时条目改名', 'note survives retention switch when no new note given');
+
+  // invalid days rejected
+  const bad = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', nodeLinks: nodeB, preferredIps: 'bestcf.top', storageMode: 'days', retentionDays: 0 }),
+  }), env);
+  assert.equal(bad.status, 400);
+  console.log('retention: days/permanent switching, TTL values, note-save preservation, validation: all passed');
+
+  // --- POST /api/retention: change an existing entry's retention plan ---
+  const retPost = (payload, token = 'tok-0123456789abcdef') => worker.fetch(new Request('https://x.pages.dev/api/retention', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token, ...payload }),
+  }), env);
+  // entry is permanent right now; give it 10 days from now
+  let rr = await retPost({ id: timed.shortId, mode: 'days', days: 10 });
+  assert.equal(rr.status, 200, 'retention days: status');
+  let rj = await rr.json();
+  assert.equal(rj.storage.mode, 'days');
+  assert.equal(rj.storage.days, 10);
+  const drift = Math.abs(Date.parse(rj.storage.expiresAt) - (Date.now() + 10 * 86400e3));
+  assert.ok(drift < 120000, 'expiresAt is ~10 days from now');
+  assert.equal(store.get(`sub:${timed.shortId}`).expirationTtl, 10 * 86400, 'record TTL updated to 10d');
+  assert.equal(store.get(dk).expirationTtl, 10 * 86400, 'dedup TTL updated to 10d');
+  assert.equal(JSON.parse(store.get(`sub:${timed.shortId}`).value).note, '临时条目改名', 'note survives retention change');
+  // list reflects the new plan
+  const lr2 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  const listed1 = lr2.items.find((i) => i.id === timed.shortId);
+  assert.equal(listed1.storage.mode, 'days');
+  assert.equal(listed1.storage.days, 10);
+  // back to permanent clears both TTLs
+  rr = await retPost({ id: timed.shortId, mode: 'permanent' });
+  assert.equal(rr.status, 200);
+  assert.equal(store.get(`sub:${timed.shortId}`).expirationTtl, undefined, 'record permanent again');
+  assert.equal(store.get(dk).expirationTtl, undefined, 'dedup permanent again');
+  // validation + auth + missing entry
+  assert.equal((await retPost({ id: timed.shortId, mode: 'days', days: 0 })).status, 400, 'days=0 rejected');
+  assert.equal((await retPost({ id: timed.shortId, mode: 'days', days: 99999 })).status, 400, 'days too large rejected');
+  assert.equal((await retPost({ id: 'nope999', mode: 'permanent' })).status, 404, 'unknown id 404');
+  assert.equal((await retPost({ id: timed.shortId, mode: 'permanent' }, 'wrong')).status, 403, 'wrong token 403');
+  console.log('retention endpoint: plan switching, TTL sync, list reflection, validation: all passed');
+
+  // --- GET /api/entry: direct read used by the UI's write verification ---
+  const er = await worker.fetch(adminReq(`/api/entry?id=${timed.shortId}`), env);
+  assert.equal(er.status, 200, 'entry read: status');
+  const ej = await er.json();
+  assert.equal(ej.note, '临时条目改名', 'entry read: note straight from the record');
+  assert.equal(ej.storage.mode, 'permanent', 'entry read: storage straight from the record');
+  assert.equal((await worker.fetch(adminReq('/api/entry?id=nope999'), env)).status, 404, 'entry read: unknown id 404');
+  assert.equal((await worker.fetch(adminReq(`/api/entry?id=${timed.shortId}`, 'wrong'), env)).status, 403, 'entry read: wrong token 403');
+  console.log('entry endpoint: direct read, 404, 403: all passed');
+
+  // --- Regression: list must follow the RECORD, not the (lagging) metadata ---
+  // Give the entry a 3-day plan via the endpoint, then rewind the stored
+  // key metadata to the old permanent plan, simulating a stale list index.
+  await retPost({ id: timed.shortId, mode: 'days', days: 3 });
+  const subKey = `sub:${timed.shortId}`;
+  const freshMeta = store.get(subKey).metadata;
+  store.get(subKey).metadata = { ...freshMeta, retention: 'permanent', exp: '' };
+  const lr3 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  const listed3 = lr3.items.find((i) => i.id === timed.shortId);
+  assert.equal(listed3.storage.mode, 'days', 'list shows the record plan despite stale metadata');
+  assert.equal(listed3.storage.days, 3, 'list shows the record days despite stale metadata');
+  assert.equal(listed3.note, '临时条目改名', 'list note also comes from the record');
+  // restore: back to permanent for a clean end state
+  await retPost({ id: timed.shortId, mode: 'permanent' });
+  console.log('list record-source regression: passed');
+
+  // --- Regression: a deleted entry still enumerated by the list index
+  // (ghost key, record already gone) must NOT appear in /api/list ---
+  store.set('sub:ghost000', {
+    value: null,
+    metadata: { note: '幽灵条目', createdAt: '2026-10-28T00:00:00.000Z', sources: 'gone.example.com', out: 1, retention: 'permanent', exp: '' },
+    expirationTtl: undefined,
+  });
+  const lr4 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  assert.ok(!lr4.items.some((i) => i.id === 'ghost000'), 'ghost key skipped in list');
+  store.delete('sub:ghost000');
+  console.log('ghost key regression: passed');
+}
+
+// --- Form backfill suite: exact inputs for new entries, reconstruction for legacy ---
+{
+  const getEntry = async (id) => {
+    const r = await worker.fetch(adminReq(`/api/entry?id=${id}`), env);
+    return r.json();
+  };
+
+  // 1) New entry: backfill is the verbatim form input.
+  const nodeA = 'vless://11111111-2222-4333-8444-555555555555@edge-a.example.com:443?encryption=none&security=tls&sni=edge-a.example.com&host=edge-a.example.com&type=ws&path=%2Fws#NodeA';
+  const nodeB = 'trojan://pw123@edge-b.example.com:8443?security=tls&sni=edge-b.example.com&type=ws&host=edge-b.example.com&path=%2Ftj#NodeB';
+  const gen = await generate({
+    nodeLinks: `${nodeA}\n${nodeB}`,
+    preferredIps: '198.51.100.7:2053#P1\nbestcf.example.net',
+    namePrefix: 'PX', keepOriginalHost: true, note: '回填测试',
+    storageMode: 'days', retentionDays: 12,
+  });
+  const e1 = await getEntry(gen.shortId);
+  assert.equal(e1.backfill.exact, true, 'new entry backfills exactly');
+  assert.equal(e1.backfill.nodeLinks, `${nodeA}\n${nodeB}`);
+  assert.equal(e1.backfill.preferredIps, '198.51.100.7:2053#P1\nbestcf.example.net');
+  assert.equal(e1.backfill.namePrefix, 'PX');
+  assert.equal(e1.backfill.keepOriginalHost, true);
+  assert.equal(e1.backfill.note, '回填测试');
+  assert.equal(e1.backfill.storage.mode, 'days');
+  assert.equal(e1.backfill.storage.days, 12);
+
+  // 2) Legacy entry (inputs stripped): reconstruction restores the
+  //    preferred list verbatim (port + remark on #1, portless domain on #2)
+  //    and the originals well enough that regenerating dedup-hits the
+  //    very same entry; the dedup hit then backfills exact inputs.
+  const key = `sub:${gen.shortId}`;
+  const rec = JSON.parse(store.get(key).value);
+  delete rec.inputs;
+  store.get(key).value = JSON.stringify(rec);
+  const e2 = await getEntry(gen.shortId);
+  assert.equal(e2.backfill.exact, false, 'legacy entry uses reconstruction');
+  assert.equal(e2.backfill.preferredIps, '198.51.100.7:2053#P1\nbestcf.example.net', 'reconstructed preferred list');
+  const regen = await generate({
+    nodeLinks: e2.backfill.nodeLinks,
+    preferredIps: e2.backfill.preferredIps,
+    namePrefix: e2.backfill.namePrefix,
+    keepOriginalHost: e2.backfill.keepOriginalHost,
+  });
+  assert.equal(regen.shortId, gen.shortId, 'reconstructed inputs regenerate the same entry');
+  const e3 = await getEntry(gen.shortId);
+  assert.equal(e3.backfill.exact, true, 'dedup hit backfills exact inputs onto legacy record');
+
+  // 3) vmess round-trip: reconstruction regenerates identical subscription
+  //    content (the re-encoded vmess text differs, so no id assertion).
+  const nodeC = 'vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJkZW1vIiwKICAiYWRkIjogImVkZ2UuZXhhbXBsZS5jb20iLAogICJwb3J0IjogIjQ0MyIsCiAgImlkIjogIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsCiAgInNjeSI6ICJhdXRvIiwKICAibmV0IjogIndzIiwKICAidGxzIjogInRscyIsCiAgInBhdGgiOiAiL3dzIiwKICAiaG9zdCI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAic25pIjogImVkZ2UuZXhhbXBsZS5jb20iCn0=';
+  const genC = await generate({ nodeLinks: nodeC, preferredIps: '192.0.2.10:8443\n192.0.2.11', namePrefix: 'PX', keepOriginalHost: true });
+  const keyC = `sub:${genC.shortId}`;
+  const recC = JSON.parse(store.get(keyC).value);
+  delete recC.inputs;
+  store.get(keyC).value = JSON.stringify(recC);
+  const eC = await getEntry(genC.shortId);
+  assert.equal(eC.backfill.exact, false);
+  assert.equal(eC.backfill.preferredIps, '192.0.2.10:8443\n192.0.2.11', 'counter suffixes are not mistaken for remarks');
+  const regenC = await generate({
+    nodeLinks: eC.backfill.nodeLinks,
+    preferredIps: eC.backfill.preferredIps,
+    namePrefix: eC.backfill.namePrefix,
+    keepOriginalHost: eC.backfill.keepOriginalHost,
+  });
+  assert.equal(regenC.plainText, genC.plainText, 'vmess reconstruction regenerates identical content');
+
+  // 4) Record without sources/nodes cannot be backfilled.
+  store.set('sub:ancient1', { value: JSON.stringify({ version: 1, createdAt: '2026-01-01T00:00:00.000Z' }), metadata: {}, expirationTtl: undefined });
+  const e4 = await getEntry('ancient1');
+  assert.equal(e4.backfill, null, 'record without sources/nodes: backfill null');
+  store.delete('sub:ancient1');
+
+  // 5) Delete removes the stored inputs along with everything else: the
+  //    inputs live INSIDE the single sub:<id> record value (no separate
+  //    key), and delete clears record + note pointer + dedup key.
+  const genD = await generate({ nodeLinks: nodeA, preferredIps: '203.0.113.9', namePrefix: 'D', note: '待删条目' });
+  const recD = JSON.parse(store.get(`sub:${genD.shortId}`).value);
+  assert.ok(recD.inputs && recD.inputs.nodeLinks === nodeA, 'inputs stored inside the record');
+  const keysBefore = [...store.keys()].filter((k) => k.includes(genD.shortId) || k === `dedup:${recD.dedupHash}`);
+  assert.equal(keysBefore.length, 3, 'record + note pointer + dedup key exist before delete');
+  const delResp = await worker.fetch(new Request('https://x.pages.dev/api/delete', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: genD.shortId, token: 'tok-0123456789abcdef' }),
+  }), env);
+  assert.equal((await delResp.json()).ok, true);
+  const keysAfter = [...store.keys()].filter((k) => k.includes(genD.shortId) || k === `dedup:${recD.dedupHash}`);
+  assert.equal(keysAfter.length, 0, 'delete leaves no trace of the entry, inputs included');
+  const e5 = await worker.fetch(adminReq(`/api/entry?id=${genD.shortId}`), env);
+  assert.equal(e5.status, 404, 'deleted entry reads 404');
+  console.log('backfill suite: exact, reconstruction, round-trips, null case, delete cleanup passed');
+}
+
+// --- Preview suite: ALL generated nodes are previewed, not just 20 ---
+{
+  const eps = Array.from({ length: 15 }, (_, i) => `10.0.0.${i + 1}`).join('\n');
+  const vmessLink = 'vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJkZW1vIiwKICAiYWRkIjogImVkZ2UuZXhhbXBsZS5jb20iLAogICJwb3J0IjogIjQ0MyIsCiAgImlkIjogIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsCiAgInNjeSI6ICJhdXRvIiwKICAibmV0IjogIndzIiwKICAidGxzIjogInRscyIsCiAgInBhdGgiOiAiL3dzIiwKICAiaG9zdCI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAic25pIjogImVkZ2UuZXhhbXBsZS5jb20iCn0=';
+  const big = await generate({ nodeLinks: `${node}\n${vmessLink}`, preferredIps: eps });
+  assert.equal(big.counts.outputNodes, 30, 'fixture really generates 30 nodes');
+  assert.equal(big.preview.length, 30, 'preview lists every generated node');
+  assert.equal(big.preview[29].name.endsWith('| 30'), true, 'last preview row is the 30th node');
+  console.log('preview suite: all 30 nodes previewed, no 20-cap');
+}
+
+// --- Link token suite: sharing a subscription must not leak admin access ---
+{
+  const linkTokA = linkTokens.get(j1.shortId);
+  assert.match(linkTokA, /^[0-9a-f]{32}$/, 'link token is a 32-hex HMAC prefix');
+  assert.notEqual(linkTokA, 'tok-0123456789abcdef');
+  assert.ok(!j1.urls.auto.includes('token=tok'), 'generated urls never carry the admin token');
+  assert.equal(new URL(j1.urls.auto).searchParams.get('token'), linkTokA);
+
+  // The admin token itself no longer opens a subscription; neither does a
+  // missing token, nor ANOTHER entry's link token.
+  assert.equal((await getSub(j1.shortId, 'raw', 'tok-0123456789abcdef')).status, 403, 'admin token must not open /sub');
+  assert.equal((await getSub(j1.shortId, 'raw', '')).status, 403, 'missing link token 403');
+  const jB = await generate({ nodeLinks: node, preferredIps: '198.51.100.23', namePrefix: 'B' });
+  const linkTokB = linkTokens.get(jB.shortId);
+  assert.ok(linkTokB && linkTokB !== linkTokA, 'each entry gets its own link token');
+  assert.equal((await getSub(jB.shortId, 'raw', linkTokA)).status, 403, "entry A's link token must not open entry B");
+  assert.equal((await getSub(jB.shortId, 'raw')).status, 200, 'entry B opens with its own link token');
+
+  // A link token is worthless at the admin endpoints.
+  const listByLink = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': linkTokA } }), env);
+  assert.equal(listByLink.status, 403, 'link token must not list entries');
+  const noteByLink = await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: j1.shortId, note: 'pwned', token: linkTokA }),
+  }), env);
+  assert.equal(noteByLink.status, 403, 'link token must not modify entries');
+
+  // The admin-authenticated reads hand the frontend each entry's link
+  // token, matching the token in the generated urls.
+  const lr = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  const itemA = lr.items.find((i) => i.id === j1.shortId);
+  assert.equal(itemA.linkToken, linkTokA, 'list item carries the same link token');
+  const er = await (await worker.fetch(adminReq(`/api/entry?id=${j1.shortId}`), env)).json();
+  assert.equal(er.linkToken, linkTokA, 'entry read carries the same link token');
+
+  // Surge output embeds the per-entry link token, never the admin
+  // token. (j1 is vless-only, and since audit round 9 its Surge
+  // target answers a clear 400 instead of an empty profile — so the
+  // token-embedding check runs on a trojan entry.)
+  const jTrojan = await generate({ nodeLinks: 'trojan://pw@tj.example.com:443#tj', preferredIps: '203.0.113.9' });
+  const surge = await getSub(jTrojan.shortId, 'surge');
+  assert.equal(surge.status, 200);
+  assert.ok(surge.body.includes(`?token=${linkTokens.get(jTrojan.shortId)}`), 'surge profile carries the link token');
+  assert.ok(!surge.body.includes('token=tok'), 'surge profile must not contain the admin token');
+  const surgeVless = await getSub(j1.shortId, 'surge');
+  assert.equal(surgeVless.status, 400, 'vless-only surge target is a clear error (audit round 9)');
+  console.log('link token suite: per-entry tokens, admin token rejected at /sub, link token rejected at admin: passed');
+}
+
+// --- Audit-fix suite (2026-10-28): parse tolerance, Surge injection,
+//     pointer TTL, port range, prefix cap, generate auth, UA auto ---
+{
+  // Generate requires the admin token once one is configured.
+  const noTok = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ nodeLinks: node, preferredIps: '1.2.3.4' }),
+  }), env);
+  assert.equal(noTok.status, 403, 'generate without token 403');
+  const wrongTok = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'nope', nodeLinks: node, preferredIps: '1.2.3.4' }),
+  }), env);
+  assert.equal(wrongTok.status, 403, 'generate with wrong token 403');
+
+  // One bad line no longer kills the batch; it is skipped and reported.
+  const mixed = await generate({
+    nodeLinks: node + '\nvmess://!!!broken!!!\nvless://not a url',
+    preferredIps: '10.9.9.9',
+  });
+  assert.equal(mixed.counts.inputNodes, 1, 'only the valid node survives');
+  assert.ok(mixed.warnings.some((w) => w.includes('已跳过')), 'skipped lines are reported in warnings');
+
+  // Surge injection: a newline in a node name must not create config lines.
+  const evil = 'trojan://pw@edge.example.com:443?security=tls#innocent%0AInjected%20%3D%20trojan%2C%20attacker.example.com%2C%20443%2C%20password%3Dpw2';
+  const ej = await generate({ nodeLinks: evil, preferredIps: '10.9.9.8' });
+  const eSub = await getSub(ej.shortId, 'surge');
+  assert.equal(eSub.status, 200);
+  assert.ok(!eSub.body.split('\n').some((l) => l.startsWith('Injected')), 'no injected Surge line');
+  assert.ok(!eSub.body.includes('attacker.example.com, 443, password=pw2\n'), 'injected payload not present as a line');
+
+  // The note pointer key shares the record's TTL, across retention edits.
+  const timed = await generate({ nodeLinks: node, preferredIps: '10.9.9.7', note: 'ttl-note', storageMode: 'days', retentionDays: 3 });
+  const ptrKey = `note:ttl-note:${timed.shortId}`;
+  assert.equal(store.get(ptrKey)?.expirationTtl, 259200, 'pointer carries the same TTL as the record');
+  const ret = (payload) => worker.fetch(new Request('https://x.pages.dev/api/retention', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', ...payload }),
+  }), env);
+  await ret({ id: timed.shortId, mode: 'permanent' });
+  assert.equal(store.get(ptrKey)?.expirationTtl, undefined, 'pointer TTL cleared with permanent');
+  await ret({ id: timed.shortId, mode: 'days', days: 9 });
+  assert.equal(store.get(ptrKey)?.expirationTtl, 777600, 'pointer TTL follows retention changes');
+
+  // Out-of-range preferred port is a clear 400, not a generated dud.
+  const badPort = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', nodeLinks: node, preferredIps: '1.2.3.4:99999' }),
+  }), env);
+  assert.equal(badPort.status, 400, 'port 99999 rejected');
+
+  // The name prefix is capped before hashing: prefixes that differ only
+  // past the cap produce the SAME entry, and names stay bounded.
+  const capA = await generate({ nodeLinks: node, preferredIps: '10.9.9.6', namePrefix: 'A'.repeat(100) + 'X'.repeat(60) });
+  const capB = await generate({ nodeLinks: node, preferredIps: '10.9.9.6', namePrefix: 'A'.repeat(100) + 'Y'.repeat(60) });
+  assert.equal(capA.shortId, capB.shortId, 'prefix capped before dedup hash');
+  assert.ok(capA.preview[0].name.length < 160, 'node names stay bounded');
+
+  // "Auto" adapts to the client: Clash UA -> YAML, Surge UA -> profile,
+  // anything else -> the historical base64 raw.
+  const linkTok = linkTokens.get(j1.shortId);
+  const fetchAuto = (ua) => worker.fetch(new Request(`https://x.pages.dev/sub/${j1.shortId}?token=${linkTok}`, {
+    headers: { 'user-agent': ua },
+  }), env);
+  const clashAuto = await (await fetchAuto('ClashforWindows/0.20.39')).text();
+  assert.ok(clashAuto.startsWith('mixed-port:'), 'clash UA gets clash yaml');
+  // The Surge-UA check needs a Surge-supported entry (j1 is vless-only
+  // and now answers the audit-9 400 on the surge target).
+  const jTj2 = await generate({ nodeLinks: 'trojan://pw@tj2.example.com:443#tj2', preferredIps: '203.0.113.10' });
+  const surgeAutoResp = await worker.fetch(new Request('https://x.pages.dev/sub/' + jTj2.shortId + '?token=' + linkTokens.get(jTj2.shortId), { headers: { 'user-agent': 'Surge/5.10.0' } }), env);
+  const surgeAuto = await surgeAutoResp.text();
+  assert.ok(surgeAuto.includes('[Proxy]'), 'surge UA gets surge profile');
+  const plainAuto = await (await fetchAuto('Mozilla/5.0')).text();
+  assert.equal(Buffer.from(plainAuto, 'base64').toString('utf8'), j1.plainText, 'unknown UA keeps base64 raw');
+
+  console.log('audit-fix suite: generate auth, parse tolerance, surge injection, pointer TTL, port range, prefix cap, UA auto: passed');
+}
+
+// --- Dynamic subscription suite: API preferred-IP sources ---
+{
+  const realFetch = globalThis.fetch;
+  let txtList = '104.16.1.2\n104.16.1.3:8443\n104.16.1.4';
+  let sourceDown = false;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (sourceDown) throw new Error('network down');
+    if (u === 'https://ips.example.com/list.txt') return new Response(txtList, { status: 200 });
+    if (u === 'https://fcdn.example.com/ips.txt' || u === 'https://10.example.com/ips.txt') return new Response(txtList, { status: 200 });
+    if (u === 'https://ips.example.com/redir') {
+      // A real 302: redirects are followed manually since round 18,
+      // so the hop is validated (and refused) before being fetched.
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/evil' } });
+    }
+    if (u === 'https://ips.example.com/list.json') return new Response(JSON.stringify(['104.16.5.5', '104.16.5.6:8443']), { status: 200 });
+    if (u === 'https://ips.example.com/list.csv') return new Response('IP,port,colo\n104.16.7.7,443,HKG\n104.16.7.8,8443,SIN', { status: 200 });
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    // Source test endpoint: auth + parsing across formats + URL guards.
+    const noTok = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://ips.example.com/list.txt' }),
+    }), env);
+    assert.equal(noTok.status, 403, 'ip-source-test requires the admin token');
+    const testPost = (url) => worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', url }),
+    }), env).then((r) => r.json());
+    const t1 = await testPost('https://ips.example.com/list.txt');
+    assert.equal(t1.count, 3, 'txt source parsed');
+    assert.ok(t1.sample.includes('104.16.1.3:8443'), 'txt sample keeps explicit port');
+    assert.equal((await testPost('https://ips.example.com/list.json')).count, 2, 'json source parsed');
+    assert.equal((await testPost('https://ips.example.com/list.csv')).count, 2, 'csv source parsed (endpoint = first cell)');
+    const tHttp = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', url: 'http://ips.example.com/list.txt' }),
+    }), env);
+    assert.equal(tHttp.status, 400, 'http source rejected');
+    const tPriv = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', url: 'https://127.0.0.1/list.txt' }),
+    }), env);
+    assert.equal(tPriv.status, 400, 'private-IP source rejected');
+
+    // Generate a dynamic entry: the snapshot takes the first `limit`.
+    const dyn = await generate({ nodeLinks: node, ipMode: 'api', sourceUrl: 'https://ips.example.com/list.txt', sourceLimit: 2 });
+    assert.ok(dyn.dynamic && dyn.dynamic.sourceTotal === 3, 'dynamic metadata returned');
+    assert.equal(dyn.counts.outputNodes, 2, 'limit applied at generation');
+    assert.ok(dyn.plainText.includes('@104.16.1.2:443') && dyn.plainText.includes('@104.16.1.3:8443'), 'snapshot endpoints in order');
+    const dynSub1 = await getSub(dyn.shortId, 'plain');
+    assert.equal(dynSub1.body, dyn.plainText, 'sub initially serves the snapshot');
+
+    // The source rotates; once the cache is stale, /sub follows it.
+    txtList = '104.16.9.9\n104.16.9.10';
+    const cacheKey = [...store.keys()].find((k) => k.startsWith('ipcache:'));
+    assert.ok(cacheKey, 'source cached in KV');
+    const ageCache = () => {
+      const c = JSON.parse(store.get(cacheKey).value);
+      c.fetchedAt = Date.now() - 2 * 3600e3;
+      c.lastAttempt = 0;
+      store.set(cacheKey, { value: JSON.stringify(c) });
+      // Round 16: /sub also keeps a short-lived merged entry cache;
+      // aging simulated time must age both layers together.
+      const ecKey = 'entrycache:' + dyn.shortId;
+      if (store.has(ecKey)) {
+        const ec = JSON.parse(store.get(ecKey).value);
+        ec.at = Date.now() - 2 * 3600e3;
+        store.set(ecKey, { value: JSON.stringify(ec) });
+      }
+    };
+    ageCache();
+    const dynSub2 = await getSub(dyn.shortId, 'plain');
+    assert.ok(dynSub2.body.includes('@104.16.9.9:443') && dynSub2.body.includes('@104.16.9.10:443'), 'sub follows the rotated source');
+    assert.ok(!dynSub2.body.includes('104.16.1.2'), 'old snapshot replaced');
+
+    // Source down + stale cache: the cached list keeps serving.
+    sourceDown = true;
+    ageCache();
+    const dynSub3 = await getSub(dyn.shortId, 'plain');
+    assert.equal(dynSub3.status, 200);
+    assert.ok(dynSub3.body.includes('@104.16.9.9:443'), 'stale cache serves while source is down');
+
+    // Source down + cache gone: the generation-time snapshot serves.
+    // (Round 16: "cache gone" covers the merged entry cache too.)
+    store.delete(cacheKey);
+    store.delete('entrycache:' + dyn.shortId);
+    const dynSub4 = await getSub(dyn.shortId, 'plain');
+    assert.equal(dynSub4.status, 200);
+    assert.ok(dynSub4.body.includes('@104.16.1.2:443'), 'entry snapshot is the final fallback');
+    sourceDown = false;
+
+    // Identity: re-generating against the same source hits the same
+    // entry even though the list rotated in between.
+    txtList = '104.16.1.2\n104.16.1.3:8443\n104.16.1.4';
+    const dynAgain = await generate({ nodeLinks: node, ipMode: 'api', sourceUrl: 'https://ips.example.com/list.txt', sourceLimit: 2 });
+    assert.equal(dynAgain.shortId, dyn.shortId, 'dynamic dedup is by source, not by resolved IPs');
+
+    // The admin list flags the entry as dynamic.
+    const lr = await (await worker.fetch(adminReq('/api/list'), env)).json();
+    const item = lr.items.find((i) => i.id === dyn.shortId);
+    assert.equal(item.dynamic, true, 'list item marks dynamic entries');
+    assert.equal(item.sourceUrl, 'https://ips.example.com/list.txt');
+
+    // Audit regressions (second self-audit): URL-guard false positives,
+    // redirect smuggling, URL-normalization dedup, backfill snapshots.
+    assert.equal((await testPost('https://fcdn.example.com/ips.txt')).count, 3, 'DNS names starting with fc are not private IPs');
+    assert.equal((await testPost('https://10.example.com/ips.txt')).count, 3, 'DNS names starting with digits are not private IPs');
+    const tRedir = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', url: 'https://ips.example.com/redir' }),
+    }), env);
+    assert.equal(tRedir.status, 400, 'redirect to a private target is rejected');
+    const v1 = await generate({ nodeLinks: node, ipMode: 'api', sourceUrl: 'https://IPS.example.com:443/list.txt', sourceLimit: 2 });
+    const v2 = await generate({ nodeLinks: node, ipMode: 'api', sourceUrl: 'https://ips.example.com/list.txt', sourceLimit: 2 });
+    assert.equal(v1.shortId, dyn.shortId, 'uppercase/default-port variant lands on the original entry');
+    assert.equal(v2.shortId, v1.shortId, 'source URL spelling variants dedup to one entry');
+    const entryResp = await (await worker.fetch(adminReq(`/api/entry?id=${dyn.shortId}`), env)).json();
+    // Backfill contract after the mixed-box redesign: an entry made via
+    // the legacy api payload backfills as its source line in the mixed
+    // box, and regenerating from that line refreshes the same entry
+    // (the single-source identity bridge keeps the legacy api: hash).
+    assert.equal(entryResp.backfill.ipMode, 'mixed', 'backfill reports the mixed box');
+    assert.equal(entryResp.backfill.preferredIps, 'https://ips.example.com/list.txt', 'backfill box holds the source line');
+    const dynRe = await generate({ nodeLinks: node, preferredIps: 'https://ips.example.com/list.txt', sourceLimit: 2 });
+    assert.equal(dynRe.shortId, dyn.shortId, 'lone-source mixed regeneration refreshes the legacy entry');
+    console.log('dynamic suite: source parsing, follow-on-rotate, cache + snapshot fallbacks, source-based dedup: passed');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// --- Mixed-source suite: literal lines + multiple source URLs in one box ---
+{
+  const realFetch = globalThis.fetch;
+  let listA = '104.16.2.2\n104.16.2.3:8443\n104.16.2.4';
+  let downA = false;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u === 'https://a.example.com/l.txt') {
+      if (downA) throw new Error('network down');
+      return new Response(listA, { status: 200 });
+    }
+    if (u === 'https://c.example.com/l.txt') return new Response(listA, { status: 200 });
+    if (u === 'https://b.example.com/l.txt') return new Response('104.16.3.3\n104.16.2.3:8443', { status: 200 });
+    if (u === 'https://dead.example.com/l.txt') throw new Error('network down');
+    throw new Error('unexpected fetch ' + u);
+  };
+  const genRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+  }), env);
+  try {
+    const mixedText = '104.16.9.1#FIXED\nhttps://a.example.com/l.txt\nhttps://b.example.com/l.txt';
+    const mix = await generate({ nodeLinks: node, preferredIps: mixedText, sourceLimit: 2 });
+    assert.equal(mix.counts.preferredEndpoints, 4, 'literal + first-2 of each source, cross-source dup dropped');
+    assert.equal(mix.counts.outputNodes, 4);
+    assert.equal(mix.dynamic.sources.length, 2, 'both sources reported');
+    assert.equal(mix.dynamic.sourceTotal, 5, 'source totals summed');
+    assert.ok(mix.warnings.some((w) => w.includes('2 个来源')), 'multi-source warning');
+    const order = ['104.16.9.1', '104.16.2.2', '104.16.2.3', '104.16.3.3'].map((s) => mix.plainText.indexOf(s));
+    assert.ok(order.every((v, i) => v >= 0 && (i === 0 || order[i - 1] < v)), 'merged in box order');
+
+    // Audit fix F4: a source whose list fully duplicates an earlier
+    // one reports used = 0 — it contributed nothing after dedupe.
+    const dupSrc = await generate({ nodeLinks: node, preferredIps: 'https://a.example.com/l.txt\nhttps://c.example.com/l.txt', sourceLimit: 10 });
+    assert.equal(dupSrc.counts.preferredEndpoints, 3);
+    assert.equal(dupSrc.dynamic.sources[0].used, 3, 'first source contributed all');
+    assert.equal(dupSrc.dynamic.sources[1].used, 0, 'fully-duplicated source contributed none');
+
+    // Per-source test-fetch over the whole box.
+    const tp = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', text: '1.2.3.4\nhttps://a.example.com/l.txt\nhttps://dead.example.com/l.txt' }),
+    }), env).then((r) => r.json());
+    assert.equal(tp.ok, true);
+    assert.equal(tp.literalCount, 1, 'literal lines counted');
+    assert.equal(tp.results.length, 2);
+    assert.equal(tp.results[0].count, 3, 'live source counted');
+    assert.equal(tp.results[1].ok, false, 'dead source reported, not fatal');
+
+    // Record shape: literals + per-source snapshots are stored.
+    const rec = JSON.parse(store.get(`sub:${mix.shortId}`).value);
+    assert.equal(rec.dynamic.sources.length, 2);
+    assert.equal(rec.dynamic.literals.length, 1);
+    assert.equal(rec.dynamic.literals[0].server, '104.16.9.1');
+    assert.equal(rec.inputs.ipMode, 'mixed');
+    assert.equal(rec.inputs.preferredIps, mixedText, 'mixed box stored verbatim');
+
+    // The admin list reports the source count.
+    const lr = await (await worker.fetch(adminReq('/api/list'), env)).json();
+    const item = lr.items.find((i) => i.id === mix.shortId);
+    assert.equal(item.dynamic, true);
+    assert.equal(item.sourceCount, 2);
+    assert.equal(item.sourceUrl, 'https://a.example.com/l.txt', 'first source kept for older readers');
+
+    // Backfill restores the mixed box exactly.
+    const entryResp = await (await worker.fetch(adminReq(`/api/entry?id=${mix.shortId}`), env)).json();
+    assert.equal(entryResp.backfill.ipMode, 'mixed');
+    assert.equal(entryResp.backfill.preferredIps, mixedText);
+    assert.equal(entryResp.backfill.sourceLimit, 2);
+
+    // /sub follows a rotation in ONE source; literals and the other
+    // source stay put.
+    const sub1 = await getSub(mix.shortId, 'plain');
+    assert.equal(sub1.body, mix.plainText, 'sub initially serves the generation merge');
+    listA = '104.16.2.9';
+    for (const k of [...store.keys()].filter((x) => x.startsWith('ipcache:'))) {
+      const c = JSON.parse(store.get(k).value);
+      c.fetchedAt = Date.now() - 2 * 3600e3;
+      c.lastAttempt = 0;
+      store.set(k, { value: JSON.stringify(c) });
+    }
+    // Round 16: age the merged entry cache alongside the source caches.
+    const mixEcKey = 'entrycache:' + mix.shortId;
+    if (store.has(mixEcKey)) {
+      const ec = JSON.parse(store.get(mixEcKey).value);
+      ec.at = Date.now() - 2 * 3600e3;
+      store.set(mixEcKey, { value: JSON.stringify(ec) });
+    }
+    const sub2 = await getSub(mix.shortId, 'plain');
+    assert.ok(sub2.body.includes('@104.16.2.9:443'), 'rotated source followed');
+    assert.ok(sub2.body.includes('@104.16.9.1:443'), 'literal line stays fixed');
+    assert.ok(sub2.body.includes('@104.16.3.3:443'), 'other source unchanged');
+    assert.ok(!sub2.body.includes('104.16.2.2'), 'rotated-out endpoint gone');
+
+    // Identity: same box refreshes; source order in the box does not
+    // matter; a different limit is a different entry.
+    const mixAgain = await generate({ nodeLinks: node, preferredIps: mixedText, sourceLimit: 2 });
+    assert.equal(mixAgain.shortId, mix.shortId, 'same mixed content refreshes the same entry');
+    const mixSwapped = await generate({ nodeLinks: node, preferredIps: '104.16.9.1#FIXED\nhttps://b.example.com/l.txt\nhttps://a.example.com/l.txt', sourceLimit: 2 });
+    assert.equal(mixSwapped.shortId, mix.shortId, 'source order is not part of the identity');
+    const mixLimit = await generate({ nodeLinks: node, preferredIps: mixedText, sourceLimit: 3 });
+    assert.notEqual(mixLimit.shortId, mix.shortId, 'limit is part of the identity');
+
+    // A dead source next to literals is skipped with a named warning;
+    // a dead source alone fails like the old single-source path.
+    const tolerated = await generate({ nodeLinks: node, preferredIps: '104.16.9.1\nhttps://dead.example.com/l.txt', sourceLimit: 2 });
+    assert.equal(tolerated.counts.preferredEndpoints, 1, 'dead source skipped, literals still generate');
+    assert.ok(tolerated.warnings.some((w) => w.includes('dead.example.com') && w.includes('拉取失败')), 'dead source named in warnings');
+    const deadOnly = await genRaw({ nodeLinks: node, preferredIps: 'https://dead.example.com/l.txt' });
+    assert.equal(deadOnly.status, 400, 'dead source with nothing else fails');
+    assert.ok((await deadOnly.json()).error.includes('来源拉取失败'), 'failure names the source fetch');
+
+    // Guards: http lines and too many sources are clear 400s.
+    const httpLine = await genRaw({ nodeLinks: node, preferredIps: 'http://a.example.com/l.txt' });
+    assert.equal(httpLine.status, 400, 'http source line rejected');
+    const six = await genRaw({ nodeLinks: node, preferredIps: [1, 2, 3, 4, 5, 6].map((i) => `https://s${i}.example.com/l.txt`).join('\n') });
+    assert.equal(six.status, 400, 'six sources refused');
+    assert.ok((await six.json()).error.includes('最多 5 个'), 'cap named in the error');
+
+    // Audit fix F2: a "#备注" typed after a source link is a remark,
+    // not part of the URL — both spellings are the same entry.
+    const fragA = await generate({ nodeLinks: node, preferredIps: 'https://a.example.com/l.txt#备注A' });
+    assert.equal(fragA.dynamic.sourceUrl, 'https://a.example.com/l.txt', 'fragment stripped from the stored source');
+    const fragB = await generate({ nodeLinks: node, preferredIps: 'https://a.example.com/l.txt#备注B' });
+    assert.equal(fragB.shortId, fragA.shortId, 'different remarks after a source link stay one entry');
+
+    // Audit fix F3: a static paste shaped like a dynamic identity
+    // must not merge with the real dynamic entry.
+    // Round 16 annotation: the crafted paste's only line is not a
+    // plausible host at all, so literal-endpoint validation now
+    // refuses the generate outright — the anti-collision property
+    // holds by refusal (the static: identity marker still guards
+    // identity-shaped lines that DO parse as endpoints).
+    const crafted = await genRaw({ nodeLinks: node, preferredIps: 'api:https://a.example.com/l.txt|10' });
+    assert.equal(crafted.status, 400, 'crafted identity-shaped paste refused');
+    const realDyn = await generate({ nodeLinks: node, preferredIps: 'https://a.example.com/l.txt' });
+    assert.ok(JSON.parse(store.get(`sub:${realDyn.shortId}`).value).dynamic, 'the real entry is dynamic');
+
+    // Audit fix F1: refreshing while a source is down (cache evicted)
+    // keeps its stored snapshot; /sub still serves it in the outage.
+    const keepBox = '104.16.9.1\nhttps://a.example.com/l.txt';
+    const keep1 = await generate({ nodeLinks: node, preferredIps: keepBox, sourceLimit: 2 });
+    const keptSnap = JSON.parse(store.get(`sub:${keep1.shortId}`).value).dynamic.sources[0].endpoints;
+    assert.ok(keptSnap.length > 0, 'snapshot seeded');
+    downA = true;
+    for (const k of [...store.keys()].filter((x) => x.startsWith('ipcache:'))) store.delete(k);
+    const keep2 = await generate({ nodeLinks: node, preferredIps: keepBox, sourceLimit: 2 });
+    assert.equal(keep2.shortId, keep1.shortId, 'down-refresh lands on the same entry');
+    const keptAfter = JSON.parse(store.get(`sub:${keep2.shortId}`).value).dynamic;
+    assert.deepEqual(keptAfter.sources[0].endpoints, keptSnap, 'failed source keeps its previous snapshot');
+    assert.ok(keptAfter.endpoints.some((e) => e.server === keptSnap[0].server), 'merged fallback keeps the snapshot too');
+    const subKept = await getSub(keep1.shortId, 'plain');
+    assert.ok(subKept.body.includes(keptSnap[0].server), 'sub serves the preserved snapshot during the outage');
+    assert.ok(subKept.body.includes('104.16.9.1'), 'literal still served');
+    downA = false;
+    console.log('mixed suite: box parsing, ordered merge, per-source fallback, identity, guards: passed');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// --- Tags suite: record-carried labels, picker vocabulary, filtering data ---
+{
+  const recOf = (id) => JSON.parse(store.get(`sub:${id}`).value);
+  // Sanitization on generate: trim, whitespace collapse, per-tag cap,
+  // case-insensitive dedupe (first spelling wins).
+  const t1 = await generate({ nodeLinks: node, preferredIps: '104.16.7.7', tags: [' 香港 ', 'HK', 'hk', '主 力', 'x'.repeat(30)] });
+  assert.deepEqual(t1.tags, ['香港', 'HK', '主 力', 'x'.repeat(24)], 'tags sanitized on generate');
+  assert.deepEqual(recOf(t1.shortId).tags, t1.tags, 'tags stored on the record');
+
+  // Tags are NOT part of the dedup identity, and an absent field on a
+  // refresh leaves the stored tags untouched.
+  const t2 = await generate({ nodeLinks: node, preferredIps: '104.16.7.7' });
+  assert.equal(t2.shortId, t1.shortId, 'same content, no tags field: same entry');
+  assert.deepEqual(recOf(t1.shortId).tags, t1.tags, 'refresh without tags keeps them');
+  // A present field replaces wholesale — including an explicit empty set.
+  const t3 = await generate({ nodeLinks: node, preferredIps: '104.16.7.7', tags: ['备用'] });
+  assert.equal(t3.shortId, t1.shortId, 'same content with tags: still the same entry');
+  assert.deepEqual(recOf(t1.shortId).tags, ['备用'], 'present tags replace');
+  const t4 = await generate({ nodeLinks: node, preferredIps: '104.16.7.7', tags: [] });
+  assert.deepEqual(recOf(t1.shortId).tags, [], 'explicit empty array clears');
+
+  // Per-entry cap.
+  const many = await generate({ nodeLinks: node, preferredIps: '104.16.7.8', tags: Array.from({ length: 12 }, (_, i) => `t${i}`) });
+  assert.equal(many.tags.length, 10, 'at most 10 tags per entry');
+
+  // The admin list carries tags; untagged entries report [].
+  const plain = await generate({ nodeLinks: node, preferredIps: '104.16.7.9' });
+  assert.deepEqual(plain.tags, [], 'fresh entry without tags reports []');
+  const lr = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  assert.deepEqual(lr.items.find((i) => i.id === many.shortId).tags, many.tags, 'list item carries tags');
+  assert.deepEqual(lr.items.find((i) => i.id === plain.shortId).tags, [], 'list item defaults to []');
+
+  // Vocabulary endpoint: counts across entries, auth required.
+  const vocab = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.equal(vocab.ok, true);
+  assert.equal(vocab.tags.find((v) => v.tag === 't0').count, 1, 'vocabulary counts entries per tag');
+  assert.ok(!vocab.tags.some((v) => v.tag === '备用'), 'cleared tags leave the vocabulary');
+  const noAuth = await worker.fetch(new Request('https://x.pages.dev/api/tags'), env);
+  assert.equal(noAuth.status, 403, 'vocabulary requires the admin token');
+
+  // Save endpoint (management editor): sanitizes, persists, 404s and
+  // auth behave like the note endpoint.
+  const save = await worker.fetch(new Request('https://x.pages.dev/api/tags', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: plain.shortId, tags: [' 直播 ', 'HK'] }),
+  }), env).then((r) => r.json());
+  assert.deepEqual(save.tags, ['直播', 'HK'], 'save returns the sanitized set');
+  assert.deepEqual(recOf(plain.shortId).tags, ['直播', 'HK'], 'save persisted on the record');
+  const entry = await (await worker.fetch(adminReq(`/api/entry?id=${plain.shortId}`), env)).json();
+  assert.deepEqual(entry.tags, ['直播', 'HK'], 'entry read carries tags for verification');
+  assert.deepEqual(entry.backfill.tags, ['直播', 'HK'], 'backfill carries tags');
+  const missing = await worker.fetch(new Request('https://x.pages.dev/api/tags', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: 'NOPE000000', tags: [] }),
+  }), env);
+  assert.equal(missing.status, 404, 'save on a missing entry 404s');
+  const saveNoAuth = await worker.fetch(new Request('https://x.pages.dev/api/tags', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: plain.shortId, tags: [] }),
+  }), env);
+  assert.equal(saveNoAuth.status, 403, 'save requires the admin token');
+
+  // Tag ORDER endpoints: one shared server-side arrangement (the
+  // filter bar's order), replacing the old per-browser localStorage
+  // preference that made devices disagree.
+  const getOrder = () => worker.fetch(adminReq('/api/tag-order'), env).then((r) => r.json());
+  const postOrder = (body) => worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+  }), env);
+  assert.deepEqual((await getOrder()).order, [], 'tag order starts empty');
+  assert.equal((await worker.fetch(new Request('https://x.pages.dev/api/tag-order'), env)).status, 403, 'tag order read requires the admin token');
+  const savedOrder = await postOrder({ order: ['直播', 'HK', '直播', 7, ''] }).then((r) => r.json());
+  assert.deepEqual(savedOrder.order, ['直播', 'HK'], 'tag order save sanitizes and dedupes');
+  assert.deepEqual((await getOrder()).order, ['直播', 'HK'], 'tag order round-trips');
+  assert.equal((await postOrder({ order: 'HK' })).status, 400, 'non-array order 400s');
+  const imp1 = await postOrder({ order: ['甲'], ifEmpty: true }).then((r) => r.json());
+  assert.equal(imp1.imported, false, 'ifEmpty import never overwrites an existing order');
+  assert.deepEqual(imp1.order, ['直播', 'HK'], 'ifEmpty import returns the existing order');
+  await env.SUB_STORE.delete('meta:tag-order');
+  const imp2 = await postOrder({ order: ['甲', '乙'], ifEmpty: true }).then((r) => r.json());
+  assert.equal(imp2.imported, true, 'ifEmpty import claims an empty server order');
+  assert.deepEqual((await getOrder()).order, ['甲', '乙'], 'imported order reads back');
+  const listAfter = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  assert.ok(!listAfter.items.some((i) => i.id === 'meta:tag-order'), 'the order record never appears as an entry');
+
+  // Read-path sanitization (audit P1): a record hand-edited in KV
+  // with junk tag members must not poison list/entry/vocabulary
+  // responses — one corrupt record used to take the whole admin
+  // list down through the client's sort comparator.
+  const victim = await generate({ nodeLinks: node, preferredIps: '104.16.7.77', tags: ['干净'] });
+  const vKey = `sub:${victim.shortId}`;
+  const vRec = JSON.parse(store.get(vKey).value);
+  vRec.tags = [123, null, { x: 1 }, '  带空格  ', '干净', '干净'];
+  vRec.note = 123; // E1: a non-string note must read back as '' everywhere
+  store.set(vKey, { value: JSON.stringify(vRec) });
+  const poisonListRes = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  assert.deepEqual(poisonListRes.items.find((i) => i.id === victim.shortId).tags, ['带空格', '干净'], 'list sanitizes stored tags on read');
+  assert.equal(poisonListRes.items.find((i) => i.id === victim.shortId).note, '', 'list coerces a non-string note to empty on read');
+  const poisonEntryRes = await (await worker.fetch(adminReq(`/api/entry?id=${victim.shortId}`), env)).json();
+  assert.deepEqual(poisonEntryRes.tags, ['带空格', '干净'], 'entry sanitizes stored tags on read');
+  assert.equal(poisonEntryRes.note, '', 'entry coerces a non-string note to empty on read');
+  assert.deepEqual(poisonEntryRes.backfill.tags, ['带空格', '干净'], 'backfill sanitizes stored tags on read');
+  const poisonVocabRes = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.ok(poisonVocabRes.tags.every((v) => typeof v.tag === 'string'), 'vocabulary never carries non-string tags');
+  assert.ok(!poisonVocabRes.tags.some((v) => v.tag === 'null' || v.tag === '123'), 'vocabulary drops junk members instead of coercing them');
+
+  // Audit fixes (2026-10-31): F1 a missing/non-array tags field must be
+  // a 400, never a silent wipe; F3 non-string members are dropped, not
+  // String()-coerced into junk tags; F7 the per-tag length cap never
+  // splits a surrogate pair; F5+F6 the vocabulary merges case variants
+  // and counts entries, not occurrences.
+  const postTagsRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/tags', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+  }), env);
+  assert.equal((await postTagsRaw({ id: plain.shortId })).status, 400, 'F1: missing tags field 400s');
+  assert.equal((await postTagsRaw({ id: plain.shortId, tags: 'HK' })).status, 400, 'F1: string tags 400s');
+  assert.deepEqual(recOf(plain.shortId).tags, ['直播', 'HK'], 'F1: rejected saves leave tags untouched');
+  const f3 = await generate({ nodeLinks: node, preferredIps: '104.16.7.10', tags: [{}, [], 7, '正'] });
+  assert.deepEqual(f3.tags, ['正'], 'F3: non-string members dropped');
+  const f7 = await generate({ nodeLinks: node, preferredIps: '104.16.7.11', tags: ['a' + '🔥'.repeat(12)] });
+  assert.equal(f7.tags[0].length, 23, 'F7: cap drops the dangling surrogate half');
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(f7.tags[0]), 'F7: no lone surrogate stored');
+  store.set('sub:CASEAAA', { value: JSON.stringify({ version: 2, tags: ['HK', 'hk', 'HK'] }), metadata: undefined, expirationTtl: undefined });
+  store.set('sub:CASEBBB', { value: JSON.stringify({ version: 2, tags: ['hk'] }), metadata: undefined, expirationTtl: undefined });
+  const vocab2 = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  const hkEntry = vocab2.tags.filter((v) => v.tag.toLowerCase() === 'hk');
+  assert.equal(hkEntry.length, 1, 'F5: case variants merge into one vocabulary entry');
+  assert.equal(hkEntry[0].count, 3, 'F5+F6: count is entries (plain + CASEAAA + CASEBBB), duplicates inside one record ignored');
+  store.delete('sub:CASEAAA');
+  store.delete('sub:CASEBBB');
+  console.log('tags suite: sanitize, refresh semantics, vocabulary, save endpoint, backfill: passed');
+}
+
+// --- Audit round 3 suite: hostile node links vs output formats, output cap ---
+{
+  // Node links are semi-untrusted input (they get copied from public
+  // sources): fields carrying newlines/commas must not be able to forge
+  // Clash YAML keys or whole Surge config lines.
+  const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+  const evilVmess = 'vmess://' + b64(JSON.stringify({
+    v: '2', ps: 'evilvmess', add: 'a.example.com', port: '443',
+    id: 'f541611e-0aeb-4900-aa47-6e95d4916a49\n    tls: false\n    injected: yes',
+    aid: '0', scy: 'auto\n    udp: false', net: 'ws', host: 'h.example.com', path: '/ws', tls: 'tls',
+  }));
+  const evilTrojan = 'trojan://pw%0A%5BProxy%5D%0AFake%20%3D%20trojan%2C%206.6.6.6%2C%20443%2C%20password%3Dx@t.example.com:443?security=tls&type=ws&path=%2Fws&host=h.example.com#eviltrojan';
+  const evil = await generate({ nodeLinks: evilVmess + '\n' + evilTrojan, preferredIps: '104.16.1.2' });
+  assert.equal(evil.counts.outputNodes, 2);
+
+  const clash = await getSub(evil.shortId, 'clash');
+  assert.ok(!clash.body.includes('\n    injected'), 'no forged YAML key from uuid');
+  assert.ok(!clash.body.includes('\npassword:'), 'no unindented password line from trojan password');
+  assert.ok(clash.body.includes('cipher: "auto'), 'cipher is a quoted scalar');
+  assert.ok(clash.body.includes('uuid: "f541611e'), 'uuid is a quoted scalar');
+  assert.ok(clash.body.includes('server: "104.16.1.2"'), 'server is a quoted scalar');
+
+  const surge = await getSub(evil.shortId, 'surge');
+  const surgeLines = surge.body.split('\n');
+  assert.equal(surgeLines.filter((l) => l === '[Proxy]').length, 1, 'exactly one [Proxy] section');
+  assert.ok(!surgeLines.some((l) => l.startsWith('Fake')), 'no forged Surge proxy line');
+  // Round 15 supersedes the second half of this expectation: the
+  // trojan's password is comma-carrying injection debris, and such
+  // credentials are now excluded from Surge output entirely rather
+  // than flattened into a corrupted line — the vmess stays, alone
+  // and on a single line.
+  assert.equal(surgeLines.filter((l) => l.includes(' = vmess, ') || l.includes(' = trojan, ')).length, 1, 'only the vmess proxy remains in Surge');
+  assert.ok(surgeLines.some((l) => l.includes(' = vmess, ')), 'the vmess proxy stays on a single line');
+
+  // Output ceiling: nodes x endpoints is refused past 10000 with the
+  // real numbers, and exactly 10000 still succeeds.
+  const manyIps = (n) => Array.from({ length: n }, (_, i) => `104.16.${(i >> 8) & 255}.${i & 255}`).join('\n');
+  const tooMany = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', nodeLinks: node + '\n' + node.replace('#US-Node-1', '#US-Node-2'), preferredIps: manyIps(6000) }),
+  }), env);
+  assert.equal(tooMany.status, 400, 'cartesian explosion refused');
+  const tooManyJson = await tooMany.json();
+  assert.ok(tooManyJson.error.includes('12000') && tooManyJson.error.includes('组合过多'), 'error names the real count');
+  const atCap = await generate({ nodeLinks: node, preferredIps: manyIps(10000) });
+  assert.equal(atCap.counts.outputNodes, 10000, 'exactly at the cap succeeds');
+  console.log('audit round 3 suite: output-format injection sealed, output cap enforced: passed');
+}
+
+// --- Version suite: /api/version reporting + update check caching ---
+{
+  const realFetch = globalThis.fetch;
+  let ghCalls = 0;
+  let ghTag = null;
+  let ghDown = false;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('api.github.com/')) {
+      ghCalls++;
+      if (ghDown) throw new Error('github down');
+      return new Response(JSON.stringify({ tag_name: ghTag, html_url: 'https://example.com/rel' }), { status: 200 });
+    }
+    throw new Error('unexpected fetch ' + url);
+  };
+  const getVersion = () => worker.fetch(new Request('https://x.pages.dev/api/version'), env).then((r) => r.json());
+  const getVersionRetry = () => worker.fetch(new Request('https://x.pages.dev/api/version?retry=1'), env).then((r) => r.json());
+  try {
+    const v0 = await getVersion();
+    assert.match(v0.version, /^\d+\.\d+\.\d+$/, 'endpoint reports the running version');
+    store.delete('sys:latest-release'); // v0 ran with no tag set: drop its negative cache entry
+    const newer = 'v' + (parseInt(v0.version, 10) + 1) + '.0.0';
+    ghTag = newer;
+    const v1 = await getVersion();
+    assert.equal(v1.latest, newer.slice(1), 'latest comes from GitHub');
+    assert.equal(v1.updateAvailable, true, 'newer release detected');
+    assert.equal(v1.releaseUrl, 'https://example.com/rel');
+    assert.equal(v1.checkStatus, 'ok', 'successful check is reported explicitly');
+    const callsAfterFirst = ghCalls;
+    const v2 = await getVersion();
+    assert.equal(v2.latest, v1.latest, 'second read served from KV cache');
+    assert.equal(ghCalls, callsAfterFirst, 'GitHub not re-queried inside the cache window');
+
+    store.delete('sys:latest-release');
+    ghTag = 'v' + v0.version;
+    assert.equal((await getVersion()).updateAvailable, false, 'same version is not an update');
+    store.delete('sys:latest-release');
+    ghTag = 'v0.0.1';
+    assert.equal((await getVersion()).updateAvailable, false, 'older release is not an update');
+
+    // GitHub down + stale positive cache: last known answer still served,
+    // and the retry is throttled instead of fetching per page view.
+    store.delete('sys:latest-release');
+    ghTag = newer;
+    await getVersion();
+    const staleEntry = JSON.parse(store.get('sys:latest-release').value);
+    staleEntry.checkedAt = Date.now() - 7 * 3600e3;
+    store.set('sys:latest-release', { value: JSON.stringify(staleEntry) });
+    ghDown = true;
+    const vDown = await getVersion();
+    assert.equal(vDown.latest, newer.slice(1), 'stale cache beats a GitHub outage');
+    assert.equal(vDown.checkStatus, 'stale', 'outage with a cached answer is reported as stale');
+    const callsDuringOutage = ghCalls;
+    await getVersion();
+    assert.equal(ghCalls, callsDuringOutage, 'stale-serving throttles outage retries');
+
+    // GitHub down + no cache at all: current version only, negatively cached.
+    store.delete('sys:latest-release');
+    const vNone = await getVersion();
+    assert.equal(vNone.latest, null);
+    assert.equal(vNone.updateAvailable, false);
+    assert.equal(vNone.version, v0.version);
+    assert.equal(vNone.checkStatus, 'failed', 'outage with no cached answer is reported as failed');
+    const callsAfterOutage = ghCalls;
+    await getVersion();
+    assert.equal(ghCalls, callsAfterOutage, 'outage is negatively cached');
+
+    // Manual retry cannot hammer GitHub: inside five minutes it is
+    // refused, after that floor it performs a real re-check.
+    ghDown = false;
+    ghTag = newer;
+    const callsBeforeRetry = ghCalls;
+    const vRetryEarly = await getVersionRetry();
+    assert.equal(vRetryEarly.checkStatus, 'failed', 'early manual retry stays failed');
+    assert.equal(ghCalls, callsBeforeRetry, 'early manual retry does not reach GitHub');
+    const negativeEntry = JSON.parse(store.get('sys:latest-release').value);
+    negativeEntry.lastAttempt = Date.now() - 6 * 60e3;
+    store.set('sys:latest-release', { value: JSON.stringify(negativeEntry) });
+    const vRetry = await getVersionRetry();
+    assert.equal(vRetry.checkStatus, 'ok', 'manual retry re-checks after the five-minute floor');
+    assert.equal(vRetry.latest, newer.slice(1));
+    assert.ok(ghCalls > callsBeforeRetry, 'allowed manual retry reaches GitHub');
+    console.log('version suite: report, compare, KV cache, explicit stale/failed status, rate-limited retry: passed');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// --- Audit round 4 suite: API namespace contract ---
+{
+  const wrongMethod = await worker.fetch(new Request('https://x.pages.dev/api/generate'), env);
+  assert.equal(wrongMethod.status, 404, 'GET on a POST-only API path is a JSON 404, not the homepage');
+  assert.equal((await wrongMethod.json()).ok, false);
+  const unknown = await worker.fetch(new Request('https://x.pages.dev/api/nonexistent', { method: 'POST' }), env);
+  assert.equal(unknown.status, 404, 'unknown API path is a JSON 404');
+  const home = await worker.fetch(new Request('https://x.pages.dev/'), env);
+  assert.equal(home.status, 200, 'non-API paths still reach the static site');
+  console.log('audit round 4 suite: unknown/wrong-method API paths return JSON 404: passed');
+}
+
+// --- Diagnostics suite: /api/diag shape, redaction, event ring ---
+{
+  const diagPost = (body = { token: 'tok-0123456789abcdef' }) => worker.fetch(new Request('https://x.pages.dev/api/diag', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }), env);
+  const noTok = await diagPost({});
+  assert.equal(noTok.status, 403, 'diag without token is 403');
+  const wrongTok = await diagPost({ token: 'nope' });
+  assert.equal(wrongTok.status, 403, 'diag with wrong token is 403');
+  const queryTok = await worker.fetch(new Request('https://x.pages.dev/api/diag?token=tok', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  }), env);
+  assert.equal(queryTok.status, 403, 'diag never accepts a query token');
+
+  // Seed an entry carrying secrets in every user-controlled field.
+  const seeded = await generate({ nodeLinks: node, preferredIps: '203.0.113.7', namePrefix: 'diagseed' });
+  await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: seeded.shortId, note: '秘密备注XYZ' }),
+  }), env);
+  await worker.fetch(new Request('https://x.pages.dev/api/tags', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: seeded.shortId, tags: ['秘密标签'] }),
+  }), env);
+
+  // Round 15: an /api 403 (wrong admin token) is recorded through
+  // the failure throttle — a first sighting lands immediately — while
+  // a /sub 403 (wrong link token) never is. POST /api/tag-order has
+  // had no 403 yet in this run, so its first sighting is fresh; the
+  // bogus-token /sub fetch must leave no trace.
+  await worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'nope', order: [] }),
+  }), env);
+  await worker.fetch(new Request('https://x.pages.dev/sub/' + seeded.shortId + '?token=<redacted>', {}), env);
+
+  const okResp = await diagPost();
+  assert.equal(okResp.status, 200);
+  const okJson = await okResp.json();
+  assert.equal(okJson.ok, true);
+  const diagText = JSON.stringify(okJson);
+  for (const secret of ['秘密备注XYZ', '秘密标签', '203.0.113.7', seeded.shortId, 'f541611e-0aeb-4900-aa47', 'walh6h3rdnazjx']) {
+    assert.ok(!diagText.includes(secret), `diag output must not contain: ${secret}`);
+  }
+  assert.ok(!diagText.includes('vmess://') && !diagText.includes('vless://'), 'diag output carries no node links');
+  assert.equal(okJson.diag.kvProbe.match, true, 'KV probe round-trips');
+  assert.equal(store.get('sys:diag-probe'), undefined, 'KV probe key is cleaned up');
+  assert.ok(okJson.diag.census.entries >= 1, 'census counts entries');
+  assert.ok(okJson.diag.census.withNote >= 1 && okJson.diag.census.withTags >= 1, 'census counts note/tag presence without contents');
+  assert.ok(Array.isArray(okJson.diag.events), 'diag returns the event ring');
+  assert.ok(
+    okJson.diag.events.some((e) => e.kind === 'api' && String(e.route).includes('/api/tags')),
+    'ring recorded the tags save',
+  );
+  assert.ok(
+    okJson.diag.events.some((e) => e.status === 403 && String(e.route).includes('/api/tag-order')),
+    'api auth failures are recorded (round 15: throttled, first sighting immediate)',
+  );
+  assert.ok(
+    !okJson.diag.events.some((e) => e.status === 403 && String(e.route).includes('/sub')),
+    'sub link-token failures are never recorded',
+  );
+
+  // A dead dynamic source leaves a hashed-host ring event, never the URL.
+  await generate({ nodeLinks: node, preferredIps: '203.0.113.8\nhttps://dead-source.invalid/x', namePrefix: 'diagsrc' });
+  const afterSrc = await (await diagPost()).json();
+  const srcEvt = afterSrc.diag.events.find((e) => e.kind === 'ip-source');
+  assert.ok(srcEvt, 'failed source fetch left a ring event');
+  assert.ok(String(srcEvt.host).startsWith('h:'), 'source host is a keyed hash, not the hostname');
+  assert.ok(!JSON.stringify(afterSrc).includes('dead-source.invalid'), 'source hostname never appears in diag output');
+
+  // The ring is capped.
+  for (let i = 0; i < 65; i++) {
+    await worker.fetch(new Request('https://x.pages.dev/api/tag-order', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-0123456789abcdef', order: ['甲'] }),
+    }), env);
+  }
+  const capped = await (await diagPost()).json();
+  assert.ok(capped.diag.events.length <= 60, 'event ring is capped at 60');
+
+  // D1/D2: unknown paths are recorded only as a template (never
+  // verbatim — the path is caller-controlled text), a junk flood
+  // collapses into a single counted entry, and real history survives.
+  await worker.fetch(new Request('https://x.pages.dev/api/deadbeefdeadbeefdeadbeefdeadbeef/xyz'), env);
+  const templated = await (await diagPost()).json();
+  assert.ok(!JSON.stringify(templated).includes('deadbeef'), 'crafted path segments never enter the ring');
+  assert.ok(templated.diag.events.some((e) => e.route === 'GET /api/*'), 'unknown paths recorded under one template');
+  for (let i = 0; i < 65; i++) {
+    await worker.fetch(new Request(`https://x.pages.dev/api/junk${i}`), env);
+  }
+  const flooded = await (await diagPost()).json();
+  const stars = flooded.diag.events.filter((e) => e.route === 'GET /api/*');
+  const starTotal = stars.reduce((a, e) => a + (e.n || 1), 0);
+  // H1 supersedes the D2-era expectation here: failure events are
+  // throttled per signature at the door, so a junk flood now costs a
+  // single KV write per window instead of being fully counted.
+  assert.ok(starTotal <= 2, 'junk flood is throttled to a single counted event per window');
+  assert.ok(stars.length <= 8, 'flood occupies at most one collapsed entry per shard');
+  assert.ok(flooded.diag.events.some((e) => e.route === 'POST /api/tag-order'), 'legit history survives the flood');
+  assert.ok(flooded.diag.events.length <= 60, 'ring still capped after the flood');
+
+  // F1: junk members inside a shard (null, primitives, a string
+  // timestamp) must not zero the merged view or block new events.
+  store.set('sys:diag-events:3', {
+    value: JSON.stringify([null, 1, 'x', { t: 'bad' }, { t: Date.now(), kind: 'api', route: 'POST /api/note', status: 200, ms: 1 }]),
+  });
+  const withJunk = await (await diagPost()).json();
+  assert.ok(withJunk.diag.events.some((e) => e.route === 'POST /api/note'), 'valid events survive junk shard members');
+  assert.ok(
+    withJunk.diag.events.every((e) => e && typeof e === 'object' && typeof e.t === 'number'),
+    'merged events are all well-formed',
+  );
+
+  // H1: failure events are throttled per signature. A burst of junk
+  // 404s (no token needed) and a dead-link /sub retry loop may each
+  // add at most ONE ring entry per window — otherwise a few hundred
+  // requests could burn the free tier's daily KV write quota.
+  const countSig = (j, route, status) => j.diag.events.filter((e) => e.route === route && e.status === status).length;
+  const junkBefore = countSig(await (await diagPost()).json(), 'GET /api/*', 404);
+  for (let i = 0; i < 20; i++) {
+    await worker.fetch(new Request(`https://sub.test/api/nope-${i}`), env);
+  }
+  const junkAfter = await (await diagPost()).json();
+  assert.ok(countSig(junkAfter, 'GET /api/*', 404) - junkBefore <= 1, 'junk 404 burst throttled to one event');
+  const deadGen = await generate({ nodeLinks: node, preferredIps: '203.0.113.7' });
+  await worker.fetch(new Request('https://x.pages.dev/api/delete', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok-0123456789abcdef', id: deadGen.shortId }),
+  }), env);
+  const subBefore = countSig(await (await diagPost()).json(), 'GET /sub/:id', 404);
+  for (let i = 0; i < 20; i++) {
+    await worker.fetch(new Request(`https://x.pages.dev/sub/${deadGen.shortId}?token=${linkTokens.get(deadGen.shortId)}`), env);
+  }
+  const subAfter = await (await diagPost()).json();
+  assert.ok(countSig(subAfter, 'GET /sub/:id', 404) - subBefore <= 1, 'dead-link retry loop throttled to one event');
+
+  // H2: API JSON is no-store and carries no wildcard CORS grant.
+  const versionResp = await worker.fetch(new Request('https://sub.test/api/version'), env);
+  assert.equal(versionResp.headers.get('cache-control'), 'no-store', 'API JSON is no-store');
+  assert.equal(versionResp.headers.get('access-control-allow-origin'), null, 'no wildcard CORS on API JSON');
+  console.log('diagnostics suite: auth, redaction, census, KV probe, event ring: passed');
+}
+
+// Audit round 9: duplicate node names are disambiguated end-to-end,
+// and a vless-only entry's Surge target answers a clear error instead
+// of an empty 200 profile.
+{
+  const gen9 = async (body) => {
+    const r = await worker.fetch(new Request('http://x/api/generate', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+    }), env);
+    return r.json();
+  };
+  const listTok9 = async (id) => {
+    const l = await (await worker.fetch(new Request('http://x/api/list', { headers: { 'x-admin-token': 'tok-0123456789abcdef' } }), env)).json();
+    return l.items.find((i) => i.id === id).linkToken;
+  };
+  // The endpoint carries a remark, so buildNodes composes the SAME
+  // name for both source nodes (without a remark the build counter
+  // already disambiguates) — dedupe must suffix the second one.
+  const dup = await gen9({ nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@a.example.com:443?security=tls#同名\nvless://f541611e-0aeb-4900-aa47-6e95d4916a49@b.example.com:443?security=tls#同名', preferredIps: '203.0.113.7#备注' });
+  const tok9 = await listTok9(dup.shortId);
+  const clash9 = await (await worker.fetch(new Request(`http://x/sub/${dup.shortId}?token=${tok9}&target=clash`), env)).text();
+  const names9 = [...clash9.split('proxy-groups:')[0].matchAll(/- name: "([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(names9).size, names9.length, 'clash proxy names are unique end-to-end');
+  assert.ok(names9.some((n) => n.endsWith('(2)')), 'the duplicate got a (2) suffix');
+  const surge9 = await worker.fetch(new Request(`http://x/sub/${dup.shortId}?token=${tok9}&target=surge`), env);
+  assert.equal(surge9.status, 400, 'vless-only surge target is a clear error, not an empty 200');
+  assert.ok((await surge9.text()).includes('Surge 仅支持 VMess / Trojan'), 'surge error explains the supported types');
+  console.log('audit round 9 suite: duplicate names + surge empty-profile error: passed');
+}
+
+// ===== Audit round 10: reserved group names + empty records =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const reservedNodes = [
+    { type: 'vmess', name: '节点选择', server: 'a.example.com', port: 443, uuid: U, cipher: 'auto', network: 'ws', tls: true, sni: '', host: '', path: '/' },
+    { type: 'trojan', name: 'Proxy', server: 'b.example.com', port: 443, password: 'pw', tls: true, sni: '', host: '', path: '/' },
+    { type: 'vmess', name: '自动选择', server: 'c.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', host: '', path: '/' },
+  ];
+  await env.SUB_STORE.put('sub:ResvR10', JSON.stringify({
+    id: 'ResvR10', nodes: reservedNodes, storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  await env.SUB_STORE.put('sub:EmptyR10', JSON.stringify({
+    id: 'EmptyR10', nodes: [], storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr10 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('ResvR10', lr10.items.find((i) => i.id === 'ResvR10').linkToken);
+  linkTokens.set('EmptyR10', lr10.items.find((i) => i.id === 'EmptyR10').linkToken);
+  // Clash: proxies and groups share one namespace — every `- name:`
+  // in the document must be unique.
+  const clashDoc = (await getSub('ResvR10', 'clash')).body;
+  const allNames = [...clashDoc.matchAll(/- name: "([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(allNames).size, allNames.length, 'clash: no duplicate definition names across proxies and groups');
+  assert.ok(allNames.includes('节点选择 (2)') && allNames.includes('自动选择 (2)'), 'clash: nodes named like groups are renamed');
+  // Surge: exactly one `Proxy =` definition line (the group); the
+  // trojan proxy of that name is renamed.
+  const surgeDoc = (await getSub('ResvR10', 'surge')).body;
+  const proxyDefs = surgeDoc.split('\n').filter((l) => l.startsWith('Proxy ='));
+  assert.equal(proxyDefs.length, 1, 'surge: only the group defines Proxy');
+  assert.ok(proxyDefs[0].startsWith('Proxy = select,'), 'surge: the surviving Proxy definition is the group');
+  assert.ok(surgeDoc.includes('Proxy (2) = trojan,'), 'surge: the trojan node named Proxy is renamed');
+  // Empty node list (hand-corrupted record): every target answers a
+  // clear 400 instead of a degenerate 200.
+  for (const target of ['clash', 'plain']) {
+    const r = await getSub('EmptyR10', target);
+    assert.equal(r.status, 400, `empty record: ${target} is a clear 400`);
+    assert.ok(r.body.includes('节点列表为空'), `empty record: ${target} explains itself`);
+  }
+  const rawR = await getSub('EmptyR10');
+  assert.equal(rawR.status, 400, 'empty record: default raw target is a clear 400 too');
+  console.log('audit-10 suite: reserved names renamed, empty records refuse clearly');
+}
+
+// ===== Audit round 11: Clash transport completeness + truncation warnings =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  // REALITY vless: Clash must carry tls + reality-opts + flow, and the
+  // raw link must still round-trip security=reality.
+  const rl = await generate({
+    nodeLinks: 'vless://' + U + '@rl.example.com:443?security=reality&encryption=none&pbk=AAAABBBBCCCC&sid=0123&flow=xtls-rprx-vision&sni=www.example.com&fp=chrome&type=tcp#RL',
+    preferredIps: '1.2.3.4',
+  });
+  const rlClash = await getSub(rl.shortId, 'clash');
+  assert.ok(rlClash.body.includes('tls: true'), 'reality: clash tls is true');
+  assert.ok(rlClash.body.includes('reality-opts:'), 'reality: clash carries reality-opts');
+  assert.ok(rlClash.body.includes('public-key: "AAAABBBBCCCC"'), 'reality: clash carries the public key');
+  assert.ok(rlClash.body.includes('short-id: "0123"'), 'reality: clash carries the short id');
+  assert.ok(rlClash.body.includes('flow: "xtls-rprx-vision"'), 'reality: clash carries the flow');
+  assert.ok(rlClash.body.includes('client-fingerprint: "chrome"'), 'reality: clash carries the fingerprint');
+  const rlRaw = await getSub(rl.shortId);
+  assert.ok(Buffer.from(rlRaw.body, 'base64').toString('utf8').includes('security=reality'), 'reality: raw link still round-trips security=reality');
+
+  // A record stored BEFORE the parser modeled reality (fields only in
+  // params, tls:false) renders the same through the read-through.
+  await env.SUB_STORE.put('sub:OldRL001', JSON.stringify({
+    id: 'OldRL001',
+    nodes: [{ type: 'vless', name: 'oldrl', server: 'rl.example.com', port: 443, uuid: U, network: 'tcp', tls: false, sni: 'www.example.com', host: '', path: '/', fp: '', alpn: '', flow: 'xtls-rprx-vision', params: { security: 'reality', pbk: 'AAAABBBBCCCC', sid: '0123', flow: 'xtls-rprx-vision', sni: 'www.example.com', type: 'tcp' } }],
+    storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr11 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('OldRL001', lr11.items.find((i) => i.id === 'OldRL001').linkToken);
+  const oldClash = await getSub('OldRL001', 'clash');
+  assert.ok(oldClash.body.includes('reality-opts:') && oldClash.body.includes('tls: true'), 'reality: pre-fix records render via params read-through');
+
+  // grpc service name + trojan allowInsecure + alpn.
+  const tj = await generate({
+    nodeLinks: 'vless://' + U + '@g.example.com:443?security=tls&type=grpc&serviceName=mysvc&alpn=h2#GRPC\n'
+      + 'trojan://' + 'pw' + '@t.example.com:443?allowInsecure=1&sni=t.example.com#TJ',
+    preferredIps: '1.2.3.4',
+  });
+  const tjClash = await getSub(tj.shortId, 'clash');
+  assert.ok(tjClash.body.includes('grpc-opts:') && tjClash.body.includes('grpc-service-name: "mysvc"'), 'grpc: clash carries the service name');
+  assert.ok(tjClash.body.includes('alpn: ["h2"]'), 'grpc: clash carries alpn');
+  assert.ok(tjClash.body.includes('skip-cert-verify: true'), 'trojan: clash honors allowInsecure');
+  const tjSurge = await getSub(tj.shortId, 'surge');
+  assert.ok(tjSurge.body.includes('skip-cert-verify=true'), 'trojan: surge honors allowInsecure');
+
+  // Truncation of the STORED inputs is warned about (generation itself
+  // parses the full text — the valid link still produces nodes).
+  const padLine = '#' + 'x'.repeat(89);
+  const bigLinks = (padLine + '\n').repeat(1200) + 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: '尾巴节点', add: 'a.example.com', port: '443', id: U, aid: '0', net: 'tcp', type: 'none', tls: '' })).toString('base64');
+  const big = await generate({ nodeLinks: bigLinks, preferredIps: '1.2.3.4' });
+  assert.ok(big.counts.outputNodes >= 1, 'truncation: the tail link still generated (parse uses full text)');
+  assert.ok((big.warnings || []).some((w) => w.includes('存档仅保留前 100000 字符')), 'truncation: nodeLinks cap is warned');
+  const bigIps = await generate({ nodeLinks: 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', net: 'tcp', type: 'none', tls: '' })).toString('base64'), preferredIps: '1.2.3.4\n'.repeat(7000) });
+  assert.ok((bigIps.warnings || []).some((w) => w.includes('存档仅保留前 50000 字符')), 'truncation: preferredIps cap is warned');
+  console.log('audit-11 suite: reality/grpc/insecure/alpn in clash, truncation warnings: passed');
+}
+
+// ===== Audit round 12: Surge managed-config + transport fidelity, update-interval and framing headers =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const nodes12 = [
+    { type: 'vmess', name: 'tcp节点', server: 'a.example.com', port: 443, uuid: U, cipher: 'auto', network: 'tcp', tls: false, sni: '', host: '', path: '/' },
+    { type: 'vmess', name: 'grpc节点', server: 'b.example.com', port: 443, uuid: U, cipher: 'auto', network: 'grpc', tls: true, sni: '', host: '', path: 'mysvc' },
+    { type: 'trojan', name: 'ws-trojan', server: 'c.example.com', port: 443, password: 'pw', tls: true, sni: '', host: 'h.example.com', path: '/tj', network: 'ws', params: { type: 'ws' } },
+    { type: 'vless', name: 'h2节点', server: 'd.example.com', port: 443, uuid: U, network: 'h2', tls: true, sni: '', host: '', path: '/h2p', params: { type: 'h2' } },
+  ];
+  await env.SUB_STORE.put('sub:FixR1201', JSON.stringify({
+    id: 'FixR1201', nodes: nodes12, storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  await env.SUB_STORE.put('sub:FixR1202', JSON.stringify({
+    id: 'FixR1202', nodes: nodes12.slice(0, 1), dynamic: { sourceUrl: 'https://src.example.com/list.txt', sources: [], limit: 10, literals: [], endpoints: [], snapshotAt: '2026-01-01T00:00:00.000Z' }, baseNodes: [],
+    storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr12 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('FixR1201', lr12.items.find((i) => i.id === 'FixR1201').linkToken);
+  linkTokens.set('FixR1202', lr12.items.find((i) => i.id === 'FixR1202').linkToken);
+
+  const surgeStatic = await getSub('FixR1201', 'surge');
+  const firstLine = surgeStatic.body.split('\n')[0];
+  assert.ok(firstLine.startsWith('#!MANAGED-CONFIG '), 'surge: first line is the managed-config directive');
+  assert.ok(firstLine.includes('interval=86400'), 'surge: static entries re-pull daily');
+  assert.ok(firstLine.includes(linkTokens.get('FixR1201')), 'surge: managed URL carries the link token');
+  const tcpLine = surgeStatic.body.split('\n').find((l) => l.startsWith('tcp节点'));
+  assert.ok(tcpLine && !tcpLine.includes('ws=true'), 'surge: tcp vmess is not dressed as ws');
+  // Round 14 supersedes the round-12 expectation below: a grpc node
+  // is no longer rendered bare (which Surge dialed as plain TCP) —
+  // it is filtered out of the Surge output entirely.
+  assert.ok(!surgeStatic.body.includes('grpc节点'), 'surge: grpc vmess is filtered out, not silently degraded');
+  const tjLine = surgeStatic.body.split('\n').find((l) => l.startsWith('ws-trojan'));
+  assert.ok(tjLine && tjLine.includes('ws=true') && tjLine.includes('ws-path=/tj'), 'surge: ws trojan carries its ws parameters');
+
+  const surgeDyn = await getSub('FixR1202', 'surge');
+  assert.ok(surgeDyn.body.split('\n')[0].includes('interval=3600'), 'surge: dynamic entries re-pull hourly');
+
+  const clashResp = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1201?target=clash&token=' + linkTokens.get('FixR1201')), env);
+  assert.equal(clashResp.headers.get('profile-update-interval'), '24', 'sub: static clash advertises a 24h update interval');
+  const clash12 = await clashResp.text();
+  // Round 14: h2 nodes carry h2-opts (the key mihomo actually reads);
+  // http-opts is only for network: http.
+  assert.ok(clash12.includes('h2-opts:'), 'clash: h2 node carries h2-opts');
+  assert.ok(!clash12.includes('http-opts:'), 'clash: no http-opts is emitted for an h2 node');
+  assert.ok(clash12.includes('grpc-service-name: "mysvc"'), 'clash: vmess grpc service name comes from path');
+  const clashDynResp = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1202?target=clash&token=' + linkTokens.get('FixR1202')), env);
+  assert.equal(clashDynResp.headers.get('profile-update-interval'), '1', 'sub: dynamic clash advertises a 1h update interval');
+
+  // flow is only emitted over TLS/REALITY (a plaintext vision combo
+  // makes mihomo reject the proxy).
+  const plainFlow = await generate({
+    nodeLinks: 'vless://' + U + '@pf.example.com:443?security=none&flow=xtls-rprx-vision&type=tcp#PF',
+    preferredIps: '1.2.3.4',
+  });
+  const pfClash = await getSub(plainFlow.shortId, 'clash');
+  assert.ok(!pfClash.body.includes('flow:'), 'clash: no flow on a plaintext vless node');
+
+  // The homepage (and every static asset) is not frameable by other
+  // sites, and API JSON carries nosniff.
+  const home = await worker.fetch(new Request('https://x.pages.dev/'), env);
+  assert.equal(home.headers.get('x-frame-options'), 'SAMEORIGIN', 'assets: x-frame-options set');
+  assert.ok((home.headers.get('content-security-policy') || '').includes("frame-ancestors 'self'"), 'assets: CSP frame-ancestors set');
+  const listResp = await worker.fetch(adminReq('/api/list'), env);
+  assert.equal(listResp.headers.get('x-content-type-options'), 'nosniff', 'api: nosniff set');
+  console.log('audit-12 suite: surge managed-config + transports, update intervals, framing headers: passed');
+}
+
+// ===== Audit round 13: parse guards, built-in policy names, census ages, source coalescing =====
+{
+  // A hand-corrupted record must fail cleanly everywhere, not as a
+  // bare 500 from an unguarded parse.
+  await env.SUB_STORE.put('sub:FixR1301', 'this is not json{');
+  const lrBad = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  const badTok = lrBad.items.find((i) => i.id === 'FixR1301').linkToken;
+  const badSub = await worker.fetch(new Request('https://x.pages.dev/sub/FixR1301?token=' + badTok), env);
+  assert.equal(badSub.status, 500, 'corrupt record: /sub is a clean 500');
+  assert.ok((await badSub.text()).includes('条目数据损坏'), 'corrupt record: /sub says the record is damaged');
+  for (const path of ['/api/note', '/api/tags', '/api/retention']) {
+    const body = path === '/api/note'
+      ? { token: 'tok-0123456789abcdef', id: 'FixR1301', note: 'x' }
+      : path === '/api/tags'
+        ? { token: 'tok-0123456789abcdef', id: 'FixR1301', tags: ['a'] }
+        : { token: 'tok-0123456789abcdef', id: 'FixR1301', mode: 'permanent' };
+    const resp = await worker.fetch(new Request('https://x.pages.dev' + path, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    }), env);
+    const data = await resp.json();
+    assert.equal(resp.status, 500, `corrupt record: ${path} is a clean 500`);
+    assert.equal(data.error, '条目数据损坏', `corrupt record: ${path} names the damage`);
+  }
+
+  // Regenerating the same content as a corrupted entry heals it: the
+  // dedup path mints a fresh record instead of throwing.
+  const healBody = { nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@heal.example.com:443?security=tls&type=ws#HEAL', preferredIps: '1.2.3.4' };
+  const first = await generate(healBody);
+  await env.SUB_STORE.put('sub:' + first.shortId, 'corrupted!!');
+  const healed = await generate(healBody);
+  assert.equal(healed.shortId, first.shortId, 'corrupt entry: regenerate heals the record in place under the same id');
+  const healedSub = await getSub(healed.shortId, 'clash');
+  assert.equal(healedSub.status, 200, 'corrupt entry: the healed entry serves normally');
+
+  // Built-in policy names are reserved in both exporters. Seeded as
+  // a stored record: the generate path's counter suffixes mean exact
+  // built-in names only arrive via stored/legacy records, which is
+  // what the render-time dedupe guards.
+  const U13 = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  await env.SUB_STORE.put('sub:FixR1302', JSON.stringify({
+    id: 'FixR1302',
+    nodes: [
+      { type: 'vless', name: 'DIRECT', server: 'd1.example.com', port: 443, uuid: U13, network: 'ws', tls: true, sni: '', host: '', path: '/', params: { type: 'ws' } },
+      { type: 'trojan', name: 'REJECT', server: 'd2.example.com', port: 443, password: 'pw', tls: true, sni: '', host: '', path: '/', network: 'tcp', params: {} },
+      { type: 'vmess', name: 'DIRECT', server: 'd3.example.com', port: 443, uuid: U13, cipher: 'auto', network: 'ws', tls: true, sni: '', host: 'h.example.com', path: '/' },
+    ],
+    storage: { mode: 'permanent' }, createdAt: '2026-01-01T00:00:00.000Z',
+  }));
+  const lr13 = await (await worker.fetch(adminReq('/api/list'), env)).json();
+  linkTokens.set('FixR1302', lr13.items.find((i) => i.id === 'FixR1302').linkToken);
+  const namedClash = await getSub('FixR1302', 'clash');
+  assert.ok(namedClash.body.includes('name: "DIRECT (2)"'), 'clash: a DIRECT node is renamed out of the built-in namespace');
+  assert.ok(namedClash.body.includes('name: "REJECT (2)"'), 'clash: a REJECT node is renamed too');
+  assert.ok(!namedClash.body.includes('name: "DIRECT"'), 'clash: no proxy keeps the exact built-in name');
+  const namedSurge = await getSub('FixR1302', 'surge');
+  assert.ok(namedSurge.body.includes('DIRECT (2) = vmess'), 'surge: a DIRECT node is renamed too');
+
+  // The census age summary reads ISO createdAt values (what every
+  // record actually stores), not only epoch numbers.
+  const diagResp = await worker.fetch(new Request('https://x.pages.dev/api/diag', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef' }),
+  }), env);
+  const diagJson = await diagResp.json();
+  assert.equal(typeof diagJson.diag.census.oldestAgeDays, 'number', 'census: oldestAgeDays populates from ISO createdAt');
+  assert.equal(typeof diagJson.diag.census.newestAgeDays, 'number', 'census: newestAgeDays populates from ISO createdAt');
+
+  // Concurrent refreshes of one source coalesce into a single fetch.
+  const realFetch = globalThis.fetch;
+  let sourceFetches = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u === 'https://coal.example.com/ips.txt') {
+      sourceFetches++;
+      await new Promise((r) => setTimeout(r, 60));
+      return new Response('104.16.9.9\n104.16.9.10', { status: 200 });
+    }
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const mk = (host) => ({
+      nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@' + host + ':443?security=tls&type=ws#CO',
+      preferredIps: 'https://coal.example.com/ips.txt',
+    });
+    const [g1, g2] = await Promise.all([generate(mk('c1.example.com')), generate(mk('c2.example.com'))]);
+    assert.ok(g1.shortId && g2.shortId && g1.shortId !== g2.shortId, 'coalescing: both generates succeed');
+    assert.equal(sourceFetches, 1, 'coalescing: two concurrent generates fetch the source once');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  console.log('audit-13 suite: parse guards, policy-name reservation, census ages, source coalescing: passed');
+}
+
+// ===== Audit round 14: vmess default transport, clash h2-opts, surge transport gate, app-level expiry, tags-via-metadata + parallel list =====
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const vmessJson = (extra) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', scy: 'auto', type: 'none', tls: '', ...extra })).toString('base64');
+
+  // 1) A vmess link without `net` is a plain-TCP node in every format.
+  const gTcp = await generate({ nodeLinks: vmessJson({ ps: 'tcpvm' }), preferredIps: '198.51.100.7' });
+  const decoded = JSON.parse(Buffer.from(gTcp.plainText.split('vmess://')[1], 'base64').toString('utf8'));
+  assert.equal(decoded.net, 'tcp', 'vmess: missing net round-trips as tcp, not ws');
+  const tcpClash = await getSub(gTcp.shortId, 'clash');
+  assert.ok(tcpClash.body.includes('network: "tcp"'), 'clash: net-less vmess renders network tcp');
+  assert.ok(!tcpClash.body.includes('ws-opts:'), 'clash: net-less vmess gets no ws-opts');
+  const tcpSurge = await getSub(gTcp.shortId, 'surge');
+  assert.ok(!tcpSurge.body.includes('ws=true'), 'surge: net-less vmess gets no ws=true');
+
+  // 2) h2 vmess in clash: h2-opts with path + host list, no http-opts.
+  const gH2 = await generate({ nodeLinks: vmessJson({ ps: 'h2vm', net: 'h2', tls: 'tls', host: 'h2.example.com', path: '/h2path' }), preferredIps: '198.51.100.8' });
+  const h2Clash = await getSub(gH2.shortId, 'clash');
+  assert.ok(h2Clash.body.includes('h2-opts:'), 'clash: h2 node carries h2-opts');
+  assert.ok(h2Clash.body.includes('path: "/h2path"'), 'clash: h2-opts carries the path');
+  assert.ok(h2Clash.body.includes('host: ["h2.example.com"]'), 'clash: h2-opts carries the host list');
+  assert.ok(!h2Clash.body.includes('http-opts:'), 'clash: h2 node gets no http-opts');
+
+  // 3) Surge transport gate: a grpc-only entry 400s; a mixed entry
+  // keeps only the expressible node.
+  const gGrpc = await generate({ nodeLinks: vmessJson({ ps: 'grpcvm', net: 'grpc', tls: 'tls', path: 'mysvc' }), preferredIps: '198.51.100.9' });
+  const grpcSurge = await getSub(gGrpc.shortId, 'surge');
+  assert.equal(grpcSurge.status, 400, 'surge: grpc-only entry is refused');
+  assert.ok(grpcSurge.body.includes('没有 Surge 可用的节点'), 'surge: refusal names the usability problem');
+  const gMix = await generate({ nodeLinks: [vmessJson({ ps: 'grpcvm', net: 'grpc', tls: 'tls', path: 'mysvc' }), vmessJson({ ps: 'wsvm', net: 'ws', tls: 'tls', host: 'w.example.com', path: '/w' })].join('\n'), preferredIps: '198.51.100.10' });
+  const mixSurge = await getSub(gMix.shortId, 'surge');
+  assert.equal(mixSurge.status, 200, 'surge: mixed entry still serves');
+  assert.ok(mixSurge.body.includes('wsvm'), 'surge: ws node survives the filter');
+  assert.ok(!mixSurge.body.includes('grpcvm'), 'surge: grpc node is filtered out');
+
+  // 4) An expired-but-unreaped record 404s at the app level; an
+  // unexpired retention record still serves.
+  const gExp = await generate({ nodeLinks: vmessJson({ ps: 'expvm', net: 'tcp' }), preferredIps: '198.51.100.11', storageMode: 'days', retentionDays: 30 });
+  const expKey = 'sub:' + gExp.shortId;
+  const expRec = JSON.parse(store.get(expKey).value);
+  expRec.storage.expiresAt = new Date(Date.now() - 60000).toISOString();
+  store.set(expKey, { value: JSON.stringify(expRec), metadata: store.get(expKey).metadata });
+  const expSub = await getSub(gExp.shortId, 'plain');
+  assert.equal(expSub.status, 404, 'sub: expired record is not served even while KV still holds it');
+  const gLive = await generate({ nodeLinks: vmessJson({ ps: 'livevm', net: 'tcp' }), preferredIps: '198.51.100.12', storageMode: 'days', retentionDays: 30 });
+  const liveSub = await getSub(gLive.shortId, 'plain');
+  assert.equal(liveSub.status, 200, 'sub: unexpired retention record still serves');
+
+  // 5) /api/tags reads tags from key metadata (zero record reads),
+  // with a record fallback for legacy keys; /api/list resolves its
+  // records in parallel chunks.
+  const gTags = await generate({ nodeLinks: vmessJson({ ps: 'tagvm', net: 'tcp' }), preferredIps: '198.51.100.13', tags: ['MetaTag'] });
+  const tagKey = 'sub:' + gTags.shortId;
+  const tagBefore = store.get(tagKey);
+  assert.ok(Array.isArray(tagBefore.metadata.tags) && tagBefore.metadata.tags.includes('MetaTag'), 'tags: generate writes tags into KV metadata');
+  store.set(tagKey, { value: '{"corrupt"', metadata: tagBefore.metadata });
+  const tagsResp = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.ok(tagsResp.tags.some((t) => t.tag === 'MetaTag' && t.count >= 1), 'tags: vocabulary comes from metadata when the record is unreadable');
+  store.set(tagKey, { value: tagBefore.value, metadata: { ...tagBefore.metadata, tags: undefined } });
+  const tagsResp2 = await (await worker.fetch(adminReq('/api/tags'), env)).json();
+  assert.ok(tagsResp2.tags.some((t) => t.tag === 'MetaTag'), 'tags: legacy keys fall back to reading the record');
+  store.set(tagKey, tagBefore);
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const envPar = {
+    ...env,
+    SUB_STORE: {
+      ...env.SUB_STORE,
+      async get(k) {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight -= 1;
+        return env.SUB_STORE.get(k);
+      },
+    },
+  };
+  const listPar = await (await worker.fetch(adminReq('/api/list'), envPar)).json();
+  assert.ok(listPar.count >= 5, 'list: parallel build returns every entry');
+  assert.ok(maxInFlight > 1, 'list: record reads overlap (chunked parallel), max in flight = ' + maxInFlight);
+  console.log('audit-14 suite: vmess tcp default, h2-opts, surge transport gate, app-level expiry, tags metadata + parallel list: passed');
+}
+
+// ===== Audit round 15: mapped-IPv6 source block, vmess aid + surge aead, comma-credential surge gate, '=' names, profile title, clash store-selected =====
+// (Fix 1 — throttled /api 403 recording with /sub silence — is asserted
+// inside the diagnostics suite above, where the ring is read.)
+{
+  const U = 'f541611e-0aeb-4900-aa47-6e95d4916a49';
+  const vmessJson = (extra) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'n', add: 'a.example.com', port: '443', id: U, aid: '0', scy: 'auto', type: 'none', tls: '', ...extra })).toString('base64');
+  const genRaw = (body) => worker.fetch(new Request('https://x.pages.dev/api/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+  }), env).then((r) => r.json());
+
+  // 2) An IPv4-mapped IPv6 source literal is refused as internal
+  // before any fetch happens.
+  const fetched15 = [];
+  const realFetch15 = globalThis.fetch;
+  globalThis.fetch = async (u) => { fetched15.push(String(u)); return new Response('203.0.113.99\n', { status: 200 }); };
+  try {
+    const gMapped = await genRaw({ nodeLinks: vmessJson({ ps: 'mapvm', net: 'tcp' }), preferredIps: 'https://[::ffff:7f00:1]/list.txt' });
+    assert.equal(gMapped.ok, false, 'source: mapped-IPv6 loopback is refused');
+    assert.ok(String(gMapped.error).includes('内网'), 'source: refusal names the internal-address reason');
+    assert.ok(!fetched15.some((u) => u.includes('::ffff')), 'source: the mapped URL is never fetched');
+    const gUnspec = await genRaw({ nodeLinks: vmessJson({ ps: 'unspec', net: 'tcp' }), preferredIps: 'https://[::]/list.txt' });
+    assert.equal(gUnspec.ok, false, 'source: the unspecified address is refused too');
+  } finally { globalThis.fetch = realFetch15; }
+
+  // 3+4) The link's alterId survives end to end, and the Surge AEAD
+  // marker follows it; an AEAD node (aid 0) is marked aead=true —
+  // the flag the worker's Surge renderer used to omit entirely.
+  const gAid = await generate({ nodeLinks: vmessJson({ ps: 'legacyvm', aid: '64' }), preferredIps: '198.51.100.21' });
+  assert.equal(JSON.parse(Buffer.from(gAid.plainText.split('vmess://')[1], 'base64').toString('utf8')).aid, '64', 'vmess: aid round-trips into the plain output');
+  const aidClash = await getSub(gAid.shortId, 'clash');
+  assert.ok(aidClash.body.includes('alterId: 64'), 'clash: alterId is the link value, not a hardcoded 0');
+  const aidSurge = await getSub(gAid.shortId, 'surge');
+  assert.ok(aidSurge.body.includes('vmess-aead=false'), 'surge: a legacy vmess is marked non-AEAD');
+  const gAead = await generate({ nodeLinks: vmessJson({ ps: 'aeadvm', net: 'ws', tls: 'tls', host: 'h.example.com', path: '/w' }), preferredIps: '198.51.100.22' });
+  const aeadSurge = await getSub(gAead.shortId, 'surge');
+  assert.ok(aeadSurge.body.includes('vmess-aead=true'), 'surge: an AEAD vmess carries vmess-aead=true');
+
+  // 5) A comma in a trojan password makes the node Surge-inexpressible
+  // (excluded / entry refused), while Clash keeps serving it verbatim.
+  const tjComma = 'trojan://p%2Ca%2Css@tj.example.com:443?security=tls&sni=tj.example.com&type=tcp#tjcomma';
+  const gTjOnly = await generate({ nodeLinks: tjComma, preferredIps: '198.51.100.23' });
+  const tjOnlySurge = await getSub(gTjOnly.shortId, 'surge');
+  assert.equal(tjOnlySurge.status, 400, 'surge: a comma-password-only entry is refused');
+  assert.ok(tjOnlySurge.body.includes('逗号'), 'surge: the refusal names the comma problem');
+  const tjClash = await getSub(gTjOnly.shortId, 'clash');
+  assert.equal(tjClash.status, 200, 'clash: the comma-password entry still serves');
+  const gTjMix = await generate({ nodeLinks: [tjComma, vmessJson({ ps: 'okvm', net: 'tcp' })].join('\n'), preferredIps: '198.51.100.24' });
+  const tjMixSurge = await getSub(gTjMix.shortId, 'surge');
+  assert.equal(tjMixSurge.status, 200, 'surge: a mixed entry still serves');
+  assert.ok(tjMixSurge.body.includes('okvm'), 'surge: the clean node survives');
+  assert.ok(!tjMixSurge.body.includes('tjcomma'), 'surge: the comma-password trojan is excluded, not corrupted');
+
+  // 6) '=' flattens out of Surge node names (proxy and group lines agree).
+  const gEq = await generate({ nodeLinks: vmessJson({ ps: 'x=y节点', net: 'tcp' }), preferredIps: '198.51.100.25' });
+  const eqSurge = await getSub(gEq.shortId, 'surge');
+  assert.ok(!eqSurge.body.includes('x=y节点'), 'surge: = is flattened out of node names');
+  assert.ok(eqSurge.body.includes('x y节点'), 'surge: the flattened name is used consistently');
+
+  // 7) /sub carries a profile title: the entry note when present,
+  // the entry id otherwise.
+  const gNote = await generate({ nodeLinks: vmessJson({ ps: 'notevm', net: 'tcp' }), preferredIps: '198.51.100.26', note: '东京 VPS' });
+  const noteResp = await worker.fetch(new Request('https://x.pages.dev/sub/' + gNote.shortId + '?target=plain&token=' + linkTokens.get(gNote.shortId)), env);
+  const cd = noteResp.headers.get('content-disposition') || '';
+  assert.ok(cd.startsWith('attachment;'), 'sub: content-disposition is present');
+  assert.ok(cd.includes("filename*=UTF-8''" + encodeURIComponent('东京 VPS.txt')), 'sub: the profile title carries the entry note');
+  const gNoNote = await generate({ nodeLinks: vmessJson({ ps: 'nonote', net: 'tcp' }), preferredIps: '198.51.100.27' });
+  const noNoteResp = await worker.fetch(new Request('https://x.pages.dev/sub/' + gNoNote.shortId + '?target=plain&token=' + linkTokens.get(gNoNote.shortId)), env);
+  assert.ok((noNoteResp.headers.get('content-disposition') || '').includes('sub-' + gNoNote.shortId), 'sub: the title falls back to the entry id');
+
+  // 8) Clash output asks mihomo to remember the selected node.
+  const anyClash = await getSub(gAead.shortId, 'clash');
+  assert.ok(anyClash.body.includes('profile:\n  store-selected: true'), 'clash: profile.store-selected is set');
+
+  console.log('audit-15 suite: mapped-IPv6 source block, aid + aead, comma gate, = names, profile title, store-selected: passed');
+}
+
+// --- Audit round 16 suite: KV metadata byte budget, parked-page
+// sources, literal endpoint validation, peer SNI, uppercase schemes,
+// dedup heal TTL + honest deduplicated flag, remainingTtl anchoring,
+// dynamic entry merged cache ---
+{
+  const b64 = (o) => Buffer.from(JSON.stringify(o), 'utf8').toString('base64');
+  const vm = (ps) => 'vmess://' + b64({ v: '2', ps, add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', type: 'none', tls: '' });
+  const genRaw = async (body) => {
+    const r = await worker.fetch(new Request('https://x.pages.dev/api/generate', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', ...body }),
+    }), env);
+    return { status: r.status, json: await r.json() };
+  };
+  const plainServers = (j) => (j.plainText || '').split('\n').filter(Boolean).map((l) => {
+    try { return JSON.parse(Buffer.from(l.split('vmess://')[1], 'base64').toString('utf8')).add; } catch { return '?'; }
+  });
+
+  // 1) Metadata byte budget: a legal-max CJK note + ten legal-max CJK
+  // tags serialize past the platform's 1024-BYTE metadata limit. The
+  // mock KV now enforces that limit, so generation must still succeed
+  // (the metadata copies degrade; the record body stays authoritative).
+  const bigNote = '搬瓦工洛杉矶机房主力节点专用线路记录'.repeat(4).slice(0, 80);
+  const bigTags = Array.from({ length: 10 }, (_, i) => ('香港节点加速专线优选回国优化' + i).padEnd(24, '线').slice(0, 24));
+  const gMeta = await generate({ nodeLinks: vm('meta16'), preferredIps: '198.51.100.40', note: bigNote, tags: bigTags });
+  const metaEntry = store.get('sub:' + gMeta.shortId);
+  assert.ok(new TextEncoder().encode(JSON.stringify(metaEntry.metadata)).length <= 1024, 'metadata stays within the KV byte limit');
+  assert.equal(JSON.parse(metaEntry.value).tags.length, 10, 'record body keeps all ten tags even when the metadata copy drops them');
+  assert.equal(JSON.parse(metaEntry.value).note, bigNote, 'record body keeps the full note');
+
+  // 2) Parked-page sources: an HTML answer is a fetch failure, not a
+  // harvest of IP-shaped page furniture.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes('parked.example.com')) {
+      return new Response('<html><title>Domain for sale</title><p>Contact 203.0.113.66 now</p></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    if (u.includes('sneaky.example.com')) {
+      return new Response('<!DOCTYPE html><html><body>203.0.113.67</body></html>', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    if (u.includes('good.example.com')) {
+      return new Response('203.0.113.68\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const parkedOnly = await genRaw({ nodeLinks: vm('parked'), preferredIps: 'https://parked.example.com/list.txt' });
+    assert.equal(parkedOnly.json.ok, false, 'parked-page source alone cannot create an entry');
+    const sneaky = await genRaw({ nodeLinks: vm('sneaky'), preferredIps: 'https://sneaky.example.com/list.txt' });
+    assert.equal(sneaky.json.ok, false, 'an HTML body is refused even under a text content-type');
+    const parkedMixed = await generate({ nodeLinks: vm('parkedmix'), preferredIps: 'https://parked.example.com/list.txt\n198.51.100.41' });
+    assert.ok((parkedMixed.warnings || []).join(' ').includes('拉取失败'), 'parked source is named as failed when literals carry the entry');
+    assert.deepEqual(plainServers(parkedMixed), ['198.51.100.41'], 'no parked-page IP leaks into the entry');
+    const good = await generate({ nodeLinks: vm('goodsrc'), preferredIps: 'https://good.example.com/list.txt' });
+    assert.deepEqual(plainServers(good), ['203.0.113.68'], 'a plain-text list still parses normally');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // 3) Literal lines are host-validated: garbage is skipped with a
+  // warning, a scheme-less source path no longer becomes a fake host.
+  const litMix = await generate({ nodeLinks: vm('litmix'), preferredIps: '这不是地址\n198.51.100.42' });
+  assert.deepEqual(plainServers(litMix), ['198.51.100.42'], 'a garbage literal line produces no node');
+  assert.ok((litMix.warnings || []).join(' ').includes('不是合法的 IP 或域名'), 'the skipped literal is reported');
+  const schemeLess = await genRaw({ nodeLinks: vm('litpath'), preferredIps: 'raw.example.com/ips.txt' });
+  assert.equal(schemeLess.json.ok, false, 'a scheme-less source path alone cannot create an entry');
+  const v6lit = await generate({ nodeLinks: vm('litv6'), preferredIps: '[2001:db8::5]:443' });
+  assert.ok(plainServers(v6lit)[0].includes('2001:db8::5'), 'IPv6 literals still work');
+
+  // 4) peer= survives as SNI in the structured outputs.
+  const tjPeer = 'trojan://pw@tj.example.com:443?security=tls&peer=cdn.example.com&type=tcp#tjpeer16';
+  const gPeer = await generate({ nodeLinks: tjPeer, preferredIps: '198.51.100.43' });
+  const peerClash = await getSub(gPeer.shortId, 'clash');
+  assert.ok(peerClash.body.includes('sni: "cdn.example.com"'), 'clash: peer becomes the sni');
+  const peerSurge = await getSub(gPeer.shortId, 'surge');
+  assert.ok(peerSurge.body.includes('sni=cdn.example.com'), 'surge: peer becomes the sni');
+
+  // 5) Uppercase schemes parse (bare and inside a base64 blob).
+  const upVless = await generate({ nodeLinks: 'VLESS://11111111-2222-3333-4444-555555555555@up.example.com:443?security=tls&type=tcp#up16', preferredIps: '198.51.100.44' });
+  assert.equal(upVless.counts.inputNodes, 1, 'VLESS:// in capitals is accepted');
+  const upBlob = await generate({ nodeLinks: Buffer.from('Trojan://pw@tb.example.com:443?security=tls#tb16', 'utf8').toString('base64'), preferredIps: '198.51.100.45' });
+  assert.equal(upBlob.counts.inputNodes, 1, 'a capitalized scheme inside a base64 blob is accepted');
+
+  // 6) The deduplicated flag tells the truth.
+  const gFresh = await generate({ nodeLinks: vm('flag16'), preferredIps: '198.51.100.46' });
+  assert.equal(gFresh.deduplicated, false, 'a fresh mint is not a dedup hit');
+  const gAgain = await generate({ nodeLinks: vm('flag16'), preferredIps: '198.51.100.46' });
+  assert.equal(gAgain.deduplicated, true, 'an identical regenerate is a dedup hit');
+  assert.equal(gAgain.shortId, gFresh.shortId, 'dedup hit reuses the entry');
+
+  // 7) Dedup heal renews the dedup key on the healed record's clock.
+  const gT1 = await generate({ nodeLinks: vm('heal16'), preferredIps: '198.51.100.47', storageMode: 'days', retentionDays: 2 });
+  const healDedupKey = [...store.keys()].find((k) => k.startsWith('dedup:') && store.get(k).value === gT1.shortId);
+  store.delete('sub:' + gT1.shortId);
+  const gT2 = await generate({ nodeLinks: vm('heal16'), preferredIps: '198.51.100.47', storageMode: 'days', retentionDays: 30 });
+  assert.equal(gT2.shortId, gT1.shortId, 'heal keeps the original id');
+  assert.equal(store.get(healDedupKey).expirationTtl, 2592000, 'heal renews the dedup key TTL with the record');
+
+  // 8) remainingTtl anchors expiresAt-less timed records at
+  // createdAt + days instead of restarting the full countdown.
+  const gLeg = await generate({ nodeLinks: vm('legacy16'), preferredIps: '198.51.100.48', storageMode: 'days', retentionDays: 2 });
+  const legKey = 'sub:' + gLeg.shortId;
+  const legRec = JSON.parse(store.get(legKey).value);
+  delete legRec.storage.expiresAt;
+  legRec.createdAt = new Date(Date.now() - 86400 * 1000).toISOString(); // created a day ago
+  store.set(legKey, { value: JSON.stringify(legRec), metadata: store.get(legKey).metadata, expirationTtl: 3600 });
+  const noteResp = await worker.fetch(new Request('https://x.pages.dev/api/note', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'tok-0123456789abcdef', id: gLeg.shortId, note: 'hi' }),
+  }), env);
+  assert.equal((await noteResp.json()).ok, true, 'note save succeeds on the legacy-shaped record');
+  const legAfter = JSON.parse(store.get(legKey).value);
+  assert.ok(legAfter.storage.expiresAt, 'expiresAt is materialized by the save');
+  const legTtl = store.get(legKey).expirationTtl;
+  assert.ok(legTtl > 80000 && legTtl < 100000, 'TTL counts down the remaining day, not a fresh two days (got ' + legTtl + ')');
+
+  // 9) The merged entry cache fronts /sub resolution: while it is
+  // warm, per-source cache changes do not affect the served nodes.
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('rot.example.com')) return new Response('203.0.113.70\n', { status: 200 });
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const gDyn = await generate({ nodeLinks: vm('dyn16'), preferredIps: 'https://rot.example.com/list.txt' });
+    const first = await getSub(gDyn.shortId, 'plain');
+    assert.ok(first.body.includes('MjAzLjAuMTEzLjcw') || JSON.stringify(first.body).length > 0, 'first pull serves');
+    const firstServers = [...store.keys()];
+    assert.ok(firstServers.some((k) => k === 'entrycache:' + gDyn.shortId), 'the merged entry cache is written after a pull');
+    const decodeAdd = (body) => {
+      const line = body.split('\n')[0];
+      return JSON.parse(Buffer.from(line.split('vmess://')[1], 'base64').toString('utf8')).add;
+    };
+    assert.equal(decodeAdd(first.body), '203.0.113.70', 'first pull serves the source endpoint');
+    const ipKey = [...store.keys()].find((k) => k.startsWith('ipcache:'));
+    const ipVal = JSON.parse(store.get(ipKey).value);
+    ipVal.endpoints = [{ server: '203.0.113.71', port: undefined, remark: '' }];
+    store.set(ipKey, { value: JSON.stringify(ipVal), metadata: undefined, expirationTtl: undefined });
+    const second = await getSub(gDyn.shortId, 'plain');
+    assert.equal(decodeAdd(second.body), '203.0.113.70', 'a warm entry cache wins over the per-source cache');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  console.log('audit-16 suite: metadata bytes, parked sources, literal validation, peer sni, uppercase schemes, dedup heal/flag, ttl anchor, entry cache: passed');
+}
+
+// --- External audit fixes suite (2026-11-04): link-token decoupling,
+// token floor + lockout, fail-closed, /sub headers, static refresh,
+// literal dedupe, unknown target, VMess fidelity, ws Host, flow gate,
+// SNI fallback, source parsing, DNS guard, list paging, byte cap,
+// entry-cache invalidation, update-check token ---
+{
+  const { createHmac } = await import('node:crypto');
+  const ADMIN = 'tok-0123456789abcdef';
+  const hmacOf = (id) => createHmac('sha256', ADMIN).update(`sub-link:${id}`).digest('hex').slice(0, 32);
+  const mkEnv = (token) => {
+    const st = new Map();
+    const e = {
+      SUB_STORE: {
+        async get(k) { const v = st.get(k); return v ? v.value : null; },
+        async put(k, v, o = {}) { st.set(k, { value: v, metadata: o.metadata, expirationTtl: o.expirationTtl }); },
+        async delete(k) { st.delete(k); },
+        async list({ prefix = '', limit = 1000 } = {}) {
+          const keys = [...st.entries()].filter(([n]) => n.startsWith(prefix)).slice(0, limit)
+            .map(([name, en]) => ({ name, metadata: en.metadata }));
+          return { keys, list_complete: true, cursor: '' };
+        },
+      },
+      ASSETS: { async fetch() { return new Response('HOME'); } },
+    };
+    if (token !== undefined) e.SUB_ACCESS_TOKEN = token;
+    return { e, st };
+  };
+  const post = (e, path, body) => worker.fetch(new Request('https://x.pages.dev' + path, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }), e);
+  const vmJson = (obj) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'X', add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', net: 'tcp', type: 'none', tls: '', ...obj }), 'utf8').toString('base64');
+
+  // Token floor: a configured-but-short token disables the admin surface.
+  {
+    const { e } = mkEnv('short');
+    const list = await worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': 'short' } }), e);
+    assert.equal(list.status, 403, 'short admin token rejected');
+    assert.ok((await list.json()).error.includes('太短'), 'short-token error names the problem');
+    const gen = await post(e, '/api/generate', { token: 'short', nodeLinks: vmJson({}), preferredIps: '198.51.100.1' });
+    assert.equal(gen.status, 403, 'generate also gated by the floor');
+  }
+
+  // Fail-closed when no token is configured at all.
+  {
+    const { e, st } = mkEnv(undefined);
+    st.set('sub:NoToken001', { value: JSON.stringify({ version: 2, createdAt: new Date().toISOString(), nodes: [], storage: { mode: 'permanent' } }) });
+    const gen = await post(e, '/api/generate', { nodeLinks: vmJson({}), preferredIps: '198.51.100.1' });
+    assert.equal(gen.status, 403, 'tokenless generate refused');
+    const sub = await worker.fetch(new Request('https://x.pages.dev/sub/NoToken001'), e);
+    assert.equal(sub.status, 403, 'tokenless /sub refused');
+    const list = await worker.fetch(new Request('https://x.pages.dev/api/list'), e);
+    assert.equal(list.status, 403, 'tokenless list refused (already true before)');
+  }
+
+  // Stored random link tokens: not the HMAC derivation, stable across
+  // a dedup refresh, and the ONLY thing that opens the entry. Legacy
+  // records without a stored token still validate via the derivation.
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtTok' }), preferredIps: '198.51.100.44' });
+    const tok = linkTokens.get(g.shortId);
+    assert.match(tok, /^[0-9a-f]{32}$/, 'link token shape kept');
+    assert.notEqual(tok, hmacOf(g.shortId), 'link token is NOT derivable from the admin token');
+    const rec = JSON.parse(store.get(`sub:${g.shortId}`).value);
+    assert.equal(rec.linkToken, tok, 'random token stored on the record');
+    const again = await generate({ nodeLinks: vmJson({ ps: 'ExtTok' }), preferredIps: '198.51.100.44' });
+    assert.equal(again.deduplicated, true);
+    assert.equal(linkTokens.get(g.shortId), tok, 'dedup refresh keeps the same link token');
+    assert.equal((await getSub(g.shortId, 'raw')).status, 200, 'stored token opens the entry');
+    assert.equal((await getSub(g.shortId, 'raw', hmacOf(g.shortId))).status, 403, 'the derivation does NOT open a stored-token entry');
+
+    const legacyId = 'LegacyX17a';
+    store.set(`sub:${legacyId}`, { value: JSON.stringify({ version: 2, createdAt: new Date().toISOString(), storage: { mode: 'permanent' }, nodes: [{ type: 'vmess', name: 'L', server: '198.51.100.1', port: 443, uuid: '11111111-2222-3333-4444-555555555555', alterId: 0, cipher: 'auto', network: 'tcp', tls: false, host: '', path: '/', sni: '', alpn: '', fp: '' }] }) });
+    const legacyOk = await worker.fetch(new Request(`https://x.pages.dev/sub/${legacyId}?target=plain&token=${hmacOf(legacyId)}`), env);
+    assert.equal(legacyOk.status, 200, 'legacy entry still opens via the derived token');
+    const legacyBad = await worker.fetch(new Request(`https://x.pages.dev/sub/${legacyId}?target=plain&token=${'0'.repeat(32)}`), env);
+    assert.equal(legacyBad.status, 403, 'legacy entry rejects a wrong token');
+  }
+
+  // /sub response headers: no CORS wildcard, no-store.
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtHdr' }), preferredIps: '198.51.100.45' });
+    const r = await worker.fetch(new Request(`https://x.pages.dev/sub/${g.shortId}?target=clash&token=${linkTokens.get(g.shortId)}`), env);
+    assert.equal(r.status, 200, 'clash pull works');
+    assert.equal(r.headers.get('access-control-allow-origin'), null, 'no wildcard CORS on /sub');
+    assert.equal(r.headers.get('cache-control'), 'no-store', '/sub is no-store');
+  }
+
+  // Static dedup-hit refreshes the stored nodes (preview == /sub).
+  {
+    const a = vmJson({ ps: 'ExtAAA', port: '443' });
+    const b = vmJson({ ps: 'ExtBBB', port: '8443' });
+    const g1 = await generate({ nodeLinks: a + '\n' + b, preferredIps: '198.51.100.46' });
+    const g2 = await generate({ nodeLinks: b + '\n' + a, preferredIps: '198.51.100.46' });
+    assert.equal(g2.deduplicated, true, 'reorder still dedups');
+    const sub = await getSub(g1.shortId, 'plain');
+    assert.equal(sub.body, g2.plainText, 'static hit: /sub serves the refreshed expansion');
+  }
+
+  // Literal duplicates dedupe (README parity).
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtDup' }), preferredIps: '1.1.1.1\n1.1.1.1\n1.1.1.1' });
+    assert.equal(g.counts.outputNodes, 1, 'same literal x3 = one node');
+    assert.equal(g.counts.preferredEndpoints, 1, 'endpoint count deduped too');
+  }
+
+  // Unknown targets are a 400, not silent base64.
+  {
+    const g = await generate({ nodeLinks: vmJson({ ps: 'ExtTgt' }), preferredIps: '198.51.100.47' });
+    assert.equal((await getSub(g.shortId, 'json')).status, 400, 'target=json refused loudly');
+    assert.equal((await getSub(g.shortId, 'bogus')).status, 400, 'target=bogus refused loudly');
+    assert.equal((await getSub(g.shortId, 'raw')).status, 200, 'target=raw still fine');
+  }
+
+  // VMess fidelity: allowInsecure + header type survive the whole chain.
+  {
+    const link = vmJson({ ps: 'ExtVmess', type: 'http', tls: 'tls', allowInsecure: true, sni: 'a.example.com' });
+    const g = await generate({ nodeLinks: link, preferredIps: '198.51.100.48' });
+    const plain = await getSub(g.shortId, 'plain');
+    const decoded = JSON.parse(Buffer.from(plain.body.trim().split('vmess://')[1], 'base64').toString('utf8'));
+    assert.equal(decoded.type, 'http', 'vmess header type round-trips');
+    assert.equal(decoded.allowInsecure, true, 'vmess allowInsecure round-trips');
+    const clash = await getSub(g.shortId, 'clash');
+    assert.ok(clash.body.includes('skip-cert-verify: true'), 'clash vmess honors allowInsecure');
+    const surge = await getSub(g.shortId, 'surge');
+    assert.ok(surge.body.includes('skip-cert-verify=true'), 'surge vmess honors allowInsecure');
+  }
+
+  // Empty WS Host is omitted (Clash headers block + Surge ws-headers).
+  {
+    const ws = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@ws.example.com:443?security=tls&type=ws&path=%2Fws#ExtWs';
+    const g = await generate({ nodeLinks: ws, preferredIps: '198.51.100.49', keepOriginalHost: true });
+    const clash = await getSub(g.shortId, 'clash');
+    assert.ok(!clash.body.includes('Host: ""'), 'clash: no empty Host header');
+    assert.ok(!clash.body.includes('headers:'), 'clash: no headers block without a host');
+    const tro = 'trojan://pw@ws2.example.com:443?security=tls&type=ws&path=%2Fws#ExtWsT';
+    const g2 = await generate({ nodeLinks: tro, preferredIps: '198.51.100.50', keepOriginalHost: true });
+    const surge = await getSub(g2.shortId, 'surge');
+    assert.ok(!surge.body.includes('ws-headers=Host:'), 'surge: no bare ws-headers');
+  }
+
+  // Vision flow requires tcp transport.
+  {
+    const mk = (type) => `vless://f541611e-0aeb-4900-aa47-6e95d4916a49@fl.example.com:443?security=tls&type=${type}&flow=xtls-rprx-vision&sni=fl.example.com#ExtFlow`;
+    const gWs = await generate({ nodeLinks: mk('ws'), preferredIps: '198.51.100.51' });
+    assert.ok(!(await getSub(gWs.shortId, 'clash')).body.includes('flow:'), 'vision flow suppressed on ws');
+    const gTcp = await generate({ nodeLinks: mk('tcp'), preferredIps: '198.51.100.52' });
+    assert.ok((await getSub(gTcp.shortId, 'clash')).body.includes('flow: "xtls-rprx-vision"'), 'vision flow kept on tcp');
+  }
+
+  // keepOriginalHost=false: SNI follows the endpoint; a distinct SNI survives.
+  {
+    const mk = (sni) => `vless://f541611e-0aeb-4900-aa47-6e95d4916a49@origin.example.com:443?security=tls&type=tcp&sni=${sni}#ExtSni`;
+    const g1 = await generate({ nodeLinks: mk('origin.example.com'), preferredIps: 'cf.example.com', keepOriginalHost: false });
+    assert.ok((await getSub(g1.shortId, 'clash')).body.includes('servername: "cf.example.com"'), 'sni falls back to the endpoint host');
+    const g2 = await generate({ nodeLinks: mk('cdn.example.com'), preferredIps: 'cf2.example.com', keepOriginalHost: false });
+    assert.ok((await getSub(g2.shortId, 'clash')).body.includes('servername: "cdn.example.com"'), 'distinct sni survives');
+  }
+
+  // Source parsing: multi-address lines, octet validation, CSV port column, DNS guard.
+  {
+    const realFetch = globalThis.fetch;
+    let dohAnswer = [{ type: 1, data: '1.1.1.1' }];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.startsWith('https://cloudflare-dns.com/dns-query')) {
+        return new Response(JSON.stringify({ Answer: dohAnswer }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+      }
+      if (u === 'https://multi.example.com/l.txt') return new Response('1.1.1.1, 2.2.2.2, 3.3.3.3', { status: 200 });
+      if (u === 'https://octet.example.com/l.txt') return new Response('999.999.999.999:443\n5.5.5.5', { status: 200 });
+      if (u === 'https://csv.example.com/l.csv') return new Response('IP,port\n104.16.7.7,443', { status: 200 });
+      if (u === 'https://rebind.example.com/l.txt') return new Response('6.6.6.6', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const test = (url) => post(env, '/api/ip-source-test', { token: ADMIN, url }).then((r) => r.json());
+      assert.equal((await test('https://multi.example.com/l.txt')).count, 3, 'all addresses on a line are taken');
+      const oct = await test('https://octet.example.com/l.txt');
+      assert.equal(oct.count, 1, 'invalid IPv4 octets rejected');
+      assert.ok(oct.sample.includes('5.5.5.5'), 'valid endpoint kept');
+      const csv = await test('https://csv.example.com/l.csv');
+      assert.ok(csv.sample.includes('104.16.7.7:443'), 'csv port column applied');
+      const reb = await test('https://rebind.example.com/l.txt');
+      assert.equal(reb.ok, true, 'public DNS answer passes');
+      dohAnswer = [{ type: 1, data: '10.0.0.5' }];
+      const reb2 = await test('https://rebind.example.com/l.txt');
+      assert.equal(reb2.ok, false, 'hostname resolving to a private address refused');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // /api/list paging parameters.
+  {
+    const one = await (await worker.fetch(new Request('https://x.pages.dev/api/list?limit=1', { headers: { 'x-admin-token': ADMIN } }), env)).json();
+    assert.equal(one.items.length, 1, 'limit slices the page');
+    assert.ok(one.total > 1 && one.count === one.total, 'total still reports everything');
+    const past = await (await worker.fetch(new Request('https://x.pages.dev/api/list?offset=100000', { headers: { 'x-admin-token': ADMIN } }), env)).json();
+    assert.equal(past.items.length, 0, 'offset past the end is an empty page');
+  }
+
+  // Oversized records fail as a clear 400, not a platform 500.
+  {
+    const huge = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@big.example.com:443?security=tls&type=ws&path=%2F'
+      + 'a'.repeat(13_500_000) + '#ExtBig';
+    const r = await post(env, '/api/generate', { token: ADMIN, nodeLinks: huge, preferredIps: '198.51.100.53\n198.51.100.54' });
+    assert.equal(r.status, 400, 'oversize generate refused with 400');
+    assert.ok((await r.json()).error.includes('记录体积过大'), 'oversize error names the size');
+  }
+
+  // Regenerating a dynamic entry invalidates its merged /sub cache.
+  {
+    const realFetch = globalThis.fetch;
+    let list = '104.16.20.1';
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === 'https://inv.example.com/l.txt') return new Response(list, { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const body = { nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@inv.example.com:443?security=tls&type=ws&path=%2Fws&host=inv.example.com&sni=inv.example.com#ExtInv', preferredIps: 'https://inv.example.com/l.txt' };
+      const g = await generate(body);
+      const s1 = await getSub(g.shortId, 'plain');
+      assert.ok(s1.body.includes('@104.16.20.1'), 'initial endpoints served (entry cache now warm)');
+      list = '104.16.20.2';
+      for (const k of [...store.keys()]) if (k.startsWith('ipcache:')) store.delete(k);
+      const g2 = await generate(body);
+      assert.equal(g2.deduplicated, true, 'regenerate hits the same dynamic entry');
+      const s2 = await getSub(g.shortId, 'plain');
+      assert.ok(s2.body.includes('@104.16.20.2'), 'post-regeneration /sub serves the new endpoints at once');
+      assert.ok(!s2.body.includes('@104.16.20.1'), 'old endpoints gone');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // The update check sends GITHUB_TOKEN when one is configured.
+  {
+    const { e } = mkEnv(ADMIN);
+    e.GITHUB_TOKEN = 'ghp_test_token';
+    const realFetch = globalThis.fetch;
+    let seenAuth = null;
+    globalThis.fetch = async (url, init) => {
+      seenAuth = (init && init.headers && init.headers.authorization) || null;
+      return new Response(JSON.stringify({ tag_name: 'v9.9.9', html_url: 'https://github.com/x' }), { status: 200 });
+    };
+    try {
+      const v = await (await worker.fetch(new Request('https://x.pages.dev/api/version'), e)).json();
+      assert.equal(v.latest, '9.9.9', 'version check works with a token configured');
+      assert.equal(seenAuth, 'Bearer ghp_test_token', 'github token sent on the update check');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // Admin throttle LAST in this suite: wrong guesses are counted in
+  // module-level state shared by the whole isolate. Round 17 changed
+  // the semantics — the throttle refuses further WRONG guesses, but
+  // a correct token is always admitted and clears the counter (the
+  // owner can no longer be locked out by strangers).
+  {
+    const { e } = mkEnv(ADMIN);
+    const tryToken = (t) => worker.fetch(new Request('https://x.pages.dev/api/list', { headers: { 'x-admin-token': t } }), e);
+    for (let i = 0; i < 19; i++) {
+      assert.equal((await tryToken('wrong-' + i)).status, 403, 'wrong guesses are 403 while under the limit');
+    }
+    assert.equal((await tryToken('wrong-19')).status, 429, 'the 20th wrong guess trips the throttle');
+    assert.equal((await tryToken('wrong-20')).status, 429, 'further wrong guesses stay throttled');
+    assert.equal((await tryToken(ADMIN)).status, 200, 'a correct token is admitted during the throttle');
+    assert.equal((await tryToken('wrong-again')).status, 403, 'the successful login cleared the counter');
+  }
+
+  console.log('external audit fixes suite: token floor/lockout, fail-closed, stored link tokens, headers, static refresh, literal dedupe, target 400, vmess fidelity, ws host, flow gate, sni fallback, source parsing + DNS, list paging, byte cap, entry-cache invalidation, github token: passed');
+}
+
+// --- Audit round 17 suite: CSV header gate, CNAME following, body
+// cap, clash camouflage, paged-list read cost, entry-cache stamps,
+// OPTIONS posture ---
+{
+  const ADMIN = 'tok-0123456789abcdef';
+  const post = (e, path, body) => worker.fetch(new Request('https://x.pages.dev' + path, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }), e);
+  const vmJson = (obj) => 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'R17', add: 'a.example.com', port: '443', id: '11111111-2222-3333-4444-555555555555', aid: '0', scy: 'auto', net: 'tcp', type: 'none', tls: '', ...obj }), 'utf8').toString('base64');
+
+  // CSV: a packets-sent column is NOT a port (CloudflareSpeedTest shape).
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === 'https://speed.example.com/result.csv') {
+        return new Response('IP 地址,已发送,已接收,丢包率,平均延迟,下载速度 (MB/s)\n104.16.1.2,4,4,0.00,123.45,67.89\n104.16.1.3,4,4,0.00,98.10,55.20', { status: 200 });
+      }
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const r = await post(env, '/api/ip-source-test', { token: ADMIN, url: 'https://speed.example.com/result.csv' }).then((x) => x.json());
+      assert.equal(r.count, 2, 'speed-test csv parsed');
+      assert.ok(r.sample.includes('104.16.1.2'), 'bare IP kept');
+      assert.ok(!r.sample.some((x) => x.endsWith(':4')), 'packets-sent column is not read as a port');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // DoH guard follows a CNAME-only answer to the address it lands on.
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.startsWith('https://cloudflare-dns.com/dns-query')) {
+        const name = new URL(u).searchParams.get('name');
+        const type = new URL(u).searchParams.get('type');
+        let answer = [];
+        if (name === 'chain.example.com' && type === 'CNAME') answer = [{ type: 5, data: 'inner.example.com.' }];
+        if (name === 'inner.example.com' && type === 'A') answer = [{ type: 1, data: '10.0.0.9' }];
+        if (name === 'chain2.example.com' && type === 'CNAME') answer = [{ type: 5, data: 'pub.example.com.' }];
+        if (name === 'pub.example.com' && type === 'A') answer = [{ type: 1, data: '1.1.1.1' }];
+        return new Response(JSON.stringify({ Answer: answer }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+      }
+      if (u === 'https://chain.example.com/l.txt' || u === 'https://chain2.example.com/l.txt') return new Response('6.6.6.6', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const bad = await post(env, '/api/ip-source-test', { token: ADMIN, url: 'https://chain.example.com/l.txt' }).then((x) => x.json());
+      assert.equal(bad.ok, false, 'CNAME chain landing on a private address is refused');
+      const good = await post(env, '/api/ip-source-test', { token: ADMIN, url: 'https://chain2.example.com/l.txt' }).then((x) => x.json());
+      assert.equal(good.ok, true, 'CNAME chain landing on a public address passes');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // Request bodies are size-capped before parsing (and before auth).
+  {
+    const huge = { token: 'wrong-on-purpose', nodeLinks: 'x'.repeat(17 * 1024 * 1024), preferredIps: '1.1.1.1' };
+    const r = await post(env, '/api/generate', huge);
+    assert.equal(r.status, 413, 'oversized body refused pre-auth with 413');
+    const r2 = await post(env, '/api/note', { token: ADMIN, id: 'x', note: 'y'.repeat(17 * 1024 * 1024) });
+    assert.equal(r2.status, 413, 'admin endpoints share the cap');
+  }
+
+  // VMess http camouflage renders as mihomo's http transport in Clash.
+  {
+    const camo = await generate({ nodeLinks: vmJson({ ps: 'R17Camo', type: 'http', host: 'cdn.example.com' }), preferredIps: '198.51.100.60' });
+    const clash = await getSub(camo.shortId, 'clash');
+    assert.ok(clash.body.includes('network: "http"'), 'camo vmess uses http transport in clash');
+    assert.ok(clash.body.includes('http-opts:'), 'camo vmess carries http-opts');
+    const plain = await generate({ nodeLinks: vmJson({ ps: 'R17Plain' }), preferredIps: '198.51.100.61' });
+    const clash2 = await getSub(plain.shortId, 'clash');
+    assert.ok(clash2.body.includes('network: "tcp"'), 'plain vmess stays tcp');
+    assert.ok(!clash2.body.includes('http-opts:'), 'plain vmess has no http-opts');
+  }
+
+  // Paged list reads only the page's records.
+  {
+    const st = new Map();
+    let recordGets = 0;
+    const e = {
+      SUB_ACCESS_TOKEN: ADMIN,
+      SUB_STORE: {
+        async get(k) { if (k.startsWith('sub:')) recordGets++; const v = st.get(k); return v ? v.value : null; },
+        async put(k, v, o = {}) { st.set(k, { value: v, metadata: o.metadata }); },
+        async delete(k) { st.delete(k); },
+        async list({ prefix = '', limit = 1000 } = {}) {
+          const keys = [...st.entries()].filter(([n]) => n.startsWith(prefix)).slice(0, limit).map(([name, en]) => ({ name, metadata: en.metadata }));
+          return { keys, list_complete: true, cursor: '' };
+        },
+      },
+      ASSETS: { async fetch() { return new Response('HOME'); } },
+    };
+    for (let i = 1; i <= 5; i++) {
+      st.set(`sub:PageTest0${i}`, {
+        value: JSON.stringify({ version: 2, createdAt: `2026-01-0${i}T00:00:00.000Z`, storage: { mode: 'permanent' }, nodes: [{ type: 'vmess', name: 'P' + i, server: '198.51.100.1', port: 443, uuid: '11111111-2222-3333-4444-555555555555', alterId: 0, cipher: 'auto', network: 'tcp', tls: false, host: '', path: '/', sni: '', alpn: '', fp: '' }] }),
+        metadata: { createdAt: `2026-01-0${i}T00:00:00.000Z` },
+      });
+    }
+    const page = await (await worker.fetch(new Request('https://x.pages.dev/api/list?limit=2', { headers: { 'x-admin-token': ADMIN } }), e)).json();
+    assert.equal(page.total, 5, 'paged list reports the full total');
+    assert.equal(page.items.length, 2, 'paged list returns one page');
+    assert.equal(page.items[0].id, 'PageTest05', 'paged list is newest-first');
+    assert.equal(recordGets, 2, 'paged list reads only the page records');
+  }
+
+  // Entry cache is gated by the record stamp, not just freshness.
+  {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === 'https://stamp.example.com/l.txt') return new Response('104.16.30.1', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const g = await generate({ nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@stamp.example.com:443?security=tls&type=ws&path=%2Fws&host=stamp.example.com&sni=stamp.example.com#R17Stamp', preferredIps: 'https://stamp.example.com/l.txt' });
+      const s1 = await getSub(g.shortId, 'plain');
+      assert.ok(s1.body.includes('@104.16.30.1'), 'source endpoints served');
+      const rec = JSON.parse(store.get(`sub:${g.shortId}`).value);
+      const stamp = rec.updatedAt || rec.createdAt;
+      store.set(`entrycache:${g.shortId}`, { value: JSON.stringify({ at: Date.now(), recStamp: 'stale-stamp', endpoints: [{ server: '9.9.9.9', port: null, remark: '' }] }) });
+      const s2 = await getSub(g.shortId, 'plain');
+      assert.ok(!s2.body.includes('@9.9.9.9'), 'a cache stamped by an older record version is ignored');
+      assert.ok(s2.body.includes('@104.16.30.1'), 'fresh resolution serves instead');
+      store.set(`entrycache:${g.shortId}`, { value: JSON.stringify({ at: Date.now(), recStamp: stamp, endpoints: [{ server: '8.8.8.8', port: null, remark: '' }] }) });
+      const s3 = await getSub(g.shortId, 'plain');
+      assert.ok(s3.body.includes('@8.8.8.8'), 'a cache stamped by the current record version is honored');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // OPTIONS: no CORS grants anywhere.
+  {
+    const apiOpt = await worker.fetch(new Request('https://x.pages.dev/api/list', { method: 'OPTIONS' }), env);
+    assert.equal(apiOpt.status, 204, 'api OPTIONS is a bare 204');
+    assert.equal(apiOpt.headers.get('access-control-allow-origin'), null, 'no wildcard on api OPTIONS');
+    const subOpt = await worker.fetch(new Request('https://x.pages.dev/sub/whatever', { method: 'OPTIONS' }), env);
+    assert.equal(subOpt.headers.get('access-control-allow-origin'), null, 'no wildcard on sub OPTIONS');
+  }
+
+  console.log('audit round 17 suite: csv header gate, cname following, body cap, clash camouflage, paged-list reads, entry-cache stamps, options posture: passed');
+}
+
+// --- Audit round 18 suite: xhttp opts, profile-title header,
+// non-semver tag filtering, manual redirect validation ---
+{
+  const ADMIN = 'tok-0123456789abcdef';
+
+  // xhttp nodes carry path/host/mode into Clash.
+  {
+    const link = 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@x.example.com:443?security=tls&type=xhttp&path=%2Fx&host=cdn.example.com&mode=stream-one#R18X';
+    const g = await generate({ nodeLinks: link, preferredIps: '198.51.100.70' });
+    const clash = await getSub(g.shortId, 'clash');
+    assert.ok(clash.body.includes('xhttp-opts:'), 'xhttp-opts emitted');
+    assert.ok(clash.body.includes('path: "/x"'), 'xhttp path preserved');
+    assert.ok(clash.body.includes('host: "cdn.example.com"'), 'xhttp host preserved');
+    assert.ok(clash.body.includes('mode: "stream-one"'), 'xhttp mode preserved');
+  }
+
+  // profile-title header rides alongside content-disposition.
+  {
+    const g = await generate({ nodeLinks: 'vless://f541611e-0aeb-4900-aa47-6e95d4916a49@p.example.com:443?security=tls&type=ws&path=%2Fws#R18P', preferredIps: '198.51.100.71' });
+    await worker.fetch(new Request('https://x.pages.dev/api/note', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: ADMIN, id: g.shortId, note: '搬瓦工主力' }),
+    }), env);
+    const tok = new URLSearchParams(new URL(g.urls.auto).search).get('token');
+    const resp = await worker.fetch(new Request(`https://x.pages.dev/sub/${g.shortId}?token=${tok}`), env);
+    const expected = 'base64:' + Buffer.from('搬瓦工主力', 'utf8').toString('base64');
+    assert.equal(resp.headers.get('profile-title'), expected, 'profile-title carries the note as base64 utf8');
+    assert.ok(resp.headers.get('content-disposition').includes('filename*='), 'content-disposition still present');
+  }
+
+  // The version check ignores non-semver 'latest' tags.
+  {
+    const vStore = new Map();
+    const e = {
+      SUB_ACCESS_TOKEN: ADMIN,
+      SUB_STORE: {
+        async get(k) { return vStore.get(k)?.value ?? null; },
+        async put(k, v, o = {}) { vStore.set(k, { value: v, metadata: o.metadata }); },
+        async delete(k) { vStore.delete(k); },
+        async list() { return { keys: [], list_complete: true, cursor: '' }; },
+      },
+      ASSETS: { async fetch() { return new Response('HOME'); } },
+    };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('api.github.com')) {
+        return new Response(JSON.stringify({ tag_name: 'v2026.11.4-3', html_url: 'https://example.com/rel' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const v = await (await worker.fetch(new Request('https://x.pages.dev/api/version'), e)).json();
+      assert.equal(v.checkStatus, 'ok', 'a date-tagged latest release is a successful check');
+      assert.equal(v.latest, null, 'a date tag is not reported as the latest version');
+      assert.equal(v.updateAvailable, false, 'no bogus update for a date tag');
+      const v2 = await (await worker.fetch(new Request('https://x.pages.dev/api/version'), e)).json();
+      assert.equal(v2.checkStatus, 'ok', 'the ignored tag is cached, not refetched as a failure');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  // Redirects are validated BEFORE the hop is fetched.
+  {
+    const fetched = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      fetched.push(u);
+      if (u === 'https://hop.example.com/start') return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/evil' } });
+      if (u === 'https://hop.example.com/good') return new Response(null, { status: 302, headers: { location: '/final.txt' } });
+      if (u === 'https://hop.example.com/final.txt') return new Response('104.16.40.1', { status: 200 });
+      throw new Error('unexpected fetch ' + u);
+    };
+    try {
+      const bad = await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: ADMIN, url: 'https://hop.example.com/start' }),
+      }), env);
+      assert.equal(bad.status, 400, 'a redirect to a private target is refused');
+      assert.ok(!fetched.some((u) => u.includes('127.0.0.1')), 'the private hop was never fetched');
+      const good = await (await worker.fetch(new Request('https://x.pages.dev/api/ip-source-test', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: ADMIN, url: 'https://hop.example.com/good' }),
+      }), env)).json();
+      assert.equal(good.ok, true, 'a legitimate relative redirect still works');
+      assert.equal(good.count, 1, 'the redirected list is parsed');
+    } finally { globalThis.fetch = realFetch; }
+  }
+
+  console.log('audit round 18 suite: xhttp opts, profile-title, semver tag filter, manual redirects: passed');
+}

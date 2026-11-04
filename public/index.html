@@ -10,6 +10,39 @@
     />
     <link rel="icon" href="/icons/auto.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css" />
+    <script>
+      // Earliest-possible error capture for the diagnostics export:
+      // records only the error kind, a short message and file/line —
+      // never page content — so even failures before app.js loads are
+      // visible in an exported log.
+      window.__diagErrors = [];
+      (function () {
+        var push = function (e) {
+          try {
+            if (window.__diagErrors.length < 30) window.__diagErrors.push(e);
+          } catch (x) {}
+        };
+        window.addEventListener('error', function (ev) {
+          push({
+            t: Date.now(),
+            kind: 'error',
+            msg: String(ev.message || '').slice(0, 200),
+            src: String(ev.filename || '').split('/').pop(),
+            line: ev.lineno || 0,
+            col: ev.colno || 0,
+          });
+        });
+        window.addEventListener('unhandledrejection', function (ev) {
+          var r = ev.reason;
+          push({
+            t: Date.now(),
+            kind: 'rejection',
+            msg: String((r && r.message) || r || '').slice(0, 200),
+            stack: String((r && r.stack) || '').split('\n').slice(0, 4).join('\n'),
+          });
+        });
+      })();
+    </script>
   </head>
   <body>
     <main class="container">
@@ -17,13 +50,21 @@
         <div>
           <p class="eyebrow">InfiCheesy &amp; YouTube &amp; GitHub</p>
 
-          <h1 class="hero-title">
-            <img src="/icons/auto.svg" alt="logo" class="hero-logo" />
-            <span>优选IP订阅生成器</span>
-          </h1>
+          <div class="hero-title-row">
+            <h1 class="hero-title">
+              <img src="/icons/auto.svg" alt="logo" class="hero-logo" />
+              <span>优选IP订阅生成器</span>
+            </h1>
+            <span id="versionStatus" class="version-status is-loading" role="status" aria-live="polite">版本检查中…</span>
+            <a id="versionUpdateLink" class="version-status is-update hidden" href="#" target="_blank" rel="noopener">发现新版本</a>
+          </div>
           <p class="lead">
             只做三件事：导入自建节点、批量替换为优选 IP、输出可导入主流客户端的订阅链接。
           </p>
+          <div id="versionAlert" class="version-alert hidden" role="alert">
+            <span id="versionAlertText"></span>
+            <button id="versionRetryBtn" type="button" class="secondary small">重新检查</button>
+          </div>
         </div>
         <div class="hero-note">
           <strong>适合场景</strong>
@@ -33,6 +74,14 @@
 
       <section class="grid two-col">
         <form id="generator-form" class="card stack-lg">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">生成</p>
+              <h2>生成订阅</h2>
+              <p class="section-desc">粘贴节点链接、填好优选 IP / 域名，生成你的专属订阅。</p>
+            </div>
+          </div>
+
           <div>
             <label for="nodeLinks">1. 粘贴节点链接</label>
             <textarea
@@ -46,7 +95,7 @@
           </div>
 
           <div>
-            <label for="preferredIps">2. 粘贴优选 IP / 优选域名</label>
+            <label for="preferredIps">2. 优选 IP / 优选域名来源（可混写）</label>
             <textarea
               id="preferredIps"
               name="preferredIps"
@@ -54,23 +103,73 @@
               placeholder="示例：
 104.16.1.2#HK-01
 104.17.2.3:2053#HK-02
-cf.example.com:443#US-Edge"
+cf.example.com:443#US-Edge
+2606:4700::1#IPv6
+https://example.com/ips.txt"
               required
             ></textarea>
             <p class="hint">
-              支持 <code>IP</code>、<code>IP:端口</code>、<code>域名</code>、<code>域名:端口</code>，<code>#</code> 后面可写备注。
+              一行一个，两种写法可混写、按填写顺序合并：直接写 <code>IP</code>、<code>IP:端口</code>、<code>域名</code>、<code>域名:端口</code>（<code>#</code> 后面可写备注；IPv6 可填裸地址 <code>2606:4700::1</code>，或带端口的方括号写法 <code>[2606:4700::1]:443</code>）；
+              或写一行 <code>https://</code> 链接（最多 5 个），生成时会拉取该链接的优选列表（一行一个，也支持 CSV 测速结果和 JSON 列表）并合并进来。
+              框里只要含链接，这条订阅就是动态的：手写行固定不变，链接部分约每小时跟随来源更新，来源暂时不可用时自动使用上次的快照，订阅不会中断。
             </p>
+            <div class="grid two-col compact">
+              <div>
+                <label for="ipSourceLimit">每个链接最多取前几个</label>
+                <input id="ipSourceLimit" name="ipSourceLimit" type="number" min="1" max="100" step="1" value="10" />
+              </div>
+              <div>
+                <label>&nbsp;</label>
+                <button id="testIpSourceBtn" type="button" class="secondary">测试拉取链接</button>
+              </div>
+            </div>
+            <p class="hint" id="ipSourceMsg"></p>
           </div>
 
           <div class="grid two-col compact">
             <div>
               <label for="namePrefix">3. 备注前缀（可选）</label>
-              <input id="namePrefix" name="namePrefix" type="text" placeholder="例如 CF" />
+              <input id="namePrefix" name="namePrefix" type="text" maxlength="100" placeholder="例如 CF" />
             </div>
             <div class="checkbox-wrap">
               <input id="keepOriginalHost" name="keepOriginalHost" type="checkbox" checked />
               <label for="keepOriginalHost">保留原节点 Host / SNI（推荐）</label>
             </div>
+          </div>
+
+          <div>
+            <label for="subNote">条目备注（可选，不会出现在节点名里）</label>
+            <input id="subNote" name="subNote" type="text" maxlength="80" placeholder="例如：搬瓦工 DC6 / RackNerd 法兰克福" />
+            <p class="hint">
+              这条订阅是哪台 VPS 的就写哪台。它会和条目一起存进 KV，还会在 KV 里生成一个
+              <code>note:备注:编号</code> 的索引键，在 Cloudflare 后台的 KV 列表里一眼就能认出是哪台机器。
+            </p>
+          </div>
+
+          <div>
+            <label for="tagInput">条目标签（可选，可多选）</label>
+            <div id="genTagChips" class="tag-chips"></div>
+            <input id="tagInput" name="tagInput" type="text" placeholder="输入新标签，按回车添加" autocomplete="off" />
+            <div id="genTagSuggestions" class="tag-suggestions"></div>
+            <p class="hint">
+              给这条订阅打标签（如「香港」「主力」），方便在下方管理区按标签筛选：点下方已有标签选用，或输入新标签回车新建，每条最多 10 个；长按标签可拖动排序。
+              重新生成已有条目时，没动过这里就不会改动它的标签；选了标签（哪怕清空）则按这里的为准。
+            </p>
+          </div>
+
+          <div>
+            <label>存储期限</label>
+            <div class="grid two-col compact">
+              <select id="storageMode" name="storageMode">
+                <option value="permanent" selected>永久保存（手动删除为止）</option>
+                <option value="days">自定义天数后自动删除</option>
+              </select>
+              <input id="retentionDays" name="retentionDays" type="number" min="1" max="3650" step="1" value="30" disabled />
+            </div>
+            <p class="hint">
+              选“自定义天数”并填天数（1–3650）时，这条订阅会在到期后被 KV 自动删除，链接随之失效；
+              选“永久保存”则一直保留，直到在下方“KV 条目管理”里手动删除。同一内容重复生成时，以这次的选择为准并重新计时。
+            </p>
           </div>
 
           <div class="actions">
@@ -85,6 +184,7 @@ cf.example.com:443#US-Edge"
             <li>不会帮你找优选 IP，只负责把你现成的优选 IP 替换进节点。</li>
             <li>生成的链接是“同一份节点内容”的不同导出格式，分别给不同客户端使用。</li>
             <li>推荐勾选“保留原 Host / SNI”，这样更适合 Cloudflare CDN 场景。</li>
+            <li>生成时可选<strong>永久保存</strong>，或自定义天数后由 KV 自动删除；不需要的条目也可以在页面下方的“KV 条目管理”里手动删除。</li>
             <li>订阅链接里的节点信息会通过服务端密钥加密，请不要把链接公开分享。</li>
           </ul>
 
@@ -207,6 +307,25 @@ cf.example.com:443#US-Edge"
             </div>
           </article>
 
+          <article class="sub-card">
+            <div class="sub-card-head">
+              <div class="client-meta">
+                <div class="client-icon">
+                  <img src="/icons/auto.svg" alt="明文链接" />
+                </div>
+                <div>
+                  <h3>明文链接</h3>
+                  <p>逐行明文节点链接（非 Base64），打开即可看/复制</p>
+                </div>
+              </div>
+            </div>
+            <div class="sub-actions">
+              <input id="plainUrl" readonly />
+              <button data-copy-target="plainUrl" type="button" class="secondary small">复制</button>
+              <button data-qrcode-target="plainUrl" type="button" class="secondary small">二维码</button>
+            </div>
+          </article>
+
           <article class="sub-card sub-card-wide">
             <div class="sub-card-head">
               <div class="client-meta">
@@ -229,8 +348,16 @@ cf.example.com:443#US-Edge"
         </div>
 
         <div class="preview-wrap">
-          <h3>预览前 20 个生成节点</h3>
-          <div class="table-wrap">
+          <h3>明文节点链接（一行一个，可整段复制）</h3>
+          <textarea id="plainLinks" rows="8" readonly placeholder="生成后这里会直接列出全部明文节点链接，例如 vless://...@bestcf.top:443?...#名称 | 前缀 | 1"></textarea>
+          <div class="actions">
+            <button data-copy-target="plainLinks" type="button" class="secondary small">复制全部明文链接</button>
+          </div>
+        </div>
+
+        <div class="preview-wrap">
+          <h3>预览全部生成节点</h3>
+          <div class="table-wrap preview-scroll">
             <table>
               <thead>
                 <tr>
@@ -247,7 +374,84 @@ cf.example.com:443#US-Edge"
           </div>
         </div>
       </section>
+      <section id="adminSection" class="card stack-lg">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">管理</p>
+            <h2>KV 条目管理</h2>
+            <p class="section-desc">条目永久保存后靠这里区分和清理：能看到每条订阅是哪台 VPS、什么时候生成的，可改备注、可删除；点每行的“链接”还能展开和上方结果区同款的各客户端链接卡片。需要填访问令牌（SUB_ACCESS_TOKEN）。</p>
+          </div>
+        </div>
+
+        <div class="sub-actions">
+          <input id="adminToken" type="password" placeholder="填入 SUB_ACCESS_TOKEN" autocomplete="off" />
+          <button id="listBtn" type="button" class="secondary small">加载条目列表</button>
+        </div>
+        <div id="adminMsg" class="hint"></div>
+
+        <div class="admin-toolbar">
+          <label for="sortSelect">排序</label>
+          <select id="sortSelect">
+            <option value="created-desc" selected>创建时间倒序（新 → 旧）</option>
+            <option value="created-asc">创建时间顺序（旧 → 新）</option>
+            <option value="name-asc">名称顺序（A → Z）</option>
+            <option value="name-desc">名称倒序（Z → A）</option>
+            <option value="remaining-asc">剩余有效期顺序（先到期在前）</option>
+            <option value="remaining-desc">剩余有效期倒序（晚到期在前）</option>
+          </select>
+          <label for="adminSearch">搜索</label>
+          <input id="adminSearch" type="search" placeholder="按备注、标签或来源 VPS / 节点搜索" autocomplete="off" />
+          <span class="toolbar-spacer"></span>
+          <button id="expandAllBtn" type="button" class="secondary small">展开全部</button>
+          <button id="collapseAllBtn" type="button" class="secondary small">收起全部</button>
+          <button id="deleteSelectedBtn" type="button" class="secondary small" disabled>删除所选</button>
+        </div>
+
+        <div id="tagFilterBar" class="tag-filter-bar hidden">
+          <span class="tag-filter-label">标签筛选</span>
+          <span id="tagFilterChips" class="tag-chips"></span>
+          <span class="tag-mode-toggle" role="group" aria-label="多标签筛选模式">
+            <button id="tagModeAnd" type="button" class="tag-mode-btn is-active">包含全部</button>
+            <button id="tagModeOr" type="button" class="tag-mode-btn">包含任一</button>
+          </span>
+          <button id="tagFilterClear" type="button" class="secondary small hidden">清除</button>
+        </div>
+
+        <div class="admin-wrap">
+          <div class="admin-head">
+            <span><input type="checkbox" id="selectAllEntries" aria-label="全选当前显示的条目" /></span>
+            <span>备注（可改）</span>
+            <span>创建时间</span>
+            <span>有效期</span>
+            <span>来源 VPS / 节点</span>
+            <span>生成节点数</span>
+            <span>操作</span>
+          </div>
+          <div id="adminBody" class="admin-list">
+            <div class="admin-empty">尚未加载。填好令牌后点“加载条目列表”。</div>
+          </div>
+        </div>
+      </section>
     </main>
+
+    <footer class="page-diag">
+      <button id="diagExportBtn" type="button" class="secondary small">导出诊断日志（已脱敏）</button>
+      <span id="diagStatus" class="hint" role="status" aria-live="polite"></span>
+      <p class="hint">遇到故障时点此导出一份日志文件发给维护者排查。日志只含版本号、环境、操作成败与耗时、计数等信息，已脱敏：不含管理令牌、节点链接、优选地址、备注与标签内容。</p>
+    </footer>
+
+    <div class="quick-dock">
+      <div class="quick-nav-group" role="navigation" aria-label="快速定位">
+        <button class="quick-nav" type="button" data-target="generator-form">生成</button>
+        <button class="quick-nav" type="button" data-target="resultSection">结果</button>
+        <button class="quick-nav" type="button" data-target="adminSection">管理</button>
+      </div>
+      <button id="backTopBtn" class="back-top" type="button" aria-label="回到顶部" title="回到顶部">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 19V5M5 12l7-7 7 7" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
 
     <div id="qrModal" class="modal hidden" aria-hidden="true">
       <div class="modal-backdrop" data-close-modal="true"></div>
@@ -265,7 +469,11 @@ cf.example.com:443#US-Edge"
         </div>
       </div>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script> 
+    <!-- qrcodejs 1.0.0, self-hosted (was loaded from cdnjs): the page
+         holds the admin token, so it must not execute third-party-hosted
+         scripts. Bytes verified identical across two CDNs at vendoring
+         time; sha256 c541ef06327885a8415bca8df6071e14189b4855336def4f36db54bde8484f36. -->
+    <script src="vendor/qrcode.min.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

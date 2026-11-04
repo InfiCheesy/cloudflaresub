@@ -21,6 +21,23 @@ body {
   min-height: 100vh;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: var(--text);
+  background-color: #0b1220;
+}
+
+/* The page backdrop lives in a layer pinned to the viewport, NOT on
+   body: painted on body, the gradients are sized by the full document
+   height, so anything that changes the page height (expand-all in the
+   admin list, search filtering, a single entry opening) rescales them
+   and the whole page visibly changes colour. Fixed to the viewport,
+   the backdrop depends only on the screen and stays constant.
+   (A fixed pseudo-element, not background-attachment: fixed, which
+   iOS Safari renders unreliably.) */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
   background:
     radial-gradient(circle at top right, rgba(52, 211, 153, 0.12), transparent 30%),
     radial-gradient(circle at top left, rgba(96, 165, 250, 0.18), transparent 26%),
@@ -111,7 +128,8 @@ p {
 
 form.card,
 .tips,
-#resultSection {
+#resultSection,
+#adminSection {
   padding: 24px;
 }
 
@@ -123,6 +141,11 @@ label {
 
 textarea,
 input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="url"],
+input[type="search"],
+select,
 input[readonly] {
   width: 100%;
   border-radius: 14px;
@@ -135,8 +158,24 @@ input[readonly] {
   outline: none;
 }
 
+/* Retention days input while disabled (permanent storage selected):
+   dimmed box, number hidden but value preserved in the DOM. */
+#retentionDays:disabled,
+.ret-days:disabled {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background: rgba(15, 23, 42, 0.45);
+  border-color: rgba(148, 163, 184, 0.08);
+  cursor: not-allowed;
+}
+
 textarea:focus,
 input[type="text"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus,
+input[type="url"]:focus,
+input[type="search"]:focus,
+select:focus,
 input[readonly]:focus {
   border-color: rgba(96, 165, 250, 0.72);
   box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.12);
@@ -147,6 +186,11 @@ input[readonly]:focus {
   font-size: 0.9rem;
   margin-top: 8px;
   line-height: 1.6;
+}
+
+/* Per-source test-fetch results are newline-joined; keep the breaks. */
+#ipSourceMsg {
+  white-space: pre-line;
 }
 
 .checkbox-wrap {
@@ -261,20 +305,24 @@ button.small {
   white-space: pre-wrap;
 }
 
-.url-row label {
-  margin-bottom: 10px;
-}
-
-.copy-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-}
-
 .table-wrap {
   overflow-x: auto;
   border-radius: 16px;
   border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+/* Node preview: ALL generated nodes are rendered, but the box keeps the
+   height it used to have at 20 rows (header + 20 x ~46px) and scrolls
+   internally; the header row sticks while scrolling. */
+.table-wrap.preview-scroll {
+  max-height: 968px;
+  overflow-y: auto;
+}
+.table-wrap.preview-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgb(30, 41, 59);
 }
 
 .table-wrap table {
@@ -294,10 +342,6 @@ button.small {
 .table-wrap th {
   color: #bfdbfe;
   background: rgba(30, 41, 59, 0.68);
-}
-
-.table-wrap tr:last-child td {
-  border-bottom: none;
 }
 
 @media (max-width: 920px) {
@@ -329,12 +373,9 @@ button.small {
   .hero,
   form.card,
   .tips,
-  #resultSection {
+  #resultSection,
+  #adminSection {
     padding: 18px;
-  }
-
-  .copy-row {
-    grid-template-columns: 1fr;
   }
 
   .stats-grid {
@@ -384,7 +425,8 @@ button.small {
   line-height: 1.8;
 }
 
-#resultSection {
+#resultSection,
+#adminSection {
   margin-top: 24px;
 }
 
@@ -487,6 +529,11 @@ button.small {
   position: fixed;
   inset: 0;
   z-index: 1000;
+  /* The dialog is ~430px tall plus its top margin: on short or
+     landscape viewports it would otherwise overflow the fixed layer
+     and clip its tail (the subscription URL) with no way to scroll. */
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .modal.hidden {
@@ -547,6 +594,18 @@ button.small {
   display:block;
 }
 
+.hero-title-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.hero-title-row .hero-title {
+  margin-bottom: 0;
+}
+
 .hero-title {
   display: flex;
   align-items: center;
@@ -563,4 +622,726 @@ button.small {
   .hero-title {
     gap: 10px;
   }
+}
+#retentionDays:disabled::-webkit-outer-spin-button,
+#retentionDays:disabled::-webkit-inner-spin-button,
+.ret-days:disabled::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Keep the retention select and the days input exactly the same height:
+   number inputs honour line-height:1.6 from the shared input rule while
+   selects do not, which made the right box a few px taller. */
+#storageMode,
+#retentionDays {
+  height: 52px;
+  line-height: 1.2;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* Expanded per-entry link cards (same cards as the result section),
+   rendered as a detail block under the entry row. */
+.entry-detail {
+  padding: 4px 14px 20px;
+}
+.entry-detail .sub-grid {
+  margin-bottom: 14px;
+}
+
+/* ---- Admin list: entries are blocks (header row + collapsible detail),
+   so an expanded entry's row can stick to the top while its links scroll. ---- */
+.admin-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+}
+.admin-toolbar label {
+  margin: 0;
+}
+.admin-toolbar select,
+.ret-controls select {
+  width: auto;
+  min-width: 230px;
+}
+/* Search box: visually the same size as the sort select — same width
+   class (no flex stretching) and an identical locked height. */
+.admin-toolbar select,
+.admin-toolbar input[type="search"] {
+  height: 55px;
+}
+.admin-toolbar input[type="search"] {
+  width: auto;
+  flex: 0 1 260px;
+  max-width: 260px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.toolbar-spacer {
+  flex: 1;
+}
+
+.admin-head,
+.entry-row {
+  display: grid;
+  grid-template-columns: 36px minmax(170px, 1fr) 132px 100px minmax(110px, 1fr) 84px 216px;
+  gap: 14px;
+  align-items: center;
+}
+
+.admin-head {
+  padding: 12px 14px;
+  margin-top: 4px;
+  border-radius: 12px;
+  background: rgba(30, 41, 59, 0.68);
+  color: #bfdbfe;
+  font-size: 0.92rem;
+  text-align: center;
+}
+.admin-head span {
+  white-space: nowrap;
+}
+
+.entry {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+}
+.table-wrap tr:last-child td,
+.entry:last-child {
+  border-bottom: none;
+}
+
+.entry-row {
+  padding: 18px 14px;
+  font-size: 0.92rem;
+}
+
+.entry-row .cell {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Created-time, validity and node-count columns read better centered,
+   like their headers (column 1 is the selection checkbox) */
+.entry-row .cell:nth-child(3),
+.entry-row .cell:nth-child(4),
+.entry-row .cell:nth-child(6) {
+  text-align: center;
+}
+
+/* Selection checkboxes (per-entry and the header select-all) */
+.entry-check,
+#selectAllEntries {
+  width: 20px;
+  height: 20px;
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+
+/* The sticky magic: while an entry is expanded, its row pins to the top of
+   the viewport so 收起 is always one tap away. When the next expanded entry
+   arrives, the previous row rides away with the end of its own block and
+   the new one takes its place (and vice versa scrolling up). */
+.entry.expanded .entry-row,
+.entry.retention-open .entry-row,
+.entry.tags-open .entry-row {
+  position: sticky;
+  top: 10px;
+  z-index: 30;
+  background: rgb(13, 21, 40);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 16px;
+  box-shadow: 0 16px 44px rgba(2, 6, 23, 0.5);
+}
+
+.admin-empty {
+  padding: 18px 14px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.admin-more {
+  padding: 14px;
+  text-align: center;
+}
+
+/* ---- Header version status + update-check warning ---- */
+.version-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.38);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.45);
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.35;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.version-status::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.version-status.is-current {
+  border-color: rgba(74, 222, 128, 0.45);
+  background: rgba(22, 163, 74, 0.12);
+  color: #86efac;
+}
+
+.version-status.is-update {
+  border-color: rgba(96, 165, 250, 0.68);
+  background: rgba(37, 99, 235, 0.2);
+  color: #bfdbfe;
+}
+
+.version-status.is-update:hover {
+  background: rgba(37, 99, 235, 0.3);
+  color: #dbeafe;
+}
+
+.version-status.is-stale {
+  border-color: rgba(245, 158, 11, 0.58);
+  background: rgba(245, 158, 11, 0.13);
+  color: #fcd34d;
+}
+
+.version-status.is-failed {
+  border-color: rgba(248, 113, 113, 0.62);
+  background: rgba(220, 38, 38, 0.14);
+  color: #fca5a5;
+}
+
+.version-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(245, 158, 11, 0.58);
+  border-radius: 14px;
+  background: rgba(245, 158, 11, 0.13);
+  color: #fde68a;
+  line-height: 1.55;
+}
+
+.version-alert button {
+  flex: 0 0 auto;
+  min-height: 44px;
+}
+
+@media (max-width: 640px) {
+  .hero-title-row {
+    gap: 10px;
+  }
+
+  .version-status {
+    white-space: normal;
+  }
+
+  .version-alert {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+/* ---- Quick dock: liquid-glass section nav above the back-to-top ---- */
+.quick-dock {
+  position: fixed;
+  right: 22px;
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  z-index: 900;
+}
+
+.quick-nav-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.quick-nav {
+  width: 56px;
+  min-width: 56px;
+  height: 48px;
+  min-height: 48px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #e2e8f0;
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.05) 55%, rgba(255, 255, 255, 0.02)),
+    rgba(15, 23, 42, 0.35);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  backdrop-filter: blur(14px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    inset 0 -10px 18px rgba(255, 255, 255, 0.05),
+    0 10px 26px rgba(2, 6, 23, 0.45);
+  transition: transform 0.16s ease, background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease, color 0.25s ease;
+}
+
+.quick-nav:active {
+  transform: scale(0.93);
+}
+
+.quick-nav.active {
+  color: #ffffff;
+  background:
+    linear-gradient(150deg, rgba(96, 165, 250, 0.5), rgba(37, 99, 235, 0.38)),
+    rgba(15, 23, 42, 0.35);
+  border-color: rgba(147, 197, 253, 0.6);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    inset 0 -10px 18px rgba(255, 255, 255, 0.06),
+    0 10px 26px rgba(37, 99, 235, 0.4);
+}
+
+#generator-form,
+#resultSection,
+#adminSection {
+  scroll-margin-top: 14px;
+}
+
+/* ---- Back-to-top round button (sits in the quick dock; its hidden
+   state keeps the slot via visibility, so the dock never jumps) ---- */
+.page-diag {
+  max-width: 960px;
+  margin: 8px auto 28px;
+  padding: 0 16px;
+  text-align: center;
+}
+.page-diag .hint {
+  margin-top: 8px;
+}
+.back-top {
+  width: 52px;
+  height: 52px;
+  min-height: 52px;
+  padding: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, var(--accent), #2563eb);
+  box-shadow: 0 14px 34px rgba(2, 6, 23, 0.5);
+  z-index: 900;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(10px);
+  transition: opacity 0.25s ease, transform 0.25s ease, visibility 0.25s;
+}
+.back-top.show {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+}
+
+@media (max-width: 920px) {
+  /* Narrow screens: the admin list scrolls sideways instead, and the
+     sticky entry row steps aside (sticky cannot work inside the
+     horizontal scroller). */
+  .admin-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .admin-head,
+  .entry {
+    /* Must cover the row grid's own minimum, or the last (actions)
+       column spills past every row box and iOS Safari clips it
+       instead of extending the scroll area: tracks 848 + gaps 84 +
+       row padding 28 = 960. (Was 936 — buttons overflowed the row
+       edge by ~24px on phones.) */
+    min-width: 960px;
+  }
+  .entry.expanded .entry-row,
+  .entry.retention-open .entry-row,
+  .entry.tags-open .entry-row {
+    position: static;
+    box-shadow: none;
+  }
+}
+
+.admin-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 10px; /* row gap 12px, column gap 10px */
+  width: 100%;
+}
+.admin-actions > a {
+  display: block;
+}
+.admin-actions button {
+  width: 100%;
+  font-size: 0.92rem; /* a little headroom so the longest label never crowds its cell */
+}
+.admin-actions [data-admin-action="retention"] {
+  white-space: nowrap;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.admin-actions .span-all {
+  grid-column: 1 / -1;
+}
+
+/* Note editor: a tall multi-line box. Long notes wrap, and overflow scrolls
+   inside the box (mouse wheel / dragged scrollbar / touch swipe). The box
+   stretches to the full entry-row height (driven by the actions column),
+   so it grows/shrinks with the buttons instead of a fixed pixel height. */
+.entry-row .cell:nth-child(2) {
+  align-self: stretch;
+}
+#adminSection .note-input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 98px;
+  padding: 10px 12px;
+  font-size: 0.92rem;
+  line-height: 1.55;
+  overflow-y: auto;
+  resize: vertical;
+  word-break: break-all;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ---- Touch friendliness (whole page) ---- */
+html {
+  -webkit-tap-highlight-color: rgba(96, 165, 250, 0.12);
+}
+
+button,
+a,
+input,
+select,
+textarea,
+label {
+  touch-action: manipulation; /* no double-tap zoom delay on controls */
+}
+
+@media (pointer: coarse) {
+  /* Apple HIG / Material: touch targets at least ~44-48px, gaps >= 8px */
+  button,
+  button.small {
+    min-height: 48px;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .admin-actions {
+    gap: 14px 12px;
+  }
+  /* Keep the longest action label on one line without shrinking the
+     48px touch height: trade horizontal padding, not vertical room. */
+  .admin-actions [data-admin-action="retention"] {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .sub-actions {
+    gap: 12px;
+  }
+
+  .actions {
+    gap: 14px;
+  }
+
+  /* 16px form text stops iOS Safari from auto-zooming on focus */
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  input[type="url"],
+  input[type="search"],
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  .checkbox-wrap {
+    min-height: 52px;
+  }
+
+  .checkbox-wrap input,
+  .entry-check,
+  #selectAllEntries {
+    width: 24px;
+    height: 24px;
+  }
+
+  .table-wrap th,
+  .table-wrap td {
+    padding-top: 16px;
+    padding-bottom: 16px;
+  }
+
+  /* Taller touch rows: the preview cap grows to match 20 of them. */
+  .table-wrap.preview-scroll {
+    max-height: 1134px;
+  }
+
+  #adminSection .note-input {
+    font-size: 16px;
+    height: 100%;
+    min-height: 112px;
+  }
+}
+
+/* Save feedback states on panel save buttons */
+#adminSection button[data-save-state="ok"] {
+  border-color: rgba(52, 211, 153, 0.65);
+  color: #6ee7b7;
+}
+#adminSection button[data-save-state="fail"] {
+  border-color: rgba(248, 113, 113, 0.65);
+  color: #fca5a5;
+}
+
+/* Note autosave: the cell is a vertical stack (editor, one reserved
+   status line, tag chips) so a status appearing never shifts the row. */
+.entry-row .note-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#adminSection .note-cell .note-input {
+  flex: 1 1 0;
+  height: auto;
+  min-height: 3.2em; /* floor for short rows / stacked mobile layout */
+  resize: none; /* the 50/50 split sizes the box; manual resize would break it */
+}
+/* The tag area under the editor takes the other half of the cell. */
+.entry-row .note-cell .entry-tags {
+  flex: 1 1 0;
+  margin-top: 0;
+  align-content: flex-start;
+}
+.note-save-status {
+  min-height: 1.35em;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: opacity 0.18s ease, color 0.18s ease;
+}
+.note-save-status.is-visible {
+  opacity: 1;
+}
+.note-save-status[data-state="ok"] {
+  color: #6ee7b7;
+}
+.note-save-status[data-state="warn"] {
+  color: #fbbf24;
+}
+.note-save-status[data-state="fail"] {
+  color: #fca5a5;
+  white-space: normal;
+}
+
+/* ---- Inline retention edit panel ---- */
+.entry-retention {
+  padding: 2px 14px 18px;
+}
+
+/* Entry tags: chips in the picker, the rows, the filter bar and the
+   inline editor all share one pill look. */
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(96, 165, 250, 0.08);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  min-height: 32px;
+}
+button.tag-chip {
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+}
+button.tag-chip:hover {
+  border-color: var(--accent);
+}
+.tag-chip.is-on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+}
+/* Editable chips (generate picker, tag-edit panel, filter bar)
+   reorder by long-press drag; row display chips stay plain taps. */
+#genTagChips .tag-chip,
+.tags-edit-chips .tag-chip,
+#tagFilterChips .tag-chip {
+  touch-action: none;
+  cursor: grab;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* While dragging, the chip leaves the flow and follows the pointer
+   (left/top set inline); a dashed placeholder holds its slot, and
+   siblings glide via FLIP transforms — no layout feedback, no jitter. */
+.tag-chip.dragging {
+  opacity: 0.95;
+  scale: 1.06;
+  border-color: var(--accent);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
+  cursor: grabbing;
+  margin: 0;
+}
+.chip-placeholder {
+  display: inline-block;
+  box-sizing: border-box;
+  border: 1.5px dashed rgba(96, 165, 250, 0.55);
+  border-radius: 999px;
+  background: rgba(96, 165, 250, 0.07);
+}
+/* Filter-bar trash zone: the label turns into a bin during a drag. */
+.tag-filter-label.trash-armed {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 36px;
+  padding: 2px 10px;
+  border: 1.5px dashed rgba(248, 113, 113, 0.6);
+  border-radius: 10px;
+  font-size: 1.05rem;
+}
+.tag-filter-label.trash-armed.is-hot {
+  background: rgba(248, 113, 113, 0.22);
+  border-color: #f87171;
+  scale: 1.12;
+}
+.tag-chip-x {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 2px 4px;
+  min-height: 24px;
+  min-width: 24px;
+}
+.tag-chip-x:hover {
+  color: var(--danger);
+}
+.tag-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+#genTagChips {
+  margin-bottom: 8px;
+}
+#genTagChips:empty {
+  margin-bottom: 0;
+}
+.entry-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.tag-chip-mini {
+  min-height: 28px;
+  padding: 2px 8px;
+  font-size: 0.8rem;
+}
+.tag-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 14px;
+}
+.tag-filter-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.tag-mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.tag-mode-btn {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 6px 12px;
+  min-height: 32px;
+}
+.tag-mode-btn.is-active {
+  background: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+}
+.entry-tags-panel {
+  padding: 2px 14px 18px;
+}
+.entry-tags-panel .tags-edit-chips {
+  margin-bottom: 12px;
+}
+.entry-tags-panel .tags-edit-input {
+  flex: 1 1 200px;
+}
+.entry-tags-panel .hint {
+  margin-top: 10px;
+}
+.ret-current {
+  margin-bottom: 12px;
+  font-size: 0.95rem;
+}
+.ret-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+.ret-controls label {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ret-controls .ret-days {
+  width: 110px;
+}
+.entry-retention .hint {
+  margin-top: 10px;
 }

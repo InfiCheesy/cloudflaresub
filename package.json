@@ -1,12 +1,12 @@
 {
   "name": "cf-worker-ip-sub-web",
-  "version": "1.0.0",
+  "version": "1.7.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "check": "node tests/smoke.mjs"
+    "dev": "wrangler pages dev public",
+    "deploy": "wrangler pages deploy public",
+    "check": "node tests/smoke.mjs && node tests/worker.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

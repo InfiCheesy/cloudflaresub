@@ -1,10 +1,9 @@
 name = "cloudflaresub"
-main = "src/worker.js"
 compatibility_date = "2026-03-06"
-workers_dev = true
+pages_build_output_dir = "./public"
 
-[assets]
-directory = "./public"
-binding = "ASSETS"
-not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/sub/*"]
+# KV is bound in the Cloudflare Dashboard (Pages project -> Settings -> Bindings),
+# variable name: SUB_STORE. Do NOT add a [[kv_namespaces]] block with a placeholder
+# id here; an invalid id makes deployment fail.
+# The access token SUB_ACCESS_TOKEN is likewise set in
+# Pages project -> Settings -> Variables and Secrets (Production).
